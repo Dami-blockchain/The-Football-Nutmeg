@@ -197,7 +197,11 @@ tests/test_cache.py
 - Form: last 5 finished matches, recency weights `(1.5, 1.3, 1.1, 1.0, 0.9)`,
   W=3/D=1/L=0, `+0.3` home advantage, opponent-strength via league position,
   softmax with `draw_score=2.4`, temperature `1.0`.
-- Edge filter: bet only when `our_prob − market_implied_prob ≥ 0.05`.
+- Edge filter: bet only when `our_prob − market_implied_prob ≥ 0.05`. On
+  Polymarket V2 this comparison must be computed **net of the expected taker
+  fee** (we place market orders, so we are always the taker). Subtract the
+  estimated fee from the edge before applying the 0.05 gate; do NOT change the
+  0.05 threshold itself. See §7 "Polymarket V2 fees".
 - Sizing: `$10`/bet, `$50` max, `$200` daily cap, one position per fixture,
   idempotent inserts.
 - DB: SQLite at `./data/betbot.sqlite` (configurable via `BETBOT_DB_PATH`).
@@ -294,15 +298,21 @@ match the §3 locked parameters.
 - `exchanges/polymarket.py`: `PolymarketAdapter` implementing the
   `ExchangeAdapter` Protocol. Discovery via Gamma; orderbook via the CLOB SDK.
   **Use `py-clob-client-v2`** — Polymarket migrated to CTF Exchange **V2 on
-  April 22, 2026**; V1-signed orders are now rejected. (Earlier in this project's
-  history we used V1; go straight to V2 in this rebuild.) V2 EIP-712 domain:
-  name `"Polymarket CTF Exchange"`, version `"2"`, chainId 137,
-  verifyingContract `0xE111180000d2663C0091e4f400237545B87B996B`. Collateral is
-  now **pUSD** (`0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB`), 1:1 USDC-backed,
-  needs a wrap step. Handle BOTH market layouts: (A) single 3-way market with 3
-  token ids; (B) event with 3 binary YES/NO markets (this layout is more common
-  for football). `place_order` must be DOUBLE-GATED: requires
-  `enable_orders=True` at construction AND `mode=live`.
+  April 28, 2026 (~11:00 UTC)**; V1-signed orders are rejected and there is NO
+  backward compatibility. (Earlier in this project's history we used V1; go
+  straight to V2 in this rebuild.) V2 EIP-712 domain: name
+  `"Polymarket CTF Exchange"`, version `"2"`, chainId 137, verifyingContract
+  `0xE111180000d2663C0091e4f400237545B87B996B`. Collateral is now **pUSD**,
+  1:1 USDC-backed, needs a wrap step. **Confirm the pUSD token, V2 Exchange,
+  Neg-Risk Exchange, and Collateral Onramp addresses against
+  docs.polymarket.com/resources/contracts before hardcoding any of them — do
+  NOT trust addresses pasted from chat history.** The v2 SDK handles V2 order
+  signing (new struct drops `taker`/`expiration`/`nonce`/`feeRateBps` and adds
+  `timestamp`/`metadata`/`builder`) — do NOT hand-roll Polymarket order signing.
+  Handle BOTH market layouts: (A) single 3-way market with 3 token ids; (B) event
+  with 3 binary YES/NO markets (this layout is more common for football).
+  `place_order` must be DOUBLE-GATED: requires `enable_orders=True` at
+  construction AND `mode=live`.
 - `exchanges/router.py`: `ExchangeRouter.find_best_quote()` — lowest yes_price
   wins, tie-break on larger size.
 - Wire into `main.py`: build router from the run's team set; scoring loop uses a
@@ -375,14 +385,23 @@ match the §3 locked parameters.
   switch clear. Excludes no-market bets. CLI `tfsm gate`.
 - `exchanges/limitless_signing.py`: EIP-712 signing via `eth_account`
   (`encode_typed_data(full_message=...)`, `Account.sign_message`; the hash is
-  `signed.message_hash`, NOT `signable.hash`). Order struct field order (verified
-  against the Polymarket/Limitless ctf-exchange contract source):
+  `signed.message_hash`, NOT `signable.hash`). Order struct field order — **this
+  is the Limitless / V1-fork struct ONLY** (Limitless is a fork of Polymarket's
+  pre-V2 ctf-exchange, domain version "1"):
   `salt, maker, signer, taker, tokenId, makerAmount, takerAmount, expiration,
-  nonce, feeRateBps, side, signatureType`. `takerAmount = makerAmount / price`,
+  nonce, feeRateBps, side, signatureType`. **Do NOT reuse this struct for
+  Polymarket** — Polymarket V2 dropped `taker`/`expiration`/`nonce`/`feeRateBps`
+  and added `timestamp`/`metadata`/`builder`, and Polymarket signing is handled
+  by `py-clob-client-v2` (never hand-rolled). `takerAmount = makerAmount / price`,
   6-decimal USDC scaling. Ship pure helpers (`to_usdc_units`, `shares_for`,
   `random_salt`) testable without `eth_account`.
-- Wire live `place_order` in both adapters (Polymarket via `py-clob-client-v2`'s
-  `create_and_post_market_order`; Limitless via the signer + `POST /orders`).
+- Wire live `place_order` in both adapters. Polymarket: use the v2 SDK's market-
+  order method — **verify the exact method name and signature in the installed
+  `py-clob-client-v2`; the v1 name `create_and_post_market_order` may have
+  changed, and order creation now takes an options object / `UserMarketOrderV2`
+  shape.** Pass `userUSDCBalance` on market buys so the SDK returns fee-adjusted
+  fill amounts (V2 takers pay a protocol fee — see §7 "Polymarket V2 fees").
+  Limitless: via the signer + `POST /orders`.
 - `main.py`: live pre-flight calls `evaluate_gate`, refuses to start if it fails;
   `_build_router` flips `enable_orders` when not paper; `_try_market_route`
   places the order after logging the paper bet (paper row persists even if the
@@ -440,7 +459,24 @@ match the §3 locked parameters.
 
 - **football-data.org `dateTo` requires `dateFrom`** (and the `dateTo` on
   `/competitions/{c}/matches` is EXCLUSIVE — use `today+2` to include tomorrow).
-- **Polymarket V2 cutover (April 22 2026)** — use `py-clob-client-v2`; V1 is dead.
+- **Polymarket V2 cutover (April 28 2026, ~11:00 UTC)** — use `py-clob-client-v2`;
+  V1 is dead, no backward compatibility, all V1 open orders were wiped at cutover.
+  Production URL stays `clob.polymarket.com` after cutover; the V2 sandbox is
+  `clob-v2.polymarket.com` if you want to dry-run before funding.
+- **Polymarket V2 fees** — fees are protocol-set at match time, NOT embedded in
+  the signed order. Makers pay nothing; takers pay `fee = C × feeRate × p × (1−p)`
+  (largest near p=0.5). We place market orders, so we always pay the taker fee.
+  Query live params via `getClobMarketInfo(conditionID)` (`fd.r` rate, `fd.e`
+  exponent, `fd.to` taker-only) and fold the expected fee into the edge calc
+  (Phase 2 edge filter). Remove any manual/embedded `feeRateBps` logic for
+  Polymarket — that field no longer exists in V2.
+- **Polymarket V2 pUSD must sit in the deposit/funder wallet** (`POLYMARKET_FUNDER`),
+  NOT the owner EOA. If the CLOB balance cache is stale you get false
+  "insufficient balance" errors even on a funded wallet — call the balance-sync
+  endpoint with signature type 3 after wrapping/funding.
+- **Polymarket V2 addresses are not hardcoded constants yet** — pull the canonical
+  pUSD token, V2 Exchange, Neg-Risk Exchange, and Collateral Onramp addresses from
+  docs.polymarket.com/resources/contracts. Do not trust addresses from chat history.
 - **Gamma `clobTokenIds`/`outcomes` are JSON strings** — `json.loads()`.
 - **Polymarket football markets are usually Layout B** (3 binary markets per
   event), not a single 3-way market. Handle both.
