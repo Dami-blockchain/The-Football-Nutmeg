@@ -501,3 +501,329 @@ Confirm no secret ever lands in git history.
 Welcome aboard. The spec is locked; the operator values honesty about what's
 verified vs. assumed. Show green output, don't claim untested things work, and
 keep the operator oriented in plain language.
+
+
+# APPENDIX A — Glicko Rating Engine for International / World Cup Fixtures
+
+> **Instruction to Claude Code:** Append this appendix to `CLAUDE.md`. It
+> defines an OPTIONAL phase (call it **Phase 5.5**) that adds a Glicko-2
+> rating engine used for `INTERNATIONAL_COMPETITIONS` (currently `{"WC"}`).
+> Build it only after Phases 1–5 are green, and only when the operator asks.
+> Until then, leave it as documented scope.
+>
+> **Hard rule that overrides everything else in this appendix:** the World
+> Cup model is **paper-mode only**. It must NEVER place a real-money order,
+> regardless of `BETBOT_MODE`. The existing `INTERNATIONAL_COMPETITIONS`
+> guard already blocks live ordering on `WC`; this appendix must not weaken
+> that guard. If you find yourself writing code that would let a WC fixture
+> reach `place_order`, stop — that's a bug.
+
+---
+
+## A.0 Why this exists, and what it can and cannot do
+
+The base strategy (last-5 form + league-standings opponent strength + home
+advantage + softmax) is built for club football. It degrades badly on
+international tournaments because:
+- national teams have no league table (opponent-strength input collapses to 1.0),
+- "last 5 matches" can span 12+ months and mix friendlies with qualifiers,
+- home advantage is meaningless at neutral World Cup venues.
+
+Glicko-2 fixes the *rating* problem: it produces a continuous strength
+estimate for each national team without needing a league table, AND it
+tracks a **rating deviation (RD)** — an explicit measure of how uncertain
+that estimate is. RD rises when a team hasn't played in a while (exactly the
+international-football situation) and falls after recent matches. This is why
+Glicko-2 is a better fit than plain Elo here: it knows when it doesn't know.
+
+**What this does NOT do — be honest with the operator and in code comments:**
+- It does not produce "accurate" winner predictions. Match-level outcome
+  accuracy for any football model, including this one, tops out around
+  50–55% (draws included). That is the ceiling, not a failure of
+  implementation.
+- It is not an edge source on World Cup markets. WC markets are deep, liquid,
+  and over-analysed; the market line is the best available predictor. This
+  model will mostly agree with the market on obvious matchups and be noisy on
+  close ones.
+- Its purpose is **calibration data**, not profit. We log predictions during
+  the tournament to measure how well-calibrated the model is (Brier score,
+  reliability curve) and to decide whether an international model is ever
+  worth taking live in future tournaments. That decision should be made on
+  the data, after the fact, not assumed now.
+
+The success metric for this phase is **calibration, not accuracy or P&L**.
+Do not let the operator (or yourself) judge it by "how many winners it got."
+
+---
+
+## A.1 Glicko-2: the algorithm (reference)
+
+Glicko-2 (Glickman, 2012) tracks three numbers per team:
+- **rating (r)** — strength, conventionally centred at 1500.
+- **rating deviation (RD)** — uncertainty of the rating (higher = less sure).
+- **volatility (σ)** — how erratic the team's results are over time.
+
+Internally Glicko-2 works in a transformed scale:
+- `μ = (r − 1500) / 173.7178`
+- `φ = RD / 173.7178`
+
+System constant **τ** constrains volatility change; use **τ = 0.5**
+(Glickman's recommended default; smaller = more stable, range 0.3–1.2).
+
+### Per rating period, for a team with current (μ, φ, σ) and a set of games:
+
+For each opponent j with (μ_j, φ_j) and score s_j (1 win / 0.5 draw / 0 loss):
+```
+g(φ_j) = 1 / sqrt(1 + 3·φ_j² / π²)
+E(μ, μ_j, φ_j) = 1 / (1 + exp(−g(φ_j)·(μ − μ_j)))
+```
+
+Estimated variance:
+```
+v = 1 / Σ_j [ g(φ_j)² · E_j · (1 − E_j) ]
+```
+
+Estimated improvement:
+```
+Δ = v · Σ_j [ g(φ_j) · (s_j − E_j) ]
+```
+
+New volatility σ′ via the iterative (Illinois algorithm) solution of:
+```
+f(x) = e^x·(Δ² − φ² − v − e^x) / (2·(φ² + v + e^x)²) − (x − ln(σ²)) / τ²
+```
+solve f(x) = 0 for x; σ′ = e^(x/2). (Implement the Illinois method exactly as
+in Glickman's 2012 paper, §5.1 step 5 — it converges in a handful of
+iterations. Do not approximate this; volatility update is where naive
+implementations go wrong.)
+
+Pre-rating-period RD bump (accounts for time passing):
+```
+φ* = sqrt(φ² + σ′²)
+```
+
+New φ and μ:
+```
+φ′ = 1 / sqrt(1/φ*² + 1/v)
+μ′ = μ + φ′² · Σ_j [ g(φ_j)·(s_j − E_j) ]
+```
+
+Convert back:
+```
+r′ = 173.7178·μ′ + 1500
+RD′ = 173.7178·φ′
+```
+
+### Team that did NOT play in a rating period
+Only RD increases (uncertainty grows): `φ′ = sqrt(φ² + σ²)`, μ and σ unchanged.
+
+### Match outcome probabilities (what the bot needs)
+Glicko-2 is natively a 2-outcome (win/loss) system. Football has draws.
+Convert a rating gap into win/draw/loss with a draw-inflation parameter:
+```
+# expected score for HOME vs AWAY, incorporating BOTH teams' RD:
+g_combined = 1 / sqrt(1 + 3·(φ_home² + φ_away²) / π²)
+p_home_raw = 1 / (1 + exp(−g_combined·(μ_home − μ_away + home_field_μ)))
+```
+- `home_field_μ` is a small bump for genuine host-nation home advantage ONLY.
+  Default 0.0 (neutral venue). Set a positive value (e.g. +0.2 on the μ scale)
+  for matches where the home team is an actual host nation (USA, Canada,
+  Mexico in 2026). Detect host status from a small hardcoded set; do not apply
+  generic home advantage to non-hosts.
+
+Split the win/loss probability into 3-way using a draw model. Use the simple,
+well-tested approach: a draw-propensity parameter `rho` (default ~0.28 for
+international knockout-style football; expose as a setting). One workable
+parameterisation:
+```
+p_draw = rho · (1 − abs(p_home_raw − 0.5)·2)   # more draws when teams are even
+p_draw = clamp(p_draw, 0.05, 0.40)
+p_home = (1 − p_draw) · p_home_raw
+p_away = (1 − p_draw) · (1 − p_home_raw)
+```
+Document clearly that this draw split is a heuristic, not derived from Glicko,
+and is a prime calibration target to revisit after seeing tournament data.
+
+---
+
+## A.2 Data source for ratings
+
+Glicko-2 needs historical international results to bootstrap ratings BEFORE
+the tournament starts. football-data.org free tier does NOT give deep
+international history. Two acceptable paths — pick based on what's available
+when building; ask the operator:
+
+**Path 1 (preferred, no new paid API): seed from a public dataset.**
+Use the well-known open dataset of international football results
+("results.csv" — international matches since 1872, ~45k rows, MIT-ish public
+domain, widely mirrored). Bootstrap each national team's (r, RD, σ) by
+running Glicko-2 forward over the last ~4 years of that team's results
+(weight recent rating periods; older history just establishes the prior).
+Store the seeded ratings in a new DB table (see A.4). This is a one-time
+offline job: `scripts/seed_glicko.py`.
+- The operator must supply the dataset file (a CSV path) or a URL to fetch.
+  Do not hardcode a scraped source. Keep the CSV out of git (add to
+  `.gitignore`); store only the derived ratings.
+
+**Path 2 (fallback): seed from a static ratings snapshot.**
+If no results dataset is available, seed from a snapshot of published
+international Elo/Glicko ratings (operator provides a small YAML/CSV of
+team → rating). Set RD high (e.g. 200) to reflect that these are imported
+priors, not earned. The model will tighten RD as tournament matches come in.
+
+Either way: **rating periods.** Treat each matchday (or each ~3-day window) of
+the tournament as one rating period. After each WC matchday settles, run a
+Glicko-2 update so ratings sharpen as the tournament progresses.
+
+---
+
+## A.3 Where this plugs into the existing architecture
+
+Do NOT modify the existing `StrategyEngine`. Add a parallel engine and select
+between them by competition.
+
+- New module `src/betbot/strategy/glicko.py`:
+  - `Glicko2Rating` dataclass (`rating`, `rd`, `volatility`, `last_period`).
+  - `Glicko2Engine` with the period-update math from A.1.
+  - Pure functions where possible (testable without DB/network), mirroring how
+    `probabilities.py` is kept pure.
+- New module `src/betbot/strategy/international_engine.py`:
+  - `InternationalStrategyEngine` exposing the SAME interface the scoring loop
+    expects: a `predict(fixture_form_or_equivalent) -> Prediction` method and a
+    `decide_with_market(prediction, outcome, market_price) -> BetDecision|None`.
+  - Internally it ignores `FormSnapshot` (no league form for nations) and
+    instead pulls each team's current Glicko rating from the ratings store,
+    computes (p_home, p_draw, p_away) via A.1, and returns the same
+    `Prediction` dataclass the rest of the system already uses. This keeps
+    storage, settlement, backtest, and the API all working unchanged.
+  - `decide_with_market` reuses the SAME edge filter and threshold as the club
+    engine (`edge_threshold`). It must STILL return a decision object for
+    logging — but see the live-order guard below.
+- Scoring loop selection (in `main.py`):
+  - When `fixture.competition_code in INTERNATIONAL_COMPETITIONS`, use
+    `InternationalStrategyEngine`; otherwise use the existing `StrategyEngine`.
+  - Keep the existing tri-state routing. The bot still queries Polymarket for
+    WC market prices (the markets exist and are liquid) and logs edge-filtered
+    PAPER bets — this is the calibration data we want.
+- **Live-order guard (critical):** in `_try_market_route` (or wherever
+  `place_order` is reached), add an explicit check: if
+  `prediction.competition_code in INTERNATIONAL_COMPETITIONS`, log the paper
+  bet and RETURN before any `place_order` call, even in live mode. Add a test
+  that asserts a WC fixture in live mode never calls `place_order`.
+
+---
+
+## A.4 Storage
+
+New ORM table `glicko_ratings` (in `storage/models.py`):
+```
+id              int pk
+team_name       str  (canonical national team name; index)
+team_id         int  nullable (football-data team id if known)
+rating          float
+rd              float
+volatility      float
+last_period     str  (ISO date of last rating period applied)
+updated_at      datetime
+```
+Single current row per team (upsert on team_name). Keep a separate append-only
+`glicko_rating_history` table if the operator wants to chart rating drift over
+the tournament — optional, nice for the frontend later.
+
+Repo helpers: `get_rating(team_name)`, `upsert_rating(...)`,
+`all_ratings()`, and a `apply_rating_period(results)` that runs the Glicko-2
+update for a batch of settled matches.
+
+Settlement integration: after the SettlementWatcher settles WC matches for a
+matchday, call `apply_rating_period` with those results so ratings update.
+Gate this behind the competition check so club settlements don't touch Glicko.
+
+---
+
+## A.5 Settings (add to config.py / .env.example)
+
+```
+BETBOT_GLICKO_TAU=0.5                 # volatility constraint (0.3–1.2)
+BETBOT_GLICKO_DEFAULT_RATING=1500
+BETBOT_GLICKO_DEFAULT_RD=200          # high = imported prior, low confidence
+BETBOT_GLICKO_DEFAULT_VOL=0.06
+BETBOT_GLICKO_DRAW_RHO=0.28           # draw-propensity heuristic
+BETBOT_GLICKO_HOST_HOME_MU=0.2        # μ-scale bump for actual host nations only
+BETBOT_GLICKO_RESULTS_CSV=            # path to international results dataset (Path 1)
+```
+Host nations for 2026 (hardcode a small set, document it): USA, Canada, Mexico.
+
+---
+
+## A.6 CLI
+
+- `tfsm glicko seed` — run the offline bootstrap (Path 1 or 2). Idempotent;
+  overwrites the ratings table.
+- `tfsm glicko ratings` — print current ratings sorted by rating desc.
+- `tfsm glicko update --since <date>` — manually trigger a rating-period
+  update from settled WC matches (also runs automatically post-settlement).
+
+---
+
+## A.7 Tests (required before calling this phase green)
+
+- `test_glicko.py`:
+  - Glicko-2 update against the WORKED EXAMPLE in Glickman's paper, VERIFIED
+    against his published values and three independent implementations
+    (R PlayerRatings, Scala, PL/SQL). Inputs: subject player rating 1500,
+    RD 200, vol 0.06, tau 0.5; opponents (1400, RD 30), (1550, RD 100),
+    (1700, RD 300); scores 1, 0, 0 (win, loss, loss). Expected output:
+        rating  ~ 1464.05   (higher precision 1464.051)
+        RD      ~ 151.52     (higher precision 151.51652)
+        vol     ~ 0.05999    (higher precision 0.05999583)
+    Assert rating/RD within +/-0.1 and vol within +/-0.0001. This is the
+    single most important test; it proves the math is right. If it fails, the
+    volatility iteration (Illinois method) is almost certainly the culprit --
+    that's where naive implementations diverge.
+  - RD increases for a team that didn't play a period.
+  - 3-way probability split sums to 1.0 and respects ordering (stronger team
+    higher p).
+  - Draw probability clamps to [0.05, 0.40].
+- `test_international_engine.py`:
+  - `predict` returns a valid `Prediction` with probabilities summing to 1.
+  - host-nation home bump applied only for USA/Canada/Mexico, not others.
+  - `decide_with_market` honours the edge threshold.
+- `test_live_guard.py` (or extend existing):
+  - a `WC` fixture in `mode=live` with `enable_orders=True` logs a paper bet
+    and NEVER calls `place_order` (mock the adapter; assert not called).
+
+---
+
+## A.8 Honest framing for the operator (put this in the phase's completion report)
+
+When you finish this phase, tell the operator, in plain language:
+- This produces calibration data for World Cup matches in paper mode only.
+- It will not be "accurate" — expect ~50–55% match-outcome hit rate at best,
+  same as every other football model and the market itself.
+- The point is to measure Brier score / calibration over the tournament and
+  decide AFTER the fact whether an international model is ever worth taking
+  live. Recommend the operator look at `tfsm backtest --mode stored` filtered
+  to WC fixtures once the group stage is done.
+- Reiterate: do not fund World Cup betting on the strength of this. The edge,
+  if any in football betting at all, is in obscure low-liquidity CLUB matches,
+  not the most-watched tournament on earth.
+- The single biggest accuracy improvement available is not a fancier model —
+  it's blending toward the market line. If the operator wants to pursue real
+  edge later, that (a market-aware ensemble) is the higher-value project than
+  refining Glicko.
+
+---
+
+## A.9 Build order for this phase
+
+1. `strategy/glicko.py` (pure math) + `test_glicko.py` with the paper's worked
+   example. Get this green FIRST — everything depends on the math being right.
+2. `storage` table + repos + migration (create_all handles it).
+3. `scripts/seed_glicko.py` (Path 1 or 2) + `tfsm glicko seed/ratings`.
+4. `strategy/international_engine.py` + tests.
+5. Scoring-loop selection by competition + the live-order guard + guard test.
+6. Settlement hook to update ratings after WC matchdays.
+7. Completion report to operator with the A.8 framing.
+
+One commit for the phase, or split math/storage from wiring if it's large.
+Pause for operator review before and after.
