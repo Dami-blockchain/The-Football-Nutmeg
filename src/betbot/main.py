@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import date, timedelta, timezone
+from pathlib import Path
 from typing import Annotated
 
 import typer
@@ -20,19 +21,49 @@ from apscheduler.triggers.cron import CronTrigger
 from betbot.config import get_settings
 from betbot.data.football_data import FootballDataClient, FootballDataError
 from betbot.data.form import FormService, _parse_kickoff, _parse_team
+from betbot.exchanges.matcher import TeamAliasResolver
+from betbot.exchanges.polymarket import PolymarketAdapter
+from betbot.exchanges.polymarket_gamma import GammaClient
+from betbot.exchanges.router import ExchangeRouter
 from betbot.logging import configure_logging, get_logger
 from betbot.storage.db import init_engine
 from betbot.storage.repos import (
     daily_paper_exposure_usd,
+    insert_paper_bet,
     insert_paper_bet_no_market,
     list_recent_paper_bets,
     upsert_prediction,
 )
 from betbot.strategy.engine import StrategyEngine
 
+# Repo root (…/tfsm), used to locate config/team_aliases.yaml regardless of cwd.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
 app = typer.Typer(add_completion=False, no_args_is_help=True, help=__doc__)
 bets_app = typer.Typer(help="Inspect logged paper bets.")
 app.add_typer(bets_app, name="bets")
+
+
+# ----------------------------------------------------------------------
+# Exchange routing
+# ----------------------------------------------------------------------
+def _build_router(settings) -> tuple[ExchangeRouter, GammaClient]:
+    """Construct the exchange router for a run.
+
+    Returns the router and the underlying GammaClient so the caller can close
+    it. ``enable_orders`` stays False in Phase 2 (paper only) — live ordering
+    is wired in Phase 5; the adapter's double-gate keeps place_order inert
+    regardless.
+    """
+    resolver = TeamAliasResolver.from_yaml(_REPO_ROOT / "config" / "team_aliases.yaml")
+    gamma = GammaClient()
+    polymarket = PolymarketAdapter(
+        gamma,
+        resolver,
+        enable_orders=False,
+        mode=settings.mode,
+    )
+    return ExchangeRouter([polymarket]), gamma
 
 
 # ----------------------------------------------------------------------
@@ -56,6 +87,7 @@ async def _score_once() -> int:
     date_to = (today + timedelta(days=2)).isoformat()
 
     paper_bets_logged = 0
+    router, gamma = _build_router(settings)
 
     async with FootballDataClient(
         api_key=settings.football_data_api_key,
@@ -65,41 +97,44 @@ async def _score_once() -> int:
         form_service = FormService(client, settings)
         engine = StrategyEngine(settings)
 
-        for league in settings.leagues:
-            try:
-                matches = await client.list_scheduled_matches(
-                    league, date_from, date_to
-                )
-            except FootballDataError as e:
-                log.warning("league_fetch_failed", league=league, error=str(e))
-                continue
-
-            log.info(
-                "league_fetched",
-                league=league,
-                upcoming=len(matches),
-                window=f"{date_from}..{date_to}",
-            )
-            for m in matches:
+        try:
+            for league in settings.leagues:
                 try:
-                    bets = await _score_and_log_one(
-                        m, league, form_service, engine, settings
+                    matches = await client.list_scheduled_matches(
+                        league, date_from, date_to
                     )
-                    paper_bets_logged += bets
                 except FootballDataError as e:
-                    log.warning(
-                        "fixture_score_failed",
-                        league=league,
-                        match_id=m.get("id"),
-                        error=str(e),
-                    )
-                except Exception as e:  # noqa: BLE001 — defensive
-                    log.error(
-                        "fixture_score_unexpected",
-                        league=league,
-                        match_id=m.get("id"),
-                        error=str(e),
-                    )
+                    log.warning("league_fetch_failed", league=league, error=str(e))
+                    continue
+
+                log.info(
+                    "league_fetched",
+                    league=league,
+                    upcoming=len(matches),
+                    window=f"{date_from}..{date_to}",
+                )
+                for m in matches:
+                    try:
+                        bets = await _score_and_log_one(
+                            m, league, form_service, engine, router, settings
+                        )
+                        paper_bets_logged += bets
+                    except FootballDataError as e:
+                        log.warning(
+                            "fixture_score_failed",
+                            league=league,
+                            match_id=m.get("id"),
+                            error=str(e),
+                        )
+                    except Exception as e:  # noqa: BLE001 — defensive
+                        log.error(
+                            "fixture_score_unexpected",
+                            league=league,
+                            match_id=m.get("id"),
+                            error=str(e),
+                        )
+        finally:
+            await gamma.close()
 
     log.info(
         "scoring_run_done",
@@ -114,9 +149,19 @@ async def _score_and_log_one(
     league: str,
     form_service: FormService,
     engine: StrategyEngine,
+    router: ExchangeRouter,
     settings,
 ) -> int:
-    """Score one fixture, log a Phase-1 favourite-only paper bet."""
+    """Score one fixture and log a paper bet.
+
+    Tri-state routing on the model's favourite outcome:
+
+    * a market quote with sufficient edge  → log a market-priced paper bet;
+    * a market quote with no edge           → the market vetoes; log NOTHING
+      (no favourite fallback);
+    * no market quote at all                → fall through to a Phase-1
+      favourite-only paper bet.
+    """
     log = get_logger(__name__)
     fixture_id = int(match["id"])
     kickoff = _parse_kickoff(match["utcDate"])
@@ -160,11 +205,43 @@ async def _score_and_log_one(
         return 0
 
     favourite = prediction.best_outcome
-    p = {
-        favourite: max(prediction.p_home, prediction.p_draw, prediction.p_away)
-    }[favourite]
+
+    # ---- Market route (Phase 2) --------------------------------------
+    quote = await router.find_best_quote(
+        prediction.home_team, prediction.away_team, kickoff, favourite
+    )
+    if quote is not None:
+        decision = engine.decide_with_market(prediction, favourite, quote.yes_price)
+        if decision is None:
+            # no_edge: the market price vetoes this bet. Do NOT fall back to
+            # favourite-only logging — the market is the better predictor here.
+            log.info(
+                "route_no_edge",
+                fixture_id=fixture_id,
+                outcome=favourite.value,
+                market_price=round(quote.yes_price, 3),
+                exchange=quote.exchange.value,
+            )
+            return 0
+        inserted = insert_paper_bet(decision, pred_id)
+        if inserted:
+            log.info(
+                "paper_bet_logged_market",
+                fixture_id=fixture_id,
+                outcome=decision.outcome.value,
+                market_price=round(decision.market_price, 3),
+                edge=round(decision.edge, 3),
+                exchange=quote.exchange.value,
+                stake_usd=decision.stake_usd,
+            )
+            return 1
+        log.debug("paper_bet_already_logged", fixture_id=fixture_id)
+        return 0
+
+    # ---- No market: Phase-1 favourite-only paper bet -----------------
+    p = max(prediction.p_home, prediction.p_draw, prediction.p_away)
     rationale = (
-        f"Phase-1 paper bet on model favourite: "
+        f"Favourite paper bet (no market found): "
         f"P({favourite.value})={p:.3f}; "
         f"home_form_w={fixture_form.home_form.weighted_points:.2f}, "
         f"away_form_w={fixture_form.away_form.weighted_points:.2f}"

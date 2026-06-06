@@ -29,6 +29,11 @@ dev = [
     "pytest-asyncio>=0.23",
     "ruff>=0.5",
 ]
+# Polymarket live trading (CTF Exchange V2). Optional: the base install and the
+# paper-mode bot do not need it; discovery uses Gamma over plain HTTP.
+polymarket = [
+    "py-clob-client-v2>=1.0.1",
+]
 
 [project.scripts]
 tfsm = "betbot.main:app"

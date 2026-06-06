@@ -1,0 +1,39 @@
+# Manual team-name overrides for matching football-data.org names to
+# prediction-market titles (Polymarket / Limitless).
+#
+# Keys are the canonical football-data.org team names (as returned by the
+# API). Values are alternative spellings a market might use. Matching is done
+# on a diacritic-stripped, noise-token-stripped, lowercased form, so you only
+# need entries here for cases fuzzy matching gets WRONG — abbreviations and
+# nicknames the markets favour. Regenerate/extend with:
+#     tfsm ... scripts/seed_aliases.py   (Phase 2)
+#
+# Keep this list conservative: a bad alias silently mis-routes a bet.
+
+aliases:
+  "Paris Saint-Germain FC": ["PSG", "Paris SG", "Paris Saint Germain"]
+  "FC Bayern München": ["Bayern Munich", "Bayern", "Bayern Munchen"]
+  "Borussia Dortmund": ["Dortmund", "BVB"]
+  "Borussia Mönchengladbach": ["Gladbach", "Monchengladbach", "Borussia M'gladbach"]
+  "Manchester City FC": ["Man City", "Manchester City"]
+  "Manchester United FC": ["Man United", "Man Utd", "Manchester United"]
+  "Tottenham Hotspur FC": ["Tottenham", "Spurs"]
+  "Wolverhampton Wanderers FC": ["Wolves", "Wolverhampton"]
+  "Brighton & Hove Albion FC": ["Brighton", "Brighton Hove Albion"]
+  "Newcastle United FC": ["Newcastle", "Newcastle Utd"]
+  "West Ham United FC": ["West Ham", "West Ham Utd"]
+  "Nottingham Forest FC": ["Nottingham Forest", "Notts Forest", "Forest"]
+  "Club Atlético de Madrid": ["Atletico Madrid", "Atletico", "Atleti"]
+  "Real Madrid CF": ["Real Madrid", "Madrid"]
+  "FC Barcelona": ["Barcelona", "Barca"]
+  "Real Sociedad de Fútbol": ["Real Sociedad", "La Real"]
+  "Athletic Club": ["Athletic Bilbao", "Athletic"]
+  "Real Betis Balompié": ["Real Betis", "Betis"]
+  "RC Celta de Vigo": ["Celta Vigo", "Celta"]
+  "Internazionale Milano FC": ["Inter Milan", "Inter", "Internazionale"]
+  "AC Milan": ["Milan", "AC Milan"]
+  "SSC Napoli": ["Napoli"]
+  "AS Roma": ["Roma"]
+  "Juventus FC": ["Juventus", "Juve"]
+  "Olympique de Marseille": ["Marseille", "OM"]
+  "Olympique Lyonnais": ["Lyon", "OL"]
