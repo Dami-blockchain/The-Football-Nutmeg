@@ -21,6 +21,8 @@ from apscheduler.triggers.cron import CronTrigger
 from betbot.config import get_settings
 from betbot.data.football_data import FootballDataClient, FootballDataError
 from betbot.data.form import FormService, _parse_kickoff, _parse_team
+from betbot.exchanges.limitless import LimitlessAdapter
+from betbot.exchanges.limitless_client import LimitlessClient
 from betbot.exchanges.matcher import TeamAliasResolver
 from betbot.exchanges.polymarket import PolymarketAdapter
 from betbot.exchanges.polymarket_gamma import GammaClient
@@ -47,23 +49,28 @@ app.add_typer(bets_app, name="bets")
 # ----------------------------------------------------------------------
 # Exchange routing
 # ----------------------------------------------------------------------
-def _build_router(settings) -> tuple[ExchangeRouter, GammaClient]:
+def _build_router(settings) -> tuple[ExchangeRouter, list]:
     """Construct the exchange router for a run.
 
-    Returns the router and the underlying GammaClient so the caller can close
-    it. ``enable_orders`` stays False in Phase 2 (paper only) — live ordering
-    is wired in Phase 5; the adapter's double-gate keeps place_order inert
-    regardless.
+    Returns the router and the list of HTTP clients the caller must close.
+    ``enable_orders`` stays False through Phase 3 (paper only) — live ordering
+    is wired in Phase 5; each adapter's double-gate keeps place_order inert
+    regardless. Limitless football coverage is sparse and US IPs are geo-blocked
+    (surfaced as LimitlessGeoBlockedError, which the router isolates per-adapter),
+    so most runs route on Polymarket alone — expected, not an error.
     """
     resolver = TeamAliasResolver.from_yaml(_REPO_ROOT / "config" / "team_aliases.yaml")
+
     gamma = GammaClient()
-    polymarket = PolymarketAdapter(
-        gamma,
-        resolver,
-        enable_orders=False,
-        mode=settings.mode,
+    polymarket = PolymarketAdapter(gamma, resolver, enable_orders=False, mode=settings.mode)
+
+    limitless_client = LimitlessClient()
+    limitless = LimitlessAdapter(
+        limitless_client, resolver, enable_orders=False, mode=settings.mode
     )
-    return ExchangeRouter([polymarket]), gamma
+
+    router = ExchangeRouter([polymarket, limitless])
+    return router, [gamma, limitless_client]
 
 
 # ----------------------------------------------------------------------
@@ -87,7 +94,7 @@ async def _score_once() -> int:
     date_to = (today + timedelta(days=2)).isoformat()
 
     paper_bets_logged = 0
-    router, gamma = _build_router(settings)
+    router, _http_clients = _build_router(settings)
 
     async with FootballDataClient(
         api_key=settings.football_data_api_key,
@@ -134,7 +141,8 @@ async def _score_once() -> int:
                             error=str(e),
                         )
         finally:
-            await gamma.close()
+            for client in _http_clients:
+                await client.close()
 
     log.info(
         "scoring_run_done",

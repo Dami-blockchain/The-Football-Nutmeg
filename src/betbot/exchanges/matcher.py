@@ -21,6 +21,8 @@ from pathlib import Path
 import yaml
 from rapidfuzz import fuzz, process
 
+from betbot.data.models import MatchOutcome
+
 # Club-name noise tokens stripped before fuzzy matching. These are the
 # corporate/legal suffixes and filler words that carry no discriminative
 # signal ("Arsenal FC" and "Arsenal" are the same club).
@@ -140,3 +142,30 @@ class TeamAliasResolver:
     ) -> bool:
         """True if two names refer to the same team."""
         return self.match(a, [b], threshold=threshold) is not None
+
+
+def classify_binary_outcome(
+    label: str,
+    home_team: str,
+    away_team: str,
+    resolver: TeamAliasResolver,
+    *,
+    threshold: float = DEFAULT_THRESHOLD,
+) -> MatchOutcome | None:
+    """Map a binary-market outcome label to HOME / DRAW / AWAY (or None).
+
+    Shared by both adapters: on Polymarket ``label`` is the team extracted from a
+    "Will <team> win?" question; on Limitless it is the child market's title
+    ("Liechtenstein", "Cyprus", "Draw"). Returns ``None`` when the label matches
+    neither team nor "draw" — keeping outcome classification in one place so the
+    two venues can't drift apart.
+    """
+    if not label:
+        return None
+    if "draw" in label.lower():
+        return MatchOutcome.DRAW
+    if resolver.same_team(label, home_team, threshold=threshold):
+        return MatchOutcome.HOME
+    if resolver.same_team(label, away_team, threshold=threshold):
+        return MatchOutcome.AWAY
+    return None

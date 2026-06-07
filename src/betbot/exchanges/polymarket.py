@@ -29,7 +29,7 @@ from betbot.exchanges.base import (
     OrderResult,
     Outcome,
 )
-from betbot.exchanges.matcher import TeamAliasResolver
+from betbot.exchanges.matcher import TeamAliasResolver, classify_binary_outcome
 from betbot.exchanges.polymarket_gamma import GammaClient
 from betbot.logging import get_logger
 
@@ -127,12 +127,11 @@ class PolymarketAdapter:
             if len(outcomes) == 3 and len(tokens) == 3:
                 mapping: dict[Outcome, str] = {}
                 for label, token in zip(outcomes, tokens):
-                    if _DRAW_RE.search(str(label)):
-                        mapping[Outcome.DRAW] = token
-                    elif self._resolver.same_team(str(label), home_team):
-                        mapping[Outcome.HOME] = token
-                    elif self._resolver.same_team(str(label), away_team):
-                        mapping[Outcome.AWAY] = token
+                    outcome = classify_binary_outcome(
+                        str(label), home_team, away_team, self._resolver
+                    )
+                    if outcome is not None:
+                        mapping[outcome] = token
                 if Outcome.HOME in mapping and Outcome.AWAY in mapping:
                     return mapping
             return None
@@ -151,10 +150,9 @@ class PolymarketAdapter:
             team = _extract_win_team(question)
             if team is None:
                 continue
-            if self._resolver.same_team(team, home_team):
-                mapping[Outcome.HOME] = yes_token
-            elif self._resolver.same_team(team, away_team):
-                mapping[Outcome.AWAY] = yes_token
+            outcome = classify_binary_outcome(team, home_team, away_team, self._resolver)
+            if outcome in (Outcome.HOME, Outcome.AWAY):
+                mapping[outcome] = yes_token
 
         if Outcome.HOME in mapping and Outcome.AWAY in mapping:
             return mapping

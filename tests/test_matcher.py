@@ -2,7 +2,24 @@
 
 from __future__ import annotations
 
-from betbot.exchanges.matcher import TeamAliasResolver, normalize
+from betbot.data.models import MatchOutcome
+from betbot.exchanges.matcher import (
+    TeamAliasResolver,
+    classify_binary_outcome,
+    normalize,
+)
+
+
+# ----------------------------------------------------------------------
+# classify_binary_outcome (shared by Polymarket + Limitless adapters)
+# ----------------------------------------------------------------------
+def test_classify_binary_outcome():
+    r = TeamAliasResolver()
+    assert classify_binary_outcome("Arsenal", "Arsenal FC", "Chelsea FC", r) is MatchOutcome.HOME
+    assert classify_binary_outcome("Chelsea", "Arsenal FC", "Chelsea FC", r) is MatchOutcome.AWAY
+    assert classify_binary_outcome("Draw", "Arsenal FC", "Chelsea FC", r) is MatchOutcome.DRAW
+    assert classify_binary_outcome("Spurs", "Arsenal FC", "Chelsea FC", r) is None
+    assert classify_binary_outcome("", "Arsenal FC", "Chelsea FC", r) is None
 
 
 # ----------------------------------------------------------------------
