@@ -1,0 +1,13 @@
+# Litestream config for continuous SQLite backup (Phase 9).
+# Install: https://litestream.io/install/  — then put this at /etc/litestream.yml
+# and enable the litestream systemd service. Fill in your S3/B2 bucket + creds
+# (via env: LITESTREAM_ACCESS_KEY_ID / LITESTREAM_SECRET_ACCESS_KEY).
+
+dbs:
+  - path: /home/tfsm/tfsm/data/betbot.sqlite
+    replicas:
+      - type: s3
+        bucket: YOUR_BUCKET
+        path: tfsm/betbot.sqlite
+        # endpoint: https://s3.us-west-000.backblazeb2.com   # B2 example
+        # region: us-west-000

@@ -1,0 +1,16 @@
+[Unit]
+Description=The Football Smart Manager - API (FastAPI/uvicorn)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tfsm
+WorkingDirectory=/home/tfsm/tfsm
+EnvironmentFile=/home/tfsm/tfsm/.env
+ExecStart=/home/tfsm/tfsm/.venv/bin/uvicorn backend.tfsm_api.app:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

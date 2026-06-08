@@ -1,0 +1,16 @@
+[Unit]
+Description=The Football Smart Manager - Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tfsm
+WorkingDirectory=/home/tfsm/tfsm
+EnvironmentFile=/home/tfsm/tfsm/.env
+ExecStart=/home/tfsm/tfsm/.venv/bin/python -m betbot.telegram_bot
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
