@@ -27,6 +27,8 @@ from betbot.exchanges.matcher import TeamAliasResolver
 from betbot.exchanges.polymarket import PolymarketAdapter
 from betbot.exchanges.polymarket_gamma import GammaClient
 from betbot.exchanges.router import ExchangeRouter
+from betbot.backtest import backtest_mock, backtest_stored
+from betbot.gate import evaluate_gate
 from betbot.logging import configure_logging, get_logger
 from betbot.settlement import SettlementWatcher
 from betbot.storage.db import init_engine
@@ -335,6 +337,51 @@ def settle_cmd() -> None:
         f"Trailing-{settings.drawdown_window_days}d P&L "
         f"${summary.window_pnl_usd:.2f} on ${summary.window_staked_usd:.0f} staked. "
         f"Kill switch: {'TRIPPED' if summary.kill_switch_tripped else 'clear'}."
+    )
+
+
+@app.command("backtest")
+def backtest_cmd(
+    mode: Annotated[str, typer.Option(help="stored | mock")] = "stored",
+    window: Annotated[
+        int | None, typer.Option(help="trailing days (stored mode only)")
+    ] = None,
+) -> None:
+    """Backtest the strategy: replay settled bets, or a synthetic diagnostic."""
+    settings = get_settings()
+    configure_logging(settings.log_level)
+    init_engine(settings.db_path)
+    if mode == "mock":
+        r = backtest_mock(edge_threshold=settings.edge_threshold)
+    else:
+        r = backtest_stored(window)
+    typer.echo(
+        f"[{mode}] n={r.n}  hit={r.hit_rate:.1%}  ROI={r.roi:+.1%}  "
+        f"Brier={r.brier:.3f}  P&L=${r.pnl_usd:+.2f} on ${r.staked_usd:.0f}"
+    )
+    for outcome, st in sorted(r.per_outcome.items()):
+        typer.echo(
+            f"   {outcome:<4} n={st.n:>3}  hit={st.hit_rate:.1%}  ROI={st.roi:+.1%}"
+        )
+
+
+@app.command("gate")
+def gate_cmd() -> None:
+    """Check whether the paper record clears the live-trading gate."""
+    settings = get_settings()
+    configure_logging(settings.log_level)
+    init_engine(settings.db_path)
+    g = evaluate_gate(settings)
+    if g.passed:
+        typer.echo("GATE: PASS — paper record clears the live-trading thresholds.")
+    else:
+        typer.echo("GATE: FAIL")
+        for reason in g.reasons:
+            typer.echo(f"   - {reason}")
+    typer.echo(
+        f"  (n={g.result.n}, hit={g.result.hit_rate:.1%}, ROI={g.result.roi:+.1%}, "
+        f"window={g.window_days_observed:.1f}d, "
+        f"kill_switch={'TRIPPED' if g.kill_switch_tripped else 'clear'})"
     )
 
 

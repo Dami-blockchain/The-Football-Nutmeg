@@ -72,6 +72,14 @@ class Settings(BaseSettings):
         default=100.0, alias="BETBOT_DRAWDOWN_MIN_STAKED_USD"
     )
 
+    # ---- Live-readiness gate (Phase 5) --------------------------------
+    gate_min_bets: int = Field(default=20, alias="BETBOT_GATE_MIN_BETS")
+    gate_min_window_days: float = Field(
+        default=14.0, alias="BETBOT_GATE_MIN_WINDOW_DAYS"
+    )
+    gate_min_hit_rate: float = Field(default=0.30, alias="BETBOT_GATE_MIN_HIT_RATE")
+    gate_min_roi: float = Field(default=0.0, alias="BETBOT_GATE_MIN_ROI")
+
     # ---- Storage ------------------------------------------------------
     db_path: Path = Field(
         default=Path("./data/betbot.sqlite"), alias="BETBOT_DB_PATH"

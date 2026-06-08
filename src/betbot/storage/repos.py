@@ -199,6 +199,27 @@ def settled_pnl_window(days: int) -> tuple[float, float]:
     return pnl, staked
 
 
+def list_settled_market_bets(window_days: int | None = None) -> list[PaperBet]:
+    """Settled bets that carried a market price (favourite-only bets excluded).
+
+    Ordered oldest-first by settlement time so callers can measure the window
+    span. Used by the backtest + gate.
+    """
+    with session_scope() as s:
+        stmt = (
+            select(PaperBet)
+            .where(PaperBet.settled_at.is_not(None))
+            .where(PaperBet.market_price.is_not(None))
+            .order_by(PaperBet.settled_at.asc())
+        )
+        if window_days is not None:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+            stmt = stmt.where(PaperBet.settled_at >= cutoff)
+        rows = list(s.execute(stmt).scalars())
+        s.expunge_all()
+        return rows
+
+
 # ----------------------------------------------------------------------
 # Kill switch (Phase 4)
 # ----------------------------------------------------------------------
