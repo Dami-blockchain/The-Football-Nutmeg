@@ -8,7 +8,7 @@ from sqlalchemy import select
 
 from betbot.logging import get_logger
 from betbot.storage.db import session_scope
-from betbot.storage.models import PaperBet, PredictionRow
+from betbot.storage.models import KillSwitch, PaperBet, PredictionRow
 from betbot.strategy.engine import BetDecision, Outcome, Prediction
 
 log = get_logger(__name__)
@@ -143,3 +143,103 @@ def daily_paper_exposure_usd() -> float:
             select(PaperBet.stake_usd).where(PaperBet.created_at >= today_start)
         ).scalars()
         return float(sum(rows))
+
+
+# ----------------------------------------------------------------------
+# Settlement (Phase 4)
+# ----------------------------------------------------------------------
+def list_unsettled_bets_due(now: datetime, grace_minutes: int) -> list[PaperBet]:
+    """Unsettled bets whose kickoff + grace has passed — ready to settle."""
+    cutoff = now - timedelta(minutes=grace_minutes)
+    with session_scope() as s:
+        rows = list(
+            s.execute(
+                select(PaperBet)
+                .join(PredictionRow, PaperBet.prediction_id == PredictionRow.id)
+                .where(PaperBet.settled_at.is_(None))
+                .where(PredictionRow.kickoff <= cutoff)
+                .order_by(PaperBet.fixture_id)
+            ).scalars()
+        )
+        # Detach so attribute access works after the session closes.
+        s.expunge_all()
+        return rows
+
+
+def record_settlement(
+    bet_id: int, settled_outcome: str, pnl_usd: float, settled_at: datetime
+) -> None:
+    with session_scope() as s:
+        bet = s.get(PaperBet, bet_id)
+        if bet is None:
+            return
+        bet.settled_at = settled_at
+        bet.settled_outcome = settled_outcome
+        bet.pnl_usd = pnl_usd
+
+
+def settled_pnl_window(days: int) -> tuple[float, float]:
+    """``(realized_pnl, staked)`` over settled MARKET bets in the trailing window.
+
+    No-market (favourite-only) bets are excluded — they have no real-money
+    equivalent and must not pollute the kill-switch / gate signal.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    with session_scope() as s:
+        rows = list(
+            s.execute(
+                select(PaperBet.pnl_usd, PaperBet.stake_usd)
+                .where(PaperBet.settled_at.is_not(None))
+                .where(PaperBet.settled_at >= cutoff)
+                .where(PaperBet.market_price.is_not(None))
+            )
+        )
+    pnl = float(sum((r[0] or 0.0) for r in rows))
+    staked = float(sum((r[1] or 0.0) for r in rows))
+    return pnl, staked
+
+
+# ----------------------------------------------------------------------
+# Kill switch (Phase 4)
+# ----------------------------------------------------------------------
+def get_kill_switch() -> KillSwitch:
+    """Return the single kill-switch row, creating it (untripped) if absent."""
+    with session_scope() as s:
+        ks = s.get(KillSwitch, 1)
+        if ks is None:
+            ks = KillSwitch(id=1)
+            s.add(ks)
+            s.flush()
+        s.expunge_all()
+        return ks
+
+
+def is_kill_switch_tripped() -> bool:
+    with session_scope() as s:
+        ks = s.get(KillSwitch, 1)
+        return ks is not None and ks.tripped_at is not None
+
+
+def trip_kill_switch(
+    reason: str, realized_pnl_usd: float, staked_usd: float
+) -> None:
+    with session_scope() as s:
+        ks = s.get(KillSwitch, 1)
+        if ks is None:
+            ks = KillSwitch(id=1)
+            s.add(ks)
+        ks.tripped_at = datetime.now(timezone.utc)
+        ks.reason = reason[:300]
+        ks.realized_pnl_usd = realized_pnl_usd
+        ks.staked_usd = staked_usd
+
+
+def reset_kill_switch() -> None:
+    with session_scope() as s:
+        ks = s.get(KillSwitch, 1)
+        if ks is None:
+            return
+        ks.tripped_at = None
+        ks.reason = None
+        ks.realized_pnl_usd = None
+        ks.staked_usd = None

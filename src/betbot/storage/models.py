@@ -93,3 +93,29 @@ class PaperBet(Base):
     pnl_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     prediction: Mapped["PredictionRow"] = relationship(back_populates="paper_bets")
+
+
+class KillSwitch(Base):
+    """Single-row (id=1) drawdown kill switch. Last-write-wins.
+
+    When ``tripped_at`` is set, the scoring loop refuses to log new bets until
+    an operator runs ``tfsm kill-switch reset``. ``realized_pnl_usd`` /
+    ``staked_usd`` record the trailing-window numbers that tripped it.
+    """
+
+    __tablename__ = "kill_switch"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)  # always 1
+    tripped_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    reason: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    realized_pnl_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    staked_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    @property
+    def is_tripped(self) -> bool:
+        return self.tripped_at is not None

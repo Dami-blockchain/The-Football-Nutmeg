@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from betbot.data.models import Fixture, FixtureForm, FormSnapshot, Team
+from betbot.data.models import Fixture, FixtureForm, FormSnapshot
 from betbot.exchanges.base import ExchangeName, OrderbookQuote, Outcome
 from betbot.main import _score_and_log_one
 from betbot.storage.db import init_engine

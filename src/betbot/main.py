@@ -28,12 +28,16 @@ from betbot.exchanges.polymarket import PolymarketAdapter
 from betbot.exchanges.polymarket_gamma import GammaClient
 from betbot.exchanges.router import ExchangeRouter
 from betbot.logging import configure_logging, get_logger
+from betbot.settlement import SettlementWatcher
 from betbot.storage.db import init_engine
 from betbot.storage.repos import (
     daily_paper_exposure_usd,
+    get_kill_switch,
     insert_paper_bet,
     insert_paper_bet_no_market,
+    is_kill_switch_tripped,
     list_recent_paper_bets,
+    reset_kill_switch,
     upsert_prediction,
 )
 from betbot.strategy.engine import StrategyEngine
@@ -44,6 +48,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 app = typer.Typer(add_completion=False, no_args_is_help=True, help=__doc__)
 bets_app = typer.Typer(help="Inspect logged paper bets.")
 app.add_typer(bets_app, name="bets")
+ks_app = typer.Typer(help="Inspect / reset the drawdown kill switch.")
+app.add_typer(ks_app, name="kill-switch")
 
 
 # ----------------------------------------------------------------------
@@ -82,10 +88,18 @@ async def _score_once() -> int:
     log = get_logger(__name__)
     init_engine(settings.db_path)
 
+    kill_tripped = is_kill_switch_tripped()
+    if kill_tripped:
+        log.warning(
+            "kill_switch_active",
+            note="predictions still recorded, but NO new bets will be logged",
+        )
+
     log.info(
         "starting_scoring_run",
         mode=settings.mode,
         leagues=list(settings.leagues),
+        kill_switch_tripped=kill_tripped,
     )
 
     today = date.today()
@@ -123,7 +137,8 @@ async def _score_once() -> int:
                 for m in matches:
                     try:
                         bets = await _score_and_log_one(
-                            m, league, form_service, engine, router, settings
+                            m, league, form_service, engine, router,
+                            settings, kill_tripped,
                         )
                         paper_bets_logged += bets
                     except FootballDataError as e:
@@ -159,6 +174,7 @@ async def _score_and_log_one(
     engine: StrategyEngine,
     router: ExchangeRouter,
     settings,
+    kill_tripped: bool = False,
 ) -> int:
     """Score one fixture and log a paper bet.
 
@@ -200,6 +216,12 @@ async def _score_and_log_one(
     )
 
     pred_id = upsert_prediction(prediction, kickoff=kickoff)
+
+    # Kill switch: predictions are still recorded above (useful data), but we
+    # refuse to log any new bet while the drawdown kill switch is tripped.
+    if kill_tripped:
+        log.debug("bet_suppressed_kill_switch", fixture_id=fixture_id)
+        return 0
 
     # Risk gate: stop if today's exposure has already hit the cap.
     if (
@@ -274,6 +296,22 @@ async def _score_and_log_one(
 
 
 # ----------------------------------------------------------------------
+# Settlement run
+# ----------------------------------------------------------------------
+async def _settle_once():
+    """Settle finished bets, compute P&L, evaluate the kill switch."""
+    settings = get_settings()
+    init_engine(settings.db_path)
+    async with FootballDataClient(
+        api_key=settings.football_data_api_key,
+        base_url=settings.football_data_base_url,
+        rate_limit_per_min=settings.football_data_rate_limit_per_min,
+    ) as client:
+        watcher = SettlementWatcher(client, settings)
+        return await watcher.settle_due()
+
+
+# ----------------------------------------------------------------------
 # CLI commands
 # ----------------------------------------------------------------------
 @app.command("run-once")
@@ -283,6 +321,49 @@ def run_once() -> None:
     configure_logging(settings.log_level)
     n = asyncio.run(_score_once())
     typer.echo(f"Logged {n} paper bet(s).")
+
+
+@app.command("settle")
+def settle_cmd() -> None:
+    """Settle finished bets, compute P&L, and update the kill switch."""
+    settings = get_settings()
+    configure_logging(settings.log_level)
+    summary = asyncio.run(_settle_once())
+    typer.echo(
+        f"Settled {summary.settled} bet(s) "
+        f"({summary.skipped_in_play} in-play, {summary.skipped_no_result} no-result). "
+        f"Trailing-{settings.drawdown_window_days}d P&L "
+        f"${summary.window_pnl_usd:.2f} on ${summary.window_staked_usd:.0f} staked. "
+        f"Kill switch: {'TRIPPED' if summary.kill_switch_tripped else 'clear'}."
+    )
+
+
+@ks_app.command("status")
+def kill_switch_status() -> None:
+    """Show the drawdown kill-switch state."""
+    settings = get_settings()
+    configure_logging(settings.log_level)
+    init_engine(settings.db_path)
+    ks = get_kill_switch()
+    if ks.tripped_at is None:
+        typer.echo("Kill switch: CLEAR")
+        return
+    typer.echo(f"Kill switch: TRIPPED at {ks.tripped_at:%Y-%m-%d %H:%M} UTC")
+    typer.echo(f"  reason: {ks.reason}")
+    typer.echo(
+        f"  realized P&L ${ks.realized_pnl_usd:.2f} on ${ks.staked_usd:.0f} staked"
+    )
+    typer.echo("  run `tfsm kill-switch reset` to resume betting.")
+
+
+@ks_app.command("reset")
+def kill_switch_reset() -> None:
+    """Clear a tripped kill switch so the bot resumes logging bets."""
+    settings = get_settings()
+    configure_logging(settings.log_level)
+    init_engine(settings.db_path)
+    reset_kill_switch()
+    typer.echo("Kill switch reset to CLEAR.")
 
 
 @app.command("run-daemon")
@@ -300,12 +381,18 @@ def run_daemon(
     cron_expr = cron or settings.daemon_cron
     trigger = CronTrigger.from_crontab(cron_expr, timezone=timezone.utc)
 
+    async def _tick() -> None:
+        # Settle finished bets first (updates the kill switch), then score —
+        # so a freshly-tripped kill switch suppresses this tick's new bets.
+        await _settle_once()
+        await _score_once()
+
     async def _main() -> None:
         scheduler = AsyncIOScheduler(timezone=timezone.utc)
-        scheduler.add_job(_score_once, trigger=trigger, id="daily_score")
+        scheduler.add_job(_tick, trigger=trigger, id="score_and_settle")
         scheduler.start()
         log.info("daemon_started", cron=cron_expr)
-        await _score_once()  # immediate first run
+        await _tick()  # immediate first run
         try:
             await asyncio.Event().wait()
         finally:
@@ -341,15 +428,18 @@ def bets_list(
         typer.echo(f"No paper bets in the last {since}.")
         return
     typer.echo(
-        f"{'created_at':<20}  {'fixture':>8}  {'outcome':<5}  "
-        f"{'p':>5}  {'stake':>6}  rationale"
+        f"{'created_at':<17}  {'fixture':>7}  {'out':<4}  {'p':>4}  "
+        f"{'mkt':>5}  {'stake':>6}  {'res':<4}  {'pnl':>8}"
     )
     for b in rows:
         ts = b.created_at.strftime("%Y-%m-%d %H:%M") if b.created_at else "?"
+        mkt = f"{b.market_price:.2f}" if b.market_price is not None else "-"
+        res = b.settled_outcome or "-"
+        pnl = f"${b.pnl_usd:+.2f}" if b.pnl_usd is not None else "-"
         typer.echo(
-            f"{ts:<20}  {b.fixture_id:>8}  {b.outcome:<5}  "
-            f"{b.our_probability:>5.2f}  ${b.stake_usd:>5.0f}  "
-            f"{b.rationale[:80]}"
+            f"{ts:<17}  {b.fixture_id:>7}  {b.outcome:<4}  "
+            f"{b.our_probability:>4.2f}  {mkt:>5}  ${b.stake_usd:>5.0f}  "
+            f"{res:<4}  {pnl:>8}"
         )
 
 

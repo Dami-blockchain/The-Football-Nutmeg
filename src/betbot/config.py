@@ -58,6 +58,20 @@ class Settings(BaseSettings):
     )
     edge_threshold: float = Field(default=0.05, alias="BETBOT_EDGE_THRESHOLD")
 
+    # ---- Settlement + drawdown kill switch (Phase 4) ------------------
+    settle_grace_minutes: int = Field(
+        default=150, alias="BETBOT_SETTLE_GRACE_MINUTES"
+    )
+    drawdown_kill_pct: float = Field(
+        default=0.20, alias="BETBOT_DRAWDOWN_KILL_PCT"
+    )
+    drawdown_window_days: int = Field(
+        default=7, alias="BETBOT_DRAWDOWN_WINDOW_DAYS"
+    )
+    drawdown_min_staked_usd: float = Field(
+        default=100.0, alias="BETBOT_DRAWDOWN_MIN_STAKED_USD"
+    )
+
     # ---- Storage ------------------------------------------------------
     db_path: Path = Field(
         default=Path("./data/betbot.sqlite"), alias="BETBOT_DB_PATH"
