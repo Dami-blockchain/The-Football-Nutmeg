@@ -34,10 +34,18 @@ dev = [
 polymarket = [
     "py-clob-client-v2>=1.0.1",
 ]
+# Backend API + Telegram bot + on-chain wallet/balance reads.
+api = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "web3>=7.0",
+    "python-telegram-bot>=21.0",
+]
 
 [project.scripts]
 tfsm = "betbot.main:app"
 betbot = "betbot.main:app"
+tfsm-bot = "betbot.telegram_bot:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/betbot"]

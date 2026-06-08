@@ -199,6 +199,20 @@ def settled_pnl_window(days: int) -> tuple[float, float]:
     return pnl, staked
 
 
+def list_recent_predictions(days: int = 7) -> list[PredictionRow]:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    with session_scope() as s:
+        rows = list(
+            s.execute(
+                select(PredictionRow)
+                .where(PredictionRow.created_at >= cutoff)
+                .order_by(PredictionRow.kickoff.asc())
+            ).scalars()
+        )
+        s.expunge_all()
+        return rows
+
+
 def list_settled_market_bets(window_days: int | None = None) -> list[PaperBet]:
     """Settled bets that carried a market price (favourite-only bets excluded).
 

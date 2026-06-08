@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>The Football Smart Manager</title>
+<style>
+  :root{
+    --bg:#0d1117; --surface:#161b22; --border:#30363d; --text:#c9d1d9;
+    --muted:#8b949e; --accent:#58a6ff; --success:#3fb950; --danger:#f85149;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:980px;margin:0 auto;padding:24px 16px 60px}
+  header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:20px}
+  h1{font-size:20px;margin:0;font-weight:600}
+  h1 small{color:var(--muted);font-weight:400}
+  .pills{display:flex;gap:8px;flex-wrap:wrap}
+  .pill{font-size:12px;padding:4px 10px;border-radius:999px;border:1px solid var(--border);background:var(--surface)}
+  .pill.good{color:var(--success);border-color:#23502f}
+  .pill.bad{color:var(--danger);border-color:#5c2526}
+  .pill.accent{color:var(--accent);border-color:#1f3a5f}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:18px}
+  .card h2{font-size:13px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin:0 0 14px}
+  .metric{display:flex;justify-content:space-between;align-items:baseline;padding:6px 0;border-bottom:1px solid #21262d}
+  .metric:last-child{border-bottom:0}
+  .metric .k{color:var(--muted);font-size:13px}
+  .metric .v{font-variant-numeric:tabular-nums;font-size:15px;font-weight:600}
+  .addr{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;background:#0d1117;
+    border:1px solid var(--border);border-radius:8px;padding:10px;word-break:break-all;cursor:pointer}
+  .addr:hover{border-color:var(--accent)}
+  .hint{color:var(--muted);font-size:12px;margin-top:8px;line-height:1.5}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:7px 8px;border-bottom:1px solid #21262d;font-variant-numeric:tabular-nums}
+  th{color:var(--muted);font-weight:500}
+  .pos{color:var(--success)} .neg{color:var(--danger)}
+  .foot{color:var(--muted);font-size:12px;margin-top:18px;text-align:center}
+  .err{color:var(--danger);font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>⚽ The Football Smart Manager <small>· dashboard</small></h1>
+    <div class="pills" id="pills"></div>
+  </header>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Deposit USDC</h2>
+      <div class="addr" id="addr" title="click to copy">loading…</div>
+      <div id="balances" style="margin-top:12px"></div>
+      <div class="hint">Same address on <b>Polygon</b> (Polymarket) &amp; <b>Base</b> (Limitless).
+        Send USDC on either chain. Depositing does <b>not</b> start live trading —
+        that stays gated until the paper record passes.</div>
+    </div>
+
+    <div class="card">
+      <h2>Performance</h2>
+      <div id="perf"></div>
+    </div>
+
+    <div class="card" style="grid-column:1/-1">
+      <h2>Recent bets</h2>
+      <div id="bets">loading…</div>
+    </div>
+  </div>
+  <div class="foot" id="foot"></div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const tok = localStorage.getItem("tfsm_token");
+const H = tok ? {Authorization:"Bearer "+tok} : {};
+const fmt = (n,d=2)=> (n==null?"—":Number(n).toFixed(d));
+const pct = (n)=> (n==null?"—":(n*100).toFixed(1)+"%");
+
+async function api(path){
+  const r = await fetch(path,{headers:H});
+  if(!r.ok) throw new Error(path+" → "+r.status);
+  return r.json();
+}
+
+function pill(text, cls){ return `<span class="pill ${cls}">${text}</span>`; }
+
+async function load(){
+  try{
+    const s = await api("/api/status");
+    // pills
+    $("pills").innerHTML =
+      pill("mode: "+s.mode, "accent") +
+      pill(s.kill_switch.tripped?"kill switch: TRIPPED":"kill switch: clear", s.kill_switch.tripped?"bad":"good") +
+      pill(s.gate.passed?"gate: PASS":"gate: FAIL", s.gate.passed?"good":"bad");
+    // wallet
+    $("addr").textContent = s.wallet.address;
+    $("balances").innerHTML = s.wallet.balances.map(b=>
+      `<div class="metric"><span class="k">${b.label}</span><span class="v">${fmt(b.usdc)} USDC${b.ok?"":" ⚠"}</span></div>`
+    ).join("") + `<div class="metric"><span class="k">Total</span><span class="v">${fmt(s.wallet.total_usdc)} USDC</span></div>`;
+    // performance
+    const p = s.performance, tw = s.trailing_window;
+    const pnlCls = tw.pnl_usd>=0?"pos":"neg";
+    $("perf").innerHTML =
+      `<div class="metric"><span class="k">Settled bets</span><span class="v">${p.n}</span></div>`+
+      `<div class="metric"><span class="k">Hit rate</span><span class="v">${pct(p.hit_rate)}</span></div>`+
+      `<div class="metric"><span class="k">ROI</span><span class="v">${pct(p.roi)}</span></div>`+
+      `<div class="metric"><span class="k">Brier</span><span class="v">${fmt(p.brier,3)}</span></div>`+
+      `<div class="metric"><span class="k">P&L (${tw.days}d)</span><span class="v ${pnlCls}">$${fmt(tw.pnl_usd)}</span></div>`+
+      `<div class="metric"><span class="k">Daily exposure</span><span class="v">$${fmt(s.daily_exposure_usd)}</span></div>`;
+    // bets
+    const {bets} = await api("/api/bets?days=30");
+    if(!bets.length){ $("bets").innerHTML = '<div class="hint">No bets yet.</div>'; }
+    else{
+      $("bets").innerHTML = "<table><tr><th>fixture</th><th>out</th><th>p</th><th>mkt</th><th>stake</th><th>result</th><th>pnl</th></tr>"+
+        bets.slice(0,25).map(b=>{
+          const cls = b.pnl_usd==null?"":(b.pnl_usd>=0?"pos":"neg");
+          return `<tr><td>${b.fixture_id}</td><td>${b.outcome}</td><td>${fmt(b.our_probability,2)}</td>`+
+            `<td>${b.market_price==null?"—":fmt(b.market_price,2)}</td><td>$${fmt(b.stake_usd,0)}</td>`+
+            `<td>${b.settled_outcome||"—"}</td><td class="${cls}">${b.pnl_usd==null?"—":"$"+fmt(b.pnl_usd)}</td></tr>`;
+        }).join("")+"</table>";
+    }
+    $("foot").textContent = "updated "+new Date().toLocaleTimeString();
+  }catch(e){
+    $("foot").innerHTML = '<span class="err">'+e.message+(e.message.includes("401")?" — set a token: localStorage.tfsm_token":"")+'</span>';
+  }
+}
+$("addr").addEventListener("click",()=>{navigator.clipboard.writeText($("addr").textContent);$("addr").textContent+="  ✓ copied";setTimeout(load,800)});
+load(); setInterval(load, 15000);
+</script>
+</body>
+</html>

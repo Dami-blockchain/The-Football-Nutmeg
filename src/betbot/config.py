@@ -80,6 +80,22 @@ class Settings(BaseSettings):
     gate_min_hit_rate: float = Field(default=0.30, alias="BETBOT_GATE_MIN_HIT_RATE")
     gate_min_roi: float = Field(default=0.0, alias="BETBOT_GATE_MIN_ROI")
 
+    # ---- API / wallet / Telegram (backend + TG bot) ------------------
+    api_token: str = Field(default="", alias="TFSM_API_TOKEN")
+    wallet_keyfile: Path = Field(
+        default=Path("./.secrets/agent_wallet.key"), alias="BETBOT_WALLET_KEYFILE"
+    )
+    polygon_rpc_url: str = Field(
+        default="https://polygon.drpc.org", alias="POLYGON_RPC_URL"
+    )
+    base_rpc_url: str = Field(
+        default="https://mainnet.base.org", alias="BASE_RPC_URL"
+    )
+    telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
+    telegram_allowed_user_id: int = Field(
+        default=0, alias="TELEGRAM_ALLOWED_USER_ID"
+    )
+
     # ---- Storage ------------------------------------------------------
     db_path: Path = Field(
         default=Path("./data/betbot.sqlite"), alias="BETBOT_DB_PATH"
