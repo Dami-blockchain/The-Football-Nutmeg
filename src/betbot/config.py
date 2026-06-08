@@ -103,6 +103,15 @@ class Settings(BaseSettings):
     # Max slippage added to the quoted price when sending a market buy.
     order_slippage: float = Field(default=0.02, alias="BETBOT_ORDER_SLIPPAGE")
 
+    # ---- Glicko-2 (international / World Cup, Phase 5.5) --------------
+    glicko_tau: float = Field(default=0.5, alias="BETBOT_GLICKO_TAU")
+    glicko_default_rating: float = Field(default=1500.0, alias="BETBOT_GLICKO_DEFAULT_RATING")
+    glicko_default_rd: float = Field(default=200.0, alias="BETBOT_GLICKO_DEFAULT_RD")
+    glicko_default_vol: float = Field(default=0.06, alias="BETBOT_GLICKO_DEFAULT_VOL")
+    glicko_draw_rho: float = Field(default=0.28, alias="BETBOT_GLICKO_DRAW_RHO")
+    glicko_host_home_mu: float = Field(default=0.2, alias="BETBOT_GLICKO_HOST_HOME_MU")
+    glicko_results_csv: str = Field(default="", alias="BETBOT_GLICKO_RESULTS_CSV")
+
     # ---- Storage ------------------------------------------------------
     db_path: Path = Field(
         default=Path("./data/betbot.sqlite"), alias="BETBOT_DB_PATH"

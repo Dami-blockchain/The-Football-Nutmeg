@@ -8,8 +8,9 @@ from sqlalchemy import select
 
 from betbot.logging import get_logger
 from betbot.storage.db import session_scope
-from betbot.storage.models import KillSwitch, PaperBet, PredictionRow
+from betbot.storage.models import GlickoRating, KillSwitch, PaperBet, PredictionRow
 from betbot.strategy.engine import BetDecision, Outcome, Prediction
+from betbot.strategy.glicko import Glicko2Rating, update_rating
 
 log = get_logger(__name__)
 
@@ -278,3 +279,82 @@ def reset_kill_switch() -> None:
         ks.reason = None
         ks.realized_pnl_usd = None
         ks.staked_usd = None
+
+
+# ----------------------------------------------------------------------
+# Glicko ratings (Phase 5.5)
+# ----------------------------------------------------------------------
+def get_rating(
+    team_name: str,
+    *,
+    default_rating: float = 1500.0,
+    default_rd: float = 200.0,
+    default_vol: float = 0.06,
+) -> Glicko2Rating:
+    with session_scope() as s:
+        row = s.execute(
+            select(GlickoRating).where(GlickoRating.team_name == team_name)
+        ).scalar_one_or_none()
+        if row is None:
+            return Glicko2Rating(default_rating, default_rd, default_vol)
+        return Glicko2Rating(row.rating, row.rd, row.volatility, row.last_period)
+
+
+def upsert_rating(team_name: str, rating: Glicko2Rating, *, team_id: int | None = None) -> None:
+    with session_scope() as s:
+        row = s.execute(
+            select(GlickoRating).where(GlickoRating.team_name == team_name)
+        ).scalar_one_or_none()
+        if row is None:
+            s.add(GlickoRating(
+                team_name=team_name, team_id=team_id, rating=rating.rating,
+                rd=rating.rd, volatility=rating.volatility, last_period=rating.last_period,
+            ))
+        else:
+            row.rating, row.rd, row.volatility = rating.rating, rating.rd, rating.volatility
+            row.last_period = rating.last_period
+            if team_id is not None:
+                row.team_id = team_id
+
+
+def all_ratings() -> list[tuple[str, Glicko2Rating]]:
+    with session_scope() as s:
+        rows = list(
+            s.execute(select(GlickoRating).order_by(GlickoRating.rating.desc())).scalars()
+        )
+        return [(r.team_name, Glicko2Rating(r.rating, r.rd, r.volatility, r.last_period))
+                for r in rows]
+
+
+def apply_rating_period(
+    matches: list[tuple[str, str, str]],
+    period: str,
+    *,
+    tau: float = 0.5,
+    default_rating: float = 1500.0,
+    default_rd: float = 200.0,
+    default_vol: float = 0.06,
+) -> int:
+    """Apply one Glicko-2 rating period from ``(home, away, outcome)`` results.
+
+    ``outcome`` is "HOME"/"AWAY"/"DRAW". All updates use opponents' PRE-period
+    ratings (correct Glicko-2 semantics), then persist. Returns teams updated.
+    """
+    teams: set[str] = set()
+    for home, away, _ in matches:
+        teams.add(home)
+        teams.add(away)
+    current = {
+        t: get_rating(t, default_rating=default_rating, default_rd=default_rd,
+                      default_vol=default_vol)
+        for t in teams
+    }
+    per_team: dict[str, list[tuple[float, float, float]]] = {t: [] for t in teams}
+    for home, away, outcome in matches:
+        sh = 1.0 if outcome == "HOME" else (0.5 if outcome == "DRAW" else 0.0)
+        sa = 1.0 if outcome == "AWAY" else (0.5 if outcome == "DRAW" else 0.0)
+        per_team[home].append((current[away].rating, current[away].rd, sh))
+        per_team[away].append((current[home].rating, current[home].rd, sa))
+    for t in teams:
+        upsert_rating(t, update_rating(current[t], per_team[t], tau=tau, period=period))
+    return len(teams)

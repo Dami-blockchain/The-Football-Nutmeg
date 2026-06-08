@@ -43,6 +43,7 @@ from betbot.storage.repos import (
     upsert_prediction,
 )
 from betbot.strategy.engine import StrategyEngine
+from betbot.strategy.international_engine import InternationalStrategyEngine
 
 # Repo root (…/tfsm), used to locate config/team_aliases.yaml regardless of cwd.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -52,6 +53,8 @@ bets_app = typer.Typer(help="Inspect logged paper bets.")
 app.add_typer(bets_app, name="bets")
 ks_app = typer.Typer(help="Inspect / reset the drawdown kill switch.")
 app.add_typer(ks_app, name="kill-switch")
+glicko_app = typer.Typer(help="Glicko-2 ratings (international / World Cup).")
+app.add_typer(glicko_app, name="glicko")
 
 
 # ----------------------------------------------------------------------
@@ -139,6 +142,7 @@ async def _score_once() -> int:
     ) as client:
         form_service = FormService(client, settings)
         engine = StrategyEngine(settings)
+        intl_engine = InternationalStrategyEngine(settings)
 
         try:
             for league in settings.leagues:
@@ -156,10 +160,13 @@ async def _score_once() -> int:
                     upcoming=len(matches),
                     window=f"{date_from}..{date_to}",
                 )
+                # International competitions (World Cup) use the Glicko engine;
+                # club leagues use the form-based StrategyEngine.
+                eng = intl_engine if league in INTERNATIONAL_COMPETITIONS else engine
                 for m in matches:
                     try:
                         bets = await _score_and_log_one(
-                            m, league, form_service, engine, router,
+                            m, league, form_service, eng, router,
                             settings, kill_tripped, live_orders,
                         )
                         paper_bets_logged += bets
@@ -475,6 +482,31 @@ def kill_switch_reset() -> None:
     init_engine(settings.db_path)
     reset_kill_switch()
     typer.echo("Kill switch reset to CLEAR.")
+
+
+@glicko_app.command("ratings")
+def glicko_ratings() -> None:
+    """List current Glicko-2 ratings, strongest first."""
+    settings = get_settings()
+    configure_logging(settings.log_level)
+    init_engine(settings.db_path)
+    from betbot.storage.repos import all_ratings
+
+    rows = all_ratings()
+    if not rows:
+        typer.echo("No Glicko ratings yet. Seed with: python scripts/seed_glicko.py")
+        return
+    typer.echo(f"{'team':<28} {'rating':>8} {'RD':>6} {'vol':>7}")
+    for name, r in rows:
+        typer.echo(f"{name:<28} {r.rating:>8.1f} {r.rd:>6.1f} {r.volatility:>7.4f}")
+
+
+@glicko_app.command("seed")
+def glicko_seed() -> None:
+    """Bootstrap ratings (Path 1 results-CSV, or Path 2 World-Cup teams)."""
+    import runpy
+
+    runpy.run_path(str(_REPO_ROOT / "scripts" / "seed_glicko.py"), run_name="__main__")
 
 
 @app.command("run-daemon")

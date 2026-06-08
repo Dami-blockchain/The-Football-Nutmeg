@@ -119,3 +119,23 @@ class KillSwitch(Base):
     @property
     def is_tripped(self) -> bool:
         return self.tripped_at is not None
+
+
+class GlickoRating(Base):
+    """Current Glicko-2 rating per national team (Phase 5.5). Upsert on name."""
+
+    __tablename__ = "glicko_ratings"
+    __table_args__ = (
+        UniqueConstraint("team_name", name="uq_glicko_team_name"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    team_name: Mapped[str] = mapped_column(String(80), index=True)
+    team_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rating: Mapped[float] = mapped_column(Float)
+    rd: Mapped[float] = mapped_column(Float)
+    volatility: Mapped[float] = mapped_column(Float)
+    last_period: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
