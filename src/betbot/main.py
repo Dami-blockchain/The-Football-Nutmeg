@@ -339,11 +339,15 @@ async def _maybe_place_live_order(route, prediction, decision, settings, live_or
     log = get_logger(__name__)
     if not live_orders:
         return
-    if prediction.competition_code in INTERNATIONAL_COMPETITIONS:
+    if (
+        prediction.competition_code in INTERNATIONAL_COMPETITIONS
+        and not settings.allow_international_live
+    ):
         log.info(
             "live_order_skipped_international",
             fixture_id=prediction.fixture_id,
             competition=prediction.competition_code,
+            note="set BETBOT_ALLOW_INTERNATIONAL_LIVE=true to enable",
         )
         return
     max_price = min(0.99, route.quote.yes_price + settings.order_slippage)

@@ -27,8 +27,10 @@ from betbot.config import get_settings
 from betbot.wallet import CHAINS
 
 USDC = CHAINS["base"]["usdc"]  # 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
-# Base CTF (conditional tokens). Confirm against Limitless docs before --confirm.
-CTF = os.environ.get("LIMITLESS_CTF", "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
+# Base CTF (conditional tokens) — NO safe default: this differs from Polymarket's
+# Polygon CTF. Confirm the Base address against Limitless docs and pass via
+# LIMITLESS_CTF. (Left empty on purpose so a wrong address can't be used silently.)
+CTF = os.environ.get("LIMITLESS_CTF", "")
 
 MAX_UINT = 2**256 - 1
 ERC20_ABI = [
@@ -85,6 +87,12 @@ def main() -> None:
         print("  → approve USDC for exchange")
         if args.confirm:
             _send(usdc.functions.approve(exch, MAX_UINT))
+
+    if not CTF:
+        print("  ! LIMITLESS_CTF not set — skipping CTF setApprovalForAll. "
+              "Confirm the Base CTF address with Limitless docs and re-run.")
+        print("done." if args.confirm else "dry-run complete (pass --confirm to send).")
+        return
 
     ctf = w3.eth.contract(address=Web3.to_checksum_address(CTF), abi=ERC1155_ABI)
     if ctf.functions.isApprovedForAll(acct.address, exch).call():

@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from betbot.data.models import Fixture, FixtureForm, FormSnapshot
+from betbot.data.models import Fixture, FixtureForm, FormSnapshot, Team
 from betbot.exchanges.base import (
     ExchangeName,
     MarketRef,
@@ -144,6 +144,15 @@ async def test_wc_live_order_skipped(fresh_db, settings):
                                  router, settings, False, True)  # live_orders=True
     assert n == 1
     assert router.adapter.placed == []  # guard held — no live order on WC
+
+
+async def test_wc_live_order_allowed_when_flag_set(fresh_db, settings):
+    settings.allow_international_live = True  # operator opt-in
+    router = FakeRouter(_home_quote(0.50))
+    n = await _score_and_log_one(MATCH, "WC", FakeForm(), StrategyEngine(settings),
+                                 router, settings, False, True)
+    assert n == 1
+    assert len(router.adapter.placed) == 1  # now WC can place live
 
 
 async def test_paper_mode_places_no_live_order(fresh_db, settings):

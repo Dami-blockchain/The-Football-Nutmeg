@@ -102,6 +102,12 @@ class Settings(BaseSettings):
     limitless_private_key: str = Field(default="", alias="LIMITLESS_PRIVATE_KEY")
     # Max slippage added to the quoted price when sending a market buy.
     order_slippage: float = Field(default=0.02, alias="BETBOT_ORDER_SLIPPAGE")
+    # Allow live orders on INTERNATIONAL_COMPETITIONS (World Cup). Default OFF:
+    # the Glicko model is weak vs efficient WC markets and Appendix A makes WC
+    # paper-only by default. Set true to opt in (still gated by live mode + gate).
+    allow_international_live: bool = Field(
+        default=False, alias="BETBOT_ALLOW_INTERNATIONAL_LIVE"
+    )
 
     # ---- Glicko-2 (international / World Cup, Phase 5.5) --------------
     glicko_tau: float = Field(default=0.5, alias="BETBOT_GLICKO_TAU")

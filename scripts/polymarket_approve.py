@@ -30,13 +30,14 @@ from web3 import Web3
 
 from betbot.config import get_settings
 
-# --- addresses (VERIFY against docs.polymarket.com before --confirm) ---
+# --- addresses (verified against docs.polymarket.com/resources/contracts,
+#     2026-06-08; all Polygon / chainId 137). Override via env if they change. ---
 USDC = os.environ.get("POLYMARKET_USDC", "0x3c499c542cEF5E3811e1192ce70d8cc03d5c3359")
 PUSD = os.environ.get("POLYMARKET_PUSD", "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB")
 CTF = os.environ.get("POLYMARKET_CTF", "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
 EXCHANGE_V2 = os.environ.get("POLYMARKET_EXCHANGE", "0xE111180000d2663C0091e4f400237545B87B996B")
-NEG_RISK = os.environ.get("POLYMARKET_NEG_RISK", "")
-ONRAMP = os.environ.get("POLYMARKET_ONRAMP", "")
+NEG_RISK = os.environ.get("POLYMARKET_NEG_RISK", "0xe2222d279d744050d28e00520010520000310F59")
+ONRAMP = os.environ.get("POLYMARKET_ONRAMP", "0x93070a847efEf7F70739046A929D47a521F5B8ee")
 
 MAX_UINT = 2**256 - 1
 ERC20_ABI = [
