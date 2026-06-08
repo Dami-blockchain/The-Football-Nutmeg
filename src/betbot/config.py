@@ -100,6 +100,10 @@ class Settings(BaseSettings):
     polymarket_private_key: str = Field(default="", alias="POLYMARKET_PRIVATE_KEY")
     polymarket_funder: str = Field(default="", alias="POLYMARKET_FUNDER")
     limitless_private_key: str = Field(default="", alias="LIMITLESS_PRIVATE_KEY")
+    # Limitless API auth (create in the Limitless app: connect the agent wallet,
+    # then derive a scoped API token). Without these, live orders can't post.
+    limitless_api_key: str = Field(default="", alias="LIMITLESS_API_KEY")
+    limitless_api_secret: str = Field(default="", alias="LIMITLESS_API_SECRET")
     # Max slippage added to the quoted price when sending a market buy.
     order_slippage: float = Field(default=0.02, alias="BETBOT_ORDER_SLIPPAGE")
     # Allow live orders on INTERNATIONAL_COMPETITIONS (World Cup). Default OFF:
@@ -119,6 +123,15 @@ class Settings(BaseSettings):
     # go live without a paper-trading record (NOT recommended — you lose the
     # "earned the right to trade" safety check).
     require_gate: bool = Field(default=True, alias="BETBOT_REQUIRE_GATE")
+
+    # ---- Arbitrage watch (Telegram alerts) ---------------------------
+    arb_notify_min_margin: float = Field(
+        default=0.01, alias="BETBOT_ARB_NOTIFY_MIN_MARGIN"
+    )
+    arb_scan_interval_min: int = Field(
+        default=10, alias="BETBOT_ARB_SCAN_INTERVAL_MIN"
+    )
+    arb_scan_limit: int = Field(default=80, alias="BETBOT_ARB_SCAN_LIMIT")
 
     # ---- Glicko-2 (international / World Cup, Phase 5.5) --------------
     glicko_tau: float = Field(default=0.5, alias="BETBOT_GLICKO_TAU")

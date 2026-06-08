@@ -17,6 +17,7 @@ from typing import Annotated
 import typer
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from betbot.config import INTERNATIONAL_COMPETITIONS, get_settings
 from betbot.data.football_data import FootballDataClient, FootballDataError
@@ -533,19 +534,28 @@ def glicko_seed() -> None:
     runpy.run_path(str(_REPO_ROOT / "scripts" / "seed_glicko.py"), run_name="__main__")
 
 
-async def _arb_scan(settings, limit: int, min_margin: float) -> None:
+async def _run_arb_scan(settings, limit: int, min_margin: float) -> list:
+    """Scan Polymarket + Limitless + SX Bet; return complete opportunities at or
+    above ``min_margin``, best first. Builds + closes its own clients."""
     import re
     from datetime import datetime, timezone
 
     from betbot.exchanges.arbitrage import ArbScanner
+    from betbot.exchanges.sxbet import SXBetAdapter, SXBetClient
 
     win = re.compile(r"will\s+(.+?)\s+win", re.IGNORECASE)
     router, clients = _build_router(settings)
     gamma = clients[0]
-    scanner = ArbScanner(router.adapters)
+    # SX Bet is scan-only — added to the arb scan, NOT the betting router.
+    sx_client = SXBetClient()
+    sx = SXBetAdapter(
+        sx_client, TeamAliasResolver.from_yaml(_REPO_ROOT / "config" / "team_aliases.yaml")
+    )
+    clients = clients + [sx_client]
+    scanner = ArbScanner(router.adapters + [sx])
+    found = []
     try:
         events = await gamma.list_soccer_events(limit=limit)
-        found = []
         for e in events:
             teams = []
             for m in e.get("markets") or []:
@@ -559,21 +569,47 @@ async def _arb_scan(settings, limit: int, min_margin: float) -> None:
             opp = await scanner.scan(teams[0], teams[1], datetime.now(timezone.utc))
             if opp and opp.complete and opp.margin >= min_margin:
                 found.append(opp)
-        found.sort(key=lambda o: o.margin, reverse=True)
-        if not found:
-            typer.echo("No cross-venue matches found on BOTH venues "
-                       "(Limitless coverage is sparse — expected).")
-            return
-        typer.echo(f"{'match':<32}{'sum':>6}{'margin':>9}   legs (outcome:venue@price)")
-        for o in found[:25]:
-            legs = "  ".join(f"{ov}:{lg.exchange.value[:4]}@{lg.price:.2f}"
-                             for ov, lg in o.legs.items())
-            tag = " ARB" if o.margin > 0 else ""
-            typer.echo(f"{(o.home_team + ' v ' + o.away_team)[:31]:<32}"
-                       f"{o.price_sum:>6.2f}{o.margin:>+8.1%}{tag}   {legs}")
     finally:
         for c in clients:
             await c.close()
+    found.sort(key=lambda o: o.margin, reverse=True)
+    return found
+
+
+async def _arb_scan(settings, limit: int, min_margin: float) -> None:
+    found = await _run_arb_scan(settings, limit, min_margin)
+    if not found:
+        typer.echo("No cross-venue matches found across venues "
+                   "(per-match overlap is rare — Limitless/SX list few matches).")
+        return
+    typer.echo(f"{'match':<32}{'sum':>6}{'margin':>9}   legs (outcome:venue@price)")
+    for o in found[:25]:
+        legs = "  ".join(f"{ov}:{lg.exchange.value[:4]}@{lg.price:.2f}"
+                         for ov, lg in o.legs.items())
+        tag = " ARB" if o.margin > 0 else ""
+        typer.echo(f"{(o.home_team + ' v ' + o.away_team)[:31]:<32}"
+                   f"{o.price_sum:>6.2f}{o.margin:>+8.1%}{tag}   {legs}")
+
+
+async def _arb_scan_and_notify(settings) -> int:
+    """Scan and push a Telegram alert for each real (margin>0) opportunity."""
+    from betbot.notify import send_telegram
+
+    log = get_logger(__name__)
+    found = await _run_arb_scan(
+        settings, settings.arb_scan_limit, settings.arb_notify_min_margin
+    )
+    sent = 0
+    for o in found:
+        legs = "\n".join(f"  {ov}: {lg.exchange.value} @ {lg.price:.3f}"
+                         for ov, lg in o.legs.items())
+        msg = (f"🔔 *Arb opportunity*\n*{o.home_team} v {o.away_team}*\n"
+               f"locked margin *{o.margin:+.1%}* (cost {o.price_sum:.3f})\n{legs}")
+        if await send_telegram(settings, msg):
+            sent += 1
+    if found:
+        log.info("arb_notified", opportunities=len(found), sent=sent)
+    return sent
 
 
 @arb_app.command("scan")
@@ -585,6 +621,16 @@ def arb_scan(
     settings = get_settings()
     configure_logging(settings.log_level)
     asyncio.run(_arb_scan(settings, limit, min_margin))
+
+
+@arb_app.command("watch")
+def arb_watch() -> None:
+    """One-shot scan + Telegram alert per opportunity (the daemon also does this
+    automatically every BETBOT_ARB_SCAN_INTERVAL_MIN minutes)."""
+    settings = get_settings()
+    configure_logging(settings.log_level)
+    n = asyncio.run(_arb_scan_and_notify(settings))
+    typer.echo(f"Notified {n} opportunity(ies).")
 
 
 @app.command("run-daemon")
@@ -608,11 +654,23 @@ def run_daemon(
         await _settle_once()
         await _score_once()
 
+    async def _arb_tick() -> None:
+        try:
+            await _arb_scan_and_notify(get_settings())
+        except Exception as e:  # noqa: BLE001 — never let the watcher crash the daemon
+            get_logger(__name__).warning("arb_tick_failed", error=str(e))
+
     async def _main() -> None:
+        s = get_settings()
         scheduler = AsyncIOScheduler(timezone=timezone.utc)
         scheduler.add_job(_tick, trigger=trigger, id="score_and_settle")
+        scheduler.add_job(
+            _arb_tick,
+            trigger=IntervalTrigger(minutes=s.arb_scan_interval_min),
+            id="arb_watch",
+        )
         scheduler.start()
-        log.info("daemon_started", cron=cron_expr)
+        log.info("daemon_started", cron=cron_expr, arb_scan_min=s.arb_scan_interval_min)
         await _tick()  # immediate first run
         try:
             await asyncio.Event().wait()

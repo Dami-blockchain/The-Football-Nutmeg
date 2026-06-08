@@ -18,6 +18,7 @@ from betbot.data.models import MatchOutcome
 class ExchangeName(str, Enum):
     POLYMARKET = "POLYMARKET"
     LIMITLESS = "LIMITLESS"
+    SXBET = "SXBET"
 
 
 Outcome = MatchOutcome
