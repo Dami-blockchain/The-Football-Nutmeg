@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from betbot.data.models import Fixture, FixtureForm, FormSnapshot, Team
+from betbot.data.models import Fixture, FixtureForm, FormSnapshot
 from betbot.exchanges.base import (
     ExchangeName,
     MarketRef,
@@ -160,6 +160,24 @@ async def test_paper_mode_places_no_live_order(fresh_db, settings):
     await _score_and_log_one(MATCH, "PL", FakeForm(), StrategyEngine(settings),
                              router, settings, False, False)  # live_orders=False
     assert router.adapter.placed == []
+
+
+async def test_bet_every_match_wc_forces_bet_without_edge(fresh_db, settings):
+    settings.international_bet_every_match = True
+    router = FakeRouter(_home_quote(0.97))  # high price -> normally no edge
+    n = await _score_and_log_one(MATCH, "WC", FakeForm(), StrategyEngine(settings),
+                                 router, settings, False, False)
+    assert n == 1  # bet placed despite no edge
+    rows = list_recent_paper_bets(days=7)
+    assert len(rows) == 1 and rows[0].market_price == 0.97
+
+
+async def test_wc_no_edge_still_vetoes_without_flag(fresh_db, settings):
+    # default international_bet_every_match=False -> normal veto on no edge
+    router = FakeRouter(_home_quote(0.97))
+    n = await _score_and_log_one(MATCH, "WC", FakeForm(), StrategyEngine(settings),
+                                 router, settings, False, False)
+    assert n == 0
 
 
 async def test_exposure_cap_blocks_logging(fresh_db, settings):

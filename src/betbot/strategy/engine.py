@@ -91,11 +91,15 @@ class StrategyEngine:
         prediction: Prediction,
         outcome: Outcome,
         market_price: float,
+        *,
+        require_edge: bool = True,
     ) -> BetDecision | None:
         """Apply the edge filter; return a BetDecision or None.
 
         ``None`` means the market quote vetoed the bet — don't fall back
-        to favourite-only logging in this case.
+        to favourite-only logging in this case. With ``require_edge=False``
+        the edge gate is skipped and a decision is always returned (used by
+        "bet every match" mode, which knowingly bets at negative edge).
         """
         s = self._settings
         our_p = {
@@ -104,12 +108,13 @@ class StrategyEngine:
             Outcome.AWAY: prediction.p_away,
         }[outcome]
         e = edge(our_p, market_price)
-        if e < s.edge_threshold:
+        if require_edge and e < s.edge_threshold:
             return None
         stake = min(s.fixed_stake_usd, s.max_bet_usd)
+        gate = "forced (bet-every-match)" if not require_edge else f"≥{s.edge_threshold:.3f} threshold"
         rationale = (
-            f"edge {e:+.3f} ({our_p:.3f} - {market_price:.3f}) at "
-            f"≥{s.edge_threshold:.3f} threshold; stake ${stake:.0f}"
+            f"edge {e:+.3f} ({our_p:.3f} - {market_price:.3f}); {gate}; "
+            f"stake ${stake:.0f}"
         )
         return BetDecision(
             fixture_id=prediction.fixture_id,

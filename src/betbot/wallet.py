@@ -86,6 +86,20 @@ def get_or_create_address(keyfile: str | Path) -> str:
     return acct.address
 
 
+def get_private_key(keyfile: str | Path) -> str | None:
+    """Return the agent wallet's private key (hex) from the keyfile, or None.
+
+    Used as the live-trading signing key when POLYMARKET/LIMITLESS_PRIVATE_KEY
+    aren't set explicitly — i.e. the bot signs orders with the same wallet you
+    deposit into.
+    """
+    p = Path(keyfile)
+    if not p.exists():
+        return None
+    key = p.read_text().strip()
+    return key or None
+
+
 def _rpc_for(chain: str, settings) -> str:
     if chain == "polygon":
         return settings.polygon_rpc_url

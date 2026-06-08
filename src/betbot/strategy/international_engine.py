@@ -66,6 +66,9 @@ class InternationalStrategyEngine:
         )
 
     def decide_with_market(
-        self, prediction: Prediction, outcome: Outcome, market_price: float
+        self, prediction: Prediction, outcome: Outcome, market_price: float,
+        *, require_edge: bool = True,
     ) -> BetDecision | None:
-        return self._base.decide_with_market(prediction, outcome, market_price)
+        return self._base.decide_with_market(
+            prediction, outcome, market_price, require_edge=require_edge
+        )

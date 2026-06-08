@@ -108,6 +108,17 @@ class Settings(BaseSettings):
     allow_international_live: bool = Field(
         default=False, alias="BETBOT_ALLOW_INTERNATIONAL_LIVE"
     )
+    # Bet EVERY international (WC) match that has a market, bypassing the edge
+    # filter. This is -EV against efficient markets (see the Qatar 2022 backtest)
+    # but is what the operator wants for the World Cup. The kill switch + daily
+    # exposure cap still apply as guardrails.
+    international_bet_every_match: bool = Field(
+        default=False, alias="BETBOT_INTERNATIONAL_BET_EVERY_MATCH"
+    )
+    # Require the live-readiness gate before placing live orders. Set false to
+    # go live without a paper-trading record (NOT recommended — you lose the
+    # "earned the right to trade" safety check).
+    require_gate: bool = Field(default=True, alias="BETBOT_REQUIRE_GATE")
 
     # ---- Glicko-2 (international / World Cup, Phase 5.5) --------------
     glicko_tau: float = Field(default=0.5, alias="BETBOT_GLICKO_TAU")

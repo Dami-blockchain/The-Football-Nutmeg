@@ -55,6 +55,8 @@ ks_app = typer.Typer(help="Inspect / reset the drawdown kill switch.")
 app.add_typer(ks_app, name="kill-switch")
 glicko_app = typer.Typer(help="Glicko-2 ratings (international / World Cup).")
 app.add_typer(glicko_app, name="glicko")
+arb_app = typer.Typer(help="Cross-venue arbitrage.")
+app.add_typer(arb_app, name="arb")
 
 
 # ----------------------------------------------------------------------
@@ -73,17 +75,22 @@ def _build_router(settings) -> tuple[ExchangeRouter, list]:
     resolver = TeamAliasResolver.from_yaml(_REPO_ROOT / "config" / "team_aliases.yaml")
     enable = settings.mode == "live"  # double-gate: place_order also checks mode
 
+    # Fall back to the agent wallet key (the one you deposit into) for signing
+    # if explicit per-venue keys aren't set.
+    from betbot.wallet import get_private_key
+    agent_key = get_private_key(settings.wallet_keyfile)
+
     gamma = GammaClient()
     polymarket = PolymarketAdapter(
         gamma, resolver, enable_orders=enable, mode=settings.mode,
-        private_key=settings.polymarket_private_key or None,
+        private_key=settings.polymarket_private_key or agent_key,
         funder=settings.polymarket_funder or None,
     )
 
     limitless_client = LimitlessClient()
     limitless = LimitlessAdapter(
         limitless_client, resolver, enable_orders=enable, mode=settings.mode,
-        private_key=settings.limitless_private_key or None,
+        private_key=settings.limitless_private_key or agent_key,
     )
 
     router = ExchangeRouter([polymarket, limitless])
@@ -109,7 +116,7 @@ async def _score_once() -> int:
     # Live pre-flight: only place real orders if the gate is clear. If it fails
     # we still score + log paper bets (data keeps flowing), just no live orders.
     live_orders = settings.mode == "live"
-    if live_orders:
+    if live_orders and settings.require_gate:
         gate = evaluate_gate(settings)
         if not gate.passed:
             log.error(
@@ -118,6 +125,11 @@ async def _score_once() -> int:
                 note="paper bets still logged; NO live orders this run",
             )
             live_orders = False
+    elif live_orders and not settings.require_gate:
+        log.warning(
+            "live_gate_skipped",
+            note="BETBOT_REQUIRE_GATE=false — trading live with no paper-history gate",
+        )
 
     log.info(
         "starting_scoring_run",
@@ -272,7 +284,15 @@ async def _score_and_log_one(
     )
     if route is not None:
         quote = route.quote
-        decision = engine.decide_with_market(prediction, favourite, quote.yes_price)
+        # "Bet every match" mode (WC): bypass the edge filter for international
+        # competitions so we take a position on every match that has a market.
+        bet_every = (
+            settings.international_bet_every_match
+            and prediction.competition_code in INTERNATIONAL_COMPETITIONS
+        )
+        decision = engine.decide_with_market(
+            prediction, favourite, quote.yes_price, require_edge=not bet_every
+        )
         if decision is None:
             # no_edge: the market price vetoes this bet. Do NOT fall back to
             # favourite-only logging — the market is the better predictor here.
@@ -511,6 +531,60 @@ def glicko_seed() -> None:
     import runpy
 
     runpy.run_path(str(_REPO_ROOT / "scripts" / "seed_glicko.py"), run_name="__main__")
+
+
+async def _arb_scan(settings, limit: int, min_margin: float) -> None:
+    import re
+    from datetime import datetime, timezone
+
+    from betbot.exchanges.arbitrage import ArbScanner
+
+    win = re.compile(r"will\s+(.+?)\s+win", re.IGNORECASE)
+    router, clients = _build_router(settings)
+    gamma = clients[0]
+    scanner = ArbScanner(router.adapters)
+    try:
+        events = await gamma.list_soccer_events(limit=limit)
+        found = []
+        for e in events:
+            teams = []
+            for m in e.get("markets") or []:
+                if m.get("closed"):
+                    continue
+                mt = win.search(m.get("question", "") or "")
+                if mt:
+                    teams.append(mt.group(1).strip())
+            if len(teams) < 2:
+                continue
+            opp = await scanner.scan(teams[0], teams[1], datetime.now(timezone.utc))
+            if opp and opp.complete and opp.margin >= min_margin:
+                found.append(opp)
+        found.sort(key=lambda o: o.margin, reverse=True)
+        if not found:
+            typer.echo("No cross-venue matches found on BOTH venues "
+                       "(Limitless coverage is sparse — expected).")
+            return
+        typer.echo(f"{'match':<32}{'sum':>6}{'margin':>9}   legs (outcome:venue@price)")
+        for o in found[:25]:
+            legs = "  ".join(f"{ov}:{lg.exchange.value[:4]}@{lg.price:.2f}"
+                             for ov, lg in o.legs.items())
+            tag = " ARB" if o.margin > 0 else ""
+            typer.echo(f"{(o.home_team + ' v ' + o.away_team)[:31]:<32}"
+                       f"{o.price_sum:>6.2f}{o.margin:>+8.1%}{tag}   {legs}")
+    finally:
+        for c in clients:
+            await c.close()
+
+
+@arb_app.command("scan")
+def arb_scan(
+    limit: Annotated[int, typer.Option(help="max soccer events to scan")] = 100,
+    min_margin: Annotated[float, typer.Option(help="report at/above this margin")] = -0.05,
+) -> None:
+    """Scan for cross-venue arbitrage (read-only). Positive margin = locked profit."""
+    settings = get_settings()
+    configure_logging(settings.log_level)
+    asyncio.run(_arb_scan(settings, limit, min_margin))
 
 
 @app.command("run-daemon")
