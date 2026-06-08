@@ -44,10 +44,45 @@ class LimitlessClient:
         *,
         timeout_seconds: float = 20.0,
         client: httpx.AsyncClient | None = None,
+        api_key: str = "",
+        api_secret: str = "",
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(timeout=timeout_seconds)
+        self._api_key = api_key
+        self._api_secret = api_secret
+
+    def _hmac_headers(self, method: str, path: str, body: str = "") -> dict[str, str]:
+        """Scoped-API-token HMAC headers (lmts-api-key/timestamp/signature).
+
+        Signing string: ``{timestamp}\\n{METHOD}\\n{path}\\n{body}`` HMAC-SHA256
+        with the base64-decoded secret; signature base64-encoded. Returns {} when
+        no key is configured (read-only mode).
+        """
+        if not (self._api_key and self._api_secret):
+            return {}
+        import base64
+        import hashlib
+        import hmac
+        from datetime import datetime, timezone
+
+        ts = datetime.now(timezone.utc).isoformat()
+        msg = f"{ts}\n{method.upper()}\n{path}\n{body}"
+        try:
+            key = base64.b64decode(self._api_secret)
+        except Exception:  # noqa: BLE001 — fall back to raw bytes if not base64
+            key = self._api_secret.encode()
+        sig = base64.b64encode(hmac.new(key, msg.encode(), hashlib.sha256).digest()).decode()
+        return {"lmts-api-key": self._api_key, "lmts-timestamp": ts, "lmts-signature": sig}
+
+    async def get_profile(self) -> dict[str, Any]:
+        """GET /profiles/me (authed). The numeric ``id`` is the order ownerId."""
+        url = f"{self._base_url}/profiles/me"
+        resp = await self._client.get(url, headers=self._hmac_headers("GET", "/profiles/me"))
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, dict) else {}
 
     async def __aenter__(self) -> "LimitlessClient":
         return self
@@ -109,9 +144,13 @@ class LimitlessClient:
         API docs before funding — order placement is the one path we cannot
         dry-run without real collateral.
         """
+        import json as _json
+
         url = f"{self._base_url}/orders"
+        body = _json.dumps(payload, separators=(",", ":"))
+        headers = {"content-type": "application/json", **self._hmac_headers("POST", "/orders", body)}
         try:
-            resp = await self._client.post(url, json=payload)
+            resp = await self._client.post(url, content=body, headers=headers)
         except httpx.HTTPError as e:
             raise LimitlessError(f"POST /orders failed: {e}") from e
         if resp.status_code in (403, 451):

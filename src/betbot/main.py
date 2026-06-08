@@ -88,7 +88,10 @@ def _build_router(settings) -> tuple[ExchangeRouter, list]:
         funder=settings.polymarket_funder or None,
     )
 
-    limitless_client = LimitlessClient()
+    limitless_client = LimitlessClient(
+        api_key=settings.limitless_api_key,
+        api_secret=settings.limitless_api_secret,
+    )
     limitless = LimitlessAdapter(
         limitless_client, resolver, enable_orders=enable, mode=settings.mode,
         private_key=settings.limitless_private_key or agent_key,

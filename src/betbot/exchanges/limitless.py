@@ -227,13 +227,20 @@ class LimitlessAdapter:
 
         child = market.metadata.get("outcome_markets", {}).get(outcome.value)
         token_id = (child or {}).get("yes_token")
+        market_slug = (child or {}).get("slug")
         venue_exchange = market.metadata.get("venue_exchange")
-        if not token_id or not venue_exchange:
-            raise LimitlessError("missing yes_token or venue_exchange for live order")
+        if not token_id or not venue_exchange or not market_slug:
+            raise LimitlessError("missing yes_token / venue_exchange / slug for live order")
 
         from eth_account import Account
 
         from betbot.exchanges import limitless_signing as sg
+
+        # ownerId (numeric profile id) is required in the order request.
+        try:
+            owner_id = (await self._client.get_profile()).get("id")
+        except Exception as e:  # noqa: BLE001
+            raise LimitlessError(f"could not fetch Limitless profile/ownerId: {e}") from e
 
         maker = Account.from_key(self._private_key).address
         maker_units = sg.to_usdc_units(size_usd)
@@ -246,8 +253,10 @@ class LimitlessAdapter:
         # Order ints are sent as strings (standard for ctf-exchange order APIs).
         payload = {
             "order": {k: (str(v) if isinstance(v, int) else v) for k, v in order.items()},
+            "orderType": "FOK",
+            "marketSlug": market_slug,
+            "ownerId": owner_id,
             "signature": signed["signature"],
-            "owner": maker,
         }
         resp = await self._client.post_order(payload)
         return OrderResult(
