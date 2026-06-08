@@ -1,13 +1,13 @@
-"""Telegram bot — the operator's chat interface to The Football Smart Manager.
+"""Telegram bot — multi-user, non-custodial.
 
-Locked to a single Telegram user id (``TELEGRAM_ALLOWED_USER_ID``) because it
-exposes the agent's deposit wallet and status. It reads the bot's own functions
-in-process (wallet balances, gate, P&L) — it never moves funds. "Depositing"
-means the operator sends USDC from their own wallet to the address this bot
-shows; the bot only displays the address and confirms the balance.
+Each user registers with /start and gets their OWN isolated wallet (key stored
+server-side under .secrets/users/<id>.key). Funds stay in each user's own wallet
+— nothing is pooled. The bot reads its own functions in-process; it never moves
+one user's funds into another's.
 
-Run it (after setting TELEGRAM_BOT_TOKEN + TELEGRAM_ALLOWED_USER_ID in .env):
-    python -m betbot.telegram_bot
+Access: a user may register if (a) open registration is on, (b) their id is in
+the allowlist, or (c) they're already registered. Run with TELEGRAM_BOT_TOKEN
+set:  python -m betbot.telegram_bot
 """
 
 from __future__ import annotations
@@ -21,35 +21,41 @@ from betbot.config import get_settings
 from betbot.gate import evaluate_gate
 from betbot.logging import configure_logging, get_logger
 from betbot.storage.db import init_engine
-from betbot.storage.repos import (
-    get_kill_switch,
-    list_recent_paper_bets,
-    settled_pnl_window,
-)
-from betbot.wallet import wallet_summary
+from betbot.storage.repos import get_or_create_user, get_user, list_recent_paper_bets
+from betbot.wallet import all_balances
 
 log = get_logger(__name__)
 
 
-def _authorized(update: Update) -> bool:
-    allowed = get_settings().telegram_allowed_user_id
+def _allowed(update: Update) -> bool:
+    s = get_settings()
     user = update.effective_user
-    return allowed == 0 or (user is not None and user.id == allowed)
+    if user is None:
+        return False
+    if s.telegram_open_registration:
+        return True
+    if user.id in s.allowed_telegram_ids:
+        return True
+    return get_user(user.id) is not None  # already registered
 
 
-async def _deny(update: Update) -> None:
-    log.warning(
-        "telegram_unauthorized",
-        user_id=getattr(update.effective_user, "id", None),
-    )
-    if update.message:
-        await update.message.reply_text("⛔ Not authorized.")
+def _register(update: Update):
+    s = get_settings()
+    u = update.effective_user
+    name = (u.full_name or u.username or str(u.id)) if u else "user"
+    # The operator maps onto the existing agent wallet (where their prior
+    # deposit sits); everyone else gets a fresh per-user wallet.
+    keyfile = str(s.wallet_keyfile) if u.id == s.telegram_allowed_user_id else None
+    return get_or_create_user(u.id, name, secrets_dir=s.secrets_dir, keyfile=keyfile)
 
 
 def _authed(handler):
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if not _authorized(update):
-            return await _deny(update)
+        if not _allowed(update):
+            log.warning("telegram_unauthorized", user_id=getattr(update.effective_user, "id", None))
+            if update.message:
+                await update.message.reply_text("⛔ Not authorized. Ask the operator to add you.")
+            return
         return await handler(update, ctx)
 
     return wrapper
@@ -57,42 +63,46 @@ def _authed(handler):
 
 @_authed
 async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    u = _register(update)
     await update.message.reply_text(
         "⚽ *The Football Smart Manager*\n\n"
-        "I run a football prediction-market bot. Commands:\n"
-        "/deposit – the agent wallet address to fund with USDC\n"
-        "/balance – current USDC balance (Polygon + Base)\n"
-        "/status – mode, gate, P&L, kill switch\n"
-        "/bets – recent paper bets\n",
+        "You're registered with your own wallet (your funds stay yours — nothing "
+        "is pooled).\n\n"
+        f"*Your deposit wallet:*\n`{u.wallet_address}`\n\n"
+        "Commands:\n"
+        "/deposit – your wallet address (Polygon + Base)\n"
+        "/balance – your USDC balance\n"
+        "/status – mode, gate, performance\n"
+        "/bets – recent bets",
         parse_mode=ParseMode.MARKDOWN,
     )
 
 
 @_authed
 async def deposit_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    w = wallet_summary(get_settings())
+    u = _register(update)
     await update.message.reply_text(
-        "*Deposit USDC to the agent wallet*\n\n"
-        f"`{w['address']}`\n\n"
-        "Send *USDC* on *Polygon* (Polymarket) or *Base* (Limitless) to this "
-        "address — it's the same address on both chains.\n\n"
-        "Then use /balance to confirm it arrived.\n\n"
-        "⚠️ Only send USDC. Live trading stays OFF until the paper-trading gate "
-        "passes — depositing does not start real-money betting.",
+        "*Deposit USDC to your wallet*\n\n"
+        f"`{u.wallet_address}`\n\n"
+        "Same address on *Polygon* (Polymarket) and *Base* (Limitless). Send "
+        "USDC on either chain; /balance confirms it. Your funds stay in your own "
+        "wallet — never pooled with anyone else's.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
 
 @_authed
 async def balance_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    w = wallet_summary(get_settings())
+    s = get_settings()
+    u = _register(update)
+    balances = all_balances(u.wallet_address, s)
     lines = "\n".join(
-        f"• {b['label']}: {b['usdc']:.2f} USDC" + ("" if b["ok"] else " (read failed)")
-        for b in w["balances"]
+        f"• {b.label}: {b.usdc:.2f} USDC" + ("" if b.ok else " (read failed)")
+        for b in balances
     )
+    total = sum(b.usdc for b in balances if b.ok)
     await update.message.reply_text(
-        f"*USDC balance* — total {w['total_usdc']:.2f}\n\n{lines}\n\n"
-        f"`{w['address']}`",
+        f"*Your balance* — total {total:.2f} USDC\n\n{lines}\n\n`{u.wallet_address}`",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -100,20 +110,13 @@ async def balance_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 @_authed
 async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     s = get_settings()
-    ks = get_kill_switch()
     g = evaluate_gate(s)
     r = backtest_stored()
-    pnl, staked = settled_pnl_window(s.drawdown_window_days)
-    ks_line = "TRIPPED ⛔" if ks.tripped_at else "clear ✅"
     gate_line = "PASS ✅" if g.passed else "FAIL ❌"
     await update.message.reply_text(
-        f"*Status*\n\n"
-        f"Mode: `{s.mode}`\n"
-        f"Kill switch: {ks_line}\n"
-        f"Live-trading gate: {gate_line}\n"
-        f"Settled bets: {r.n}  (hit {r.hit_rate:.0%}, ROI {r.roi:+.1%})\n"
-        f"Trailing {s.drawdown_window_days}d P&L: ${pnl:+.2f} on ${staked:.0f}\n"
-        + ("" if g.passed else "\nGate blockers:\n" + "\n".join(f"– {x}" for x in g.reasons)),
+        f"*Status*\n\nMode: `{s.mode}`\nLive-trading gate: {gate_line}\n"
+        f"Settled bets: {r.n} (hit {r.hit_rate:.0%}, ROI {r.roi:+.1%})\n"
+        f"Cross-venue arb alerts: on (every {s.arb_scan_interval_min} min)",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -122,15 +125,14 @@ async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def bets_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     rows = list_recent_paper_bets(days=7)
     if not rows:
-        await update.message.reply_text("No paper bets in the last 7 days.")
+        await update.message.reply_text("No bets in the last 7 days.")
         return
     lines = []
     for b in rows[:15]:
         res = b.settled_outcome or "—"
         pnl = f"{b.pnl_usd:+.2f}" if b.pnl_usd is not None else "—"
         lines.append(f"#{b.fixture_id} {b.outcome} p={b.our_probability:.2f} → {res} ({pnl})")
-    await update.message.reply_text("*Recent bets*\n" + "\n".join(lines),
-                                    parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("*Recent bets*\n" + "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
 def build_application(settings) -> Application:
@@ -150,9 +152,11 @@ def main() -> None:
     init_engine(settings.db_path)
     if not settings.telegram_bot_token:
         raise SystemExit("TELEGRAM_BOT_TOKEN is not set in .env — cannot start the bot.")
-    if settings.telegram_allowed_user_id == 0:
-        log.warning("telegram_open", note="TELEGRAM_ALLOWED_USER_ID=0 — bot accepts ANY user")
-    log.info("telegram_bot_starting")
+    log.info(
+        "telegram_bot_starting",
+        open_registration=settings.telegram_open_registration,
+        allowlisted=len(settings.allowed_telegram_ids),
+    )
     app = build_application(settings)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

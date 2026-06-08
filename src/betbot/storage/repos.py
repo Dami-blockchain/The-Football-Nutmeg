@@ -369,17 +369,21 @@ def apply_rating_period(
 # ----------------------------------------------------------------------
 # Multi-user accounts (each user has their OWN isolated wallet)
 # ----------------------------------------------------------------------
-def get_or_create_user(telegram_user_id: int, name: str, *, secrets_dir: str) -> User:
+def get_or_create_user(
+    telegram_user_id: int, name: str, *, secrets_dir: str, keyfile: str | None = None
+) -> User:
     """Return the user, generating a fresh per-user wallet on first contact.
 
     The wallet key lives at ``<secrets_dir>/users/<telegram_id>.key`` (0600,
-    gitignored). Funds stay in this user's own wallet — never pooled.
+    gitignored) unless ``keyfile`` overrides it — used to map the operator onto
+    the existing agent wallet so their prior deposit isn't stranded. Funds stay
+    in each user's own wallet — never pooled.
     """
     from pathlib import Path
 
     from betbot.wallet import get_or_create_address
 
-    keyfile = Path(secrets_dir) / "users" / f"{telegram_user_id}.key"
+    keyfile = Path(keyfile) if keyfile else Path(secrets_dir) / "users" / f"{telegram_user_id}.key"
     with session_scope() as s:
         u = s.execute(
             select(User).where(User.telegram_user_id == telegram_user_id)

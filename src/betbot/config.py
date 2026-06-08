@@ -95,6 +95,35 @@ class Settings(BaseSettings):
     telegram_allowed_user_id: int = Field(
         default=0, alias="TELEGRAM_ALLOWED_USER_ID"
     )
+    # Multi-user: comma-separated extra Telegram user ids allowed to register.
+    # If telegram_open_registration is true, anyone who messages the bot can
+    # register (the operator controls access by who they share the bot with).
+    telegram_allowed_user_ids: str = Field(
+        default="", alias="TELEGRAM_ALLOWED_USER_IDS"
+    )
+    telegram_open_registration: bool = Field(
+        default=False, alias="TELEGRAM_OPEN_REGISTRATION"
+    )
+
+    @property
+    def allowed_telegram_ids(self) -> set[int]:
+        ids: set[int] = set()
+        if self.telegram_allowed_user_id:
+            ids.add(self.telegram_allowed_user_id)
+        for part in self.telegram_allowed_user_ids.split(","):
+            part = part.strip()
+            if part:
+                try:
+                    ids.add(int(part))
+                except ValueError:
+                    pass
+        return ids
+
+    @property
+    def secrets_dir(self) -> str:
+        from pathlib import Path
+
+        return str(Path(self.wallet_keyfile).resolve().parent)
 
     # ---- Live-trading secrets (Phase 5; only used in live mode) -------
     polymarket_private_key: str = Field(default="", alias="POLYMARKET_PRIVATE_KEY")
