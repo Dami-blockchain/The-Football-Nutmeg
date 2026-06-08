@@ -12,3 +12,4 @@ __pycache__/
 *.sqlite-journal
 .DS_Store
 .secrets/
+frontend/node_modules/
