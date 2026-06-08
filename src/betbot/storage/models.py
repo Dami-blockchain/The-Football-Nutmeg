@@ -139,3 +139,27 @@ class GlickoRating(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
     )
+
+
+class User(Base):
+    """A tenant of the multi-user bot. Each user has their OWN isolated wallet
+    and funds — nothing is pooled. The bot trades each user's wallet
+    independently; one user's outcome never touches another's."""
+
+    __tablename__ = "users"
+    __table_args__ = (
+        UniqueConstraint("telegram_user_id", name="uq_users_tg"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    telegram_user_id: Mapped[int] = mapped_column(Integer, index=True)
+    name: Mapped[str] = mapped_column(String(80))
+    wallet_address: Mapped[str] = mapped_column(String(64))
+    wallet_keyfile: Mapped[str] = mapped_column(String(255))
+    active: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )

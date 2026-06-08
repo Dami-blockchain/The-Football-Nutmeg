@@ -8,7 +8,13 @@ from sqlalchemy import select
 
 from betbot.logging import get_logger
 from betbot.storage.db import session_scope
-from betbot.storage.models import GlickoRating, KillSwitch, PaperBet, PredictionRow
+from betbot.storage.models import (
+    GlickoRating,
+    KillSwitch,
+    PaperBet,
+    PredictionRow,
+    User,
+)
 from betbot.strategy.engine import BetDecision, Outcome, Prediction
 from betbot.strategy.glicko import Glicko2Rating, update_rating
 
@@ -358,3 +364,53 @@ def apply_rating_period(
     for t in teams:
         upsert_rating(t, update_rating(current[t], per_team[t], tau=tau, period=period))
     return len(teams)
+
+
+# ----------------------------------------------------------------------
+# Multi-user accounts (each user has their OWN isolated wallet)
+# ----------------------------------------------------------------------
+def get_or_create_user(telegram_user_id: int, name: str, *, secrets_dir: str) -> User:
+    """Return the user, generating a fresh per-user wallet on first contact.
+
+    The wallet key lives at ``<secrets_dir>/users/<telegram_id>.key`` (0600,
+    gitignored). Funds stay in this user's own wallet — never pooled.
+    """
+    from pathlib import Path
+
+    from betbot.wallet import get_or_create_address
+
+    keyfile = Path(secrets_dir) / "users" / f"{telegram_user_id}.key"
+    with session_scope() as s:
+        u = s.execute(
+            select(User).where(User.telegram_user_id == telegram_user_id)
+        ).scalar_one_or_none()
+        if u is None:
+            address = get_or_create_address(keyfile)
+            u = User(
+                telegram_user_id=telegram_user_id, name=name[:80],
+                wallet_address=address, wallet_keyfile=str(keyfile), active=True,
+            )
+            s.add(u)
+            s.flush()
+        s.expunge_all()
+        return u
+
+
+def get_user(telegram_user_id: int) -> User | None:
+    with session_scope() as s:
+        u = s.execute(
+            select(User).where(User.telegram_user_id == telegram_user_id)
+        ).scalar_one_or_none()
+        if u is not None:
+            s.expunge_all()
+        return u
+
+
+def list_users() -> list[User]:
+    with session_scope() as s:
+        rows = list(
+            s.execute(select(User).where(User.active.is_(True))
+                      .order_by(User.created_at.asc())).scalars()
+        )
+        s.expunge_all()
+        return rows
