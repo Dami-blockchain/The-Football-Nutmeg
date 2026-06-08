@@ -96,6 +96,13 @@ class Settings(BaseSettings):
         default=0, alias="TELEGRAM_ALLOWED_USER_ID"
     )
 
+    # ---- Live-trading secrets (Phase 5; only used in live mode) -------
+    polymarket_private_key: str = Field(default="", alias="POLYMARKET_PRIVATE_KEY")
+    polymarket_funder: str = Field(default="", alias="POLYMARKET_FUNDER")
+    limitless_private_key: str = Field(default="", alias="LIMITLESS_PRIVATE_KEY")
+    # Max slippage added to the quoted price when sending a market buy.
+    order_slippage: float = Field(default=0.02, alias="BETBOT_ORDER_SLIPPAGE")
+
     # ---- Storage ------------------------------------------------------
     db_path: Path = Field(
         default=Path("./data/betbot.sqlite"), alias="BETBOT_DB_PATH"

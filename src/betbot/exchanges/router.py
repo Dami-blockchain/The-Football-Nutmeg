@@ -16,12 +16,28 @@ the caller's concern (and must NOT fall back to favourite logging).
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import datetime
 
-from betbot.exchanges.base import ExchangeAdapter, OrderbookQuote, Outcome
+from betbot.exchanges.base import (
+    ExchangeAdapter,
+    MarketRef,
+    OrderbookQuote,
+    Outcome,
+)
 from betbot.logging import get_logger
 
 log = get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class RoutedQuote:
+    """Best quote plus the adapter + market that produced it, so the caller can
+    both price the edge AND place an order on the winning venue."""
+
+    adapter: ExchangeAdapter
+    market: MarketRef
+    quote: OrderbookQuote
 
 
 class ExchangeRouter:
@@ -32,15 +48,15 @@ class ExchangeRouter:
     def adapters(self) -> list[ExchangeAdapter]:
         return self._adapters
 
-    async def find_best_quote(
+    async def find_best_route(
         self,
         home_team: str,
         away_team: str,
         kickoff: datetime,
         outcome: Outcome,
-    ) -> OrderbookQuote | None:
-        """Best quote for ``outcome`` across all exchanges, or ``None``."""
-        quotes: list[OrderbookQuote] = []
+    ) -> RoutedQuote | None:
+        """Best (adapter, market, quote) for ``outcome``, or ``None``."""
+        routes: list[RoutedQuote] = []
         for adapter in self._adapters:
             name = getattr(adapter, "name", "?")
             try:
@@ -56,18 +72,29 @@ class ExchangeRouter:
                 log.warning("router_orderbook_failed", exchange=str(name), error=str(e))
                 continue
             if quote is not None:
-                quotes.append(quote)
+                routes.append(RoutedQuote(adapter=adapter, market=market, quote=quote))
 
-        if not quotes:
+        if not routes:
             return None
         # Lowest price wins; tie-break on larger size (negate for ascending min).
-        best = min(quotes, key=lambda q: (q.yes_price, -q.yes_size))
+        best = min(routes, key=lambda r: (r.quote.yes_price, -r.quote.yes_size))
         log.info(
             "router_best_quote",
-            exchange=str(best.exchange.value),
-            outcome=best.outcome.value,
-            yes_price=round(best.yes_price, 4),
-            yes_size=round(best.yes_size, 2),
-            considered=len(quotes),
+            exchange=str(best.quote.exchange.value),
+            outcome=best.quote.outcome.value,
+            yes_price=round(best.quote.yes_price, 4),
+            yes_size=round(best.quote.yes_size, 2),
+            considered=len(routes),
         )
         return best
+
+    async def find_best_quote(
+        self,
+        home_team: str,
+        away_team: str,
+        kickoff: datetime,
+        outcome: Outcome,
+    ) -> OrderbookQuote | None:
+        """Best quote only (thin wrapper over :meth:`find_best_route`)."""
+        route = await self.find_best_route(home_team, away_team, kickoff, outcome)
+        return route.quote if route is not None else None

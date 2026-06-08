@@ -18,7 +18,7 @@ import typer
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from betbot.config import get_settings
+from betbot.config import INTERNATIONAL_COMPETITIONS, get_settings
 from betbot.data.football_data import FootballDataClient, FootballDataError
 from betbot.data.form import FormService, _parse_kickoff, _parse_team
 from betbot.exchanges.limitless import LimitlessAdapter
@@ -68,13 +68,19 @@ def _build_router(settings) -> tuple[ExchangeRouter, list]:
     so most runs route on Polymarket alone — expected, not an error.
     """
     resolver = TeamAliasResolver.from_yaml(_REPO_ROOT / "config" / "team_aliases.yaml")
+    enable = settings.mode == "live"  # double-gate: place_order also checks mode
 
     gamma = GammaClient()
-    polymarket = PolymarketAdapter(gamma, resolver, enable_orders=False, mode=settings.mode)
+    polymarket = PolymarketAdapter(
+        gamma, resolver, enable_orders=enable, mode=settings.mode,
+        private_key=settings.polymarket_private_key or None,
+        funder=settings.polymarket_funder or None,
+    )
 
     limitless_client = LimitlessClient()
     limitless = LimitlessAdapter(
-        limitless_client, resolver, enable_orders=False, mode=settings.mode
+        limitless_client, resolver, enable_orders=enable, mode=settings.mode,
+        private_key=settings.limitless_private_key or None,
     )
 
     router = ExchangeRouter([polymarket, limitless])
@@ -97,11 +103,25 @@ async def _score_once() -> int:
             note="predictions still recorded, but NO new bets will be logged",
         )
 
+    # Live pre-flight: only place real orders if the gate is clear. If it fails
+    # we still score + log paper bets (data keeps flowing), just no live orders.
+    live_orders = settings.mode == "live"
+    if live_orders:
+        gate = evaluate_gate(settings)
+        if not gate.passed:
+            log.error(
+                "live_gate_failed",
+                reasons=gate.reasons,
+                note="paper bets still logged; NO live orders this run",
+            )
+            live_orders = False
+
     log.info(
         "starting_scoring_run",
         mode=settings.mode,
         leagues=list(settings.leagues),
         kill_switch_tripped=kill_tripped,
+        live_orders=live_orders,
     )
 
     today = date.today()
@@ -140,7 +160,7 @@ async def _score_once() -> int:
                     try:
                         bets = await _score_and_log_one(
                             m, league, form_service, engine, router,
-                            settings, kill_tripped,
+                            settings, kill_tripped, live_orders,
                         )
                         paper_bets_logged += bets
                     except FootballDataError as e:
@@ -177,6 +197,7 @@ async def _score_and_log_one(
     router: ExchangeRouter,
     settings,
     kill_tripped: bool = False,
+    live_orders: bool = False,
 ) -> int:
     """Score one fixture and log a paper bet.
 
@@ -238,11 +259,12 @@ async def _score_and_log_one(
 
     favourite = prediction.best_outcome
 
-    # ---- Market route (Phase 2) --------------------------------------
-    quote = await router.find_best_quote(
+    # ---- Market route (Phase 2 + Phase 5 live placement) -------------
+    route = await router.find_best_route(
         prediction.home_team, prediction.away_team, kickoff, favourite
     )
-    if quote is not None:
+    if route is not None:
+        quote = route.quote
         decision = engine.decide_with_market(prediction, favourite, quote.yes_price)
         if decision is None:
             # no_edge: the market price vetoes this bet. Do NOT fall back to
@@ -266,9 +288,11 @@ async def _score_and_log_one(
                 exchange=quote.exchange.value,
                 stake_usd=decision.stake_usd,
             )
-            return 1
-        log.debug("paper_bet_already_logged", fixture_id=fixture_id)
-        return 0
+        else:
+            log.debug("paper_bet_already_logged", fixture_id=fixture_id)
+        # Phase 5: place the real order (gated; skipped for WC and when not live).
+        await _maybe_place_live_order(route, prediction, decision, settings, live_orders)
+        return 1 if inserted else 0
 
     # ---- No market: Phase-1 favourite-only paper bet -----------------
     p = max(prediction.p_home, prediction.p_draw, prediction.p_away)
@@ -295,6 +319,46 @@ async def _score_and_log_one(
         return 1
     log.debug("paper_bet_already_logged", fixture_id=fixture_id)
     return 0
+
+
+async def _maybe_place_live_order(route, prediction, decision, settings, live_orders) -> None:
+    """Place a real order on the winning venue — heavily gated.
+
+    No-ops unless ``live_orders`` (live mode + gate clear). NEVER places for
+    INTERNATIONAL_COMPETITIONS (World Cup) — that guard is the hard rule. The
+    paper bet has already been logged by the caller and persists regardless of
+    whether the live order succeeds.
+    """
+    log = get_logger(__name__)
+    if not live_orders:
+        return
+    if prediction.competition_code in INTERNATIONAL_COMPETITIONS:
+        log.info(
+            "live_order_skipped_international",
+            fixture_id=prediction.fixture_id,
+            competition=prediction.competition_code,
+        )
+        return
+    max_price = min(0.99, route.quote.yes_price + settings.order_slippage)
+    try:
+        result = await route.adapter.place_order(
+            route.market, decision.outcome, decision.stake_usd, max_price
+        )
+        log.info(
+            "live_order_placed",
+            fixture_id=prediction.fixture_id,
+            exchange=route.quote.exchange.value,
+            outcome=decision.outcome.value,
+            order_id=result.order_id,
+            status=result.status,
+        )
+    except Exception as e:  # noqa: BLE001 — paper row persists even if order fails
+        log.error(
+            "live_order_failed",
+            fixture_id=prediction.fixture_id,
+            exchange=route.quote.exchange.value,
+            error=str(e),
+        )
 
 
 # ----------------------------------------------------------------------

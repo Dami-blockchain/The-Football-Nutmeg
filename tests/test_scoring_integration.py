@@ -19,7 +19,14 @@ from datetime import datetime, timezone
 import pytest
 
 from betbot.data.models import Fixture, FixtureForm, FormSnapshot
-from betbot.exchanges.base import ExchangeName, OrderbookQuote, Outcome
+from betbot.exchanges.base import (
+    ExchangeName,
+    MarketRef,
+    OrderbookQuote,
+    OrderResult,
+    Outcome,
+)
+from betbot.exchanges.router import RoutedQuote
 from betbot.main import _score_and_log_one
 from betbot.storage.db import init_engine
 from betbot.storage.repos import list_recent_paper_bets
@@ -54,9 +61,26 @@ class FakeForm:
         )
 
 
+class FakeAdapter:
+    def __init__(self):
+        self.placed = []
+
+    async def place_order(self, market, outcome, size_usd, max_price):
+        self.placed.append((outcome, size_usd, max_price))
+        return OrderResult(ExchangeName.POLYMARKET, "ord1", market.market_id,
+                           outcome, size_usd, max_price, "matched", {})
+
+
 class FakeRouter:
-    def __init__(self, quote):
+    def __init__(self, quote, adapter=None):
         self._quote = quote
+        self.adapter = adapter or FakeAdapter()
+
+    async def find_best_route(self, home, away, kickoff, outcome):
+        if self._quote is None:
+            return None
+        market = MarketRef(ExchangeName.POLYMARKET, "m", "A vs B", {})
+        return RoutedQuote(adapter=self.adapter, market=market, quote=self._quote)
 
     async def find_best_quote(self, home, away, kickoff, outcome):
         return self._quote
@@ -103,6 +127,30 @@ async def test_no_edge_logs_nothing(fresh_db, settings):
                                  FakeRouter(_home_quote(0.97)), settings)
     assert n == 0
     assert list_recent_paper_bets(days=7) == []
+
+
+async def test_live_order_placed_when_enabled(fresh_db, settings):
+    router = FakeRouter(_home_quote(0.50))
+    n = await _score_and_log_one(MATCH, "PL", FakeForm(), StrategyEngine(settings),
+                                 router, settings, False, True)  # live_orders=True
+    assert n == 1
+    assert len(router.adapter.placed) == 1  # real order placed on the venue
+
+
+async def test_wc_live_order_skipped(fresh_db, settings):
+    # World Cup (INTERNATIONAL_COMPETITIONS): paper bet logs, but NEVER a live order.
+    router = FakeRouter(_home_quote(0.50))
+    n = await _score_and_log_one(MATCH, "WC", FakeForm(), StrategyEngine(settings),
+                                 router, settings, False, True)  # live_orders=True
+    assert n == 1
+    assert router.adapter.placed == []  # guard held — no live order on WC
+
+
+async def test_paper_mode_places_no_live_order(fresh_db, settings):
+    router = FakeRouter(_home_quote(0.50))
+    await _score_and_log_one(MATCH, "PL", FakeForm(), StrategyEngine(settings),
+                             router, settings, False, False)  # live_orders=False
+    assert router.adapter.placed == []
 
 
 async def test_exposure_cap_blocks_logging(fresh_db, settings):

@@ -222,9 +222,44 @@ class LimitlessAdapter:
                 "place_order blocked: requires enable_orders=True AND mode=live "
                 f"(have enable_orders={self._enable_orders}, mode={self._mode!r})"
             )
-        # EIP-712 signing (domain "Limitless CTF Exchange"/"1", per-market venue
-        # exchange) + POST /orders is wired in Phase 5.
-        raise NotImplementedError("Limitless live ordering is wired in Phase 5")
+        if not self._private_key:
+            raise LimitlessError("LIMITLESS_PRIVATE_KEY not configured")
+
+        child = market.metadata.get("outcome_markets", {}).get(outcome.value)
+        token_id = (child or {}).get("yes_token")
+        venue_exchange = market.metadata.get("venue_exchange")
+        if not token_id or not venue_exchange:
+            raise LimitlessError("missing yes_token or venue_exchange for live order")
+
+        from eth_account import Account
+
+        from betbot.exchanges import limitless_signing as sg
+
+        maker = Account.from_key(self._private_key).address
+        maker_units = sg.to_usdc_units(size_usd)
+        taker_units = sg.shares_for(maker_units, max_price)
+        order = sg.build_order(
+            token_id=token_id, maker=maker,
+            maker_amount_units=maker_units, taker_amount_units=taker_units, side=sg.BUY,
+        )
+        signed = sg.sign_order(order, self._private_key, verifying_contract=venue_exchange)
+        # Order ints are sent as strings (standard for ctf-exchange order APIs).
+        payload = {
+            "order": {k: (str(v) if isinstance(v, int) else v) for k, v in order.items()},
+            "signature": signed["signature"],
+            "owner": maker,
+        }
+        resp = await self._client.post_order(payload)
+        return OrderResult(
+            exchange=ExchangeName.LIMITLESS,
+            order_id=str(resp.get("id") or resp.get("orderId") or ""),
+            market_id=market.market_id,
+            outcome=outcome,
+            filled_size=float(resp.get("filledSize") or resp.get("filled") or 0.0),
+            avg_price=float(resp.get("price") or max_price),
+            status=str(resp.get("status") or "submitted"),
+            raw_response=resp,
+        )
 
     async def get_position(self, market: MarketRef) -> float:
         return 0.0

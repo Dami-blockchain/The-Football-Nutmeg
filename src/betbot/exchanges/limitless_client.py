@@ -101,3 +101,24 @@ class LimitlessClient:
     async def get_orderbook(self, slug: str) -> dict[str, Any]:
         data = await self._get(f"/markets/{slug}/orderbook")
         return data if isinstance(data, dict) else {}
+
+    async def post_order(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """POST a signed order to ``/orders`` (Phase 5 live).
+
+        The exact request schema should be re-confirmed against the Limitless
+        API docs before funding — order placement is the one path we cannot
+        dry-run without real collateral.
+        """
+        url = f"{self._base_url}/orders"
+        try:
+            resp = await self._client.post(url, json=payload)
+        except httpx.HTTPError as e:
+            raise LimitlessError(f"POST /orders failed: {e}") from e
+        if resp.status_code in (403, 451):
+            raise LimitlessGeoBlockedError(f"POST /orders geo-blocked ({resp.status_code})")
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            raise LimitlessError(f"POST /orders -> {resp.status_code}: {resp.text[:200]}") from e
+        data = resp.json()
+        return data if isinstance(data, dict) else {"raw": data}
