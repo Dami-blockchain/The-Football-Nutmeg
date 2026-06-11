@@ -177,6 +177,41 @@ class Settings(BaseSettings):
     # "earned the right to trade" safety check).
     require_gate: bool = Field(default=True, alias="BETBOT_REQUIRE_GATE")
 
+    # ---- Deposit pipeline (CCTP bridging; betbot/bridge.py) -----------
+    # Master gate for EVERY on-chain action the pipeline takes (gas top-ups,
+    # CCTP burns/mints, venue approvals). False = detect + log only.
+    auto_bridge: bool = Field(default=True, alias="BETBOT_AUTO_BRIDGE")
+    # Deposits below this are ignored (logged): bridging dust costs more in
+    # gas + operational noise than the deposit is worth.
+    min_deposit_usdc: float = Field(default=10.0, alias="BETBOT_MIN_DEPOSIT_USDC")
+    # Fraction of each bridged deposit reserved for Base / Limitless. Default
+    # 0.0: Polymarket (Polygon) is the only live venue today — Limitless live
+    # orders are parked — so 100% of a deposit goes to Polygon.
+    bridge_split_base: float = Field(default=0.0, alias="BETBOT_BRIDGE_SPLIT_BASE")
+    # Native-gas top-ups sent from the agent wallet: user wallets are created
+    # empty and can't pay for their own approvals/burns. Small by design —
+    # enough for a handful of simple transactions, not a balance to manage.
+    gas_topup_pol: float = Field(default=0.5, alias="BETBOT_GAS_TOPUP_POL")
+    gas_topup_eth: float = Field(default=0.0005, alias="BETBOT_GAS_TOPUP_ETH")
+    deposit_scan_minutes: int = Field(
+        default=10, alias="BETBOT_DEPOSIT_SCAN_MINUTES"
+    )
+    # Extra source-chain RPCs (Polygon/Base RPCs are defined above).
+    ethereum_rpc_url: str = Field(
+        default="https://eth.drpc.org", alias="ETHEREUM_RPC_URL"
+    )
+    arbitrum_rpc_url: str = Field(
+        default="https://arbitrum.drpc.org", alias="ARBITRUM_RPC_URL"
+    )
+    # Circle's attestation service for CCTP (poll after depositForBurn).
+    iris_api_url: str = Field(
+        default="https://iris-api.circle.com", alias="BETBOT_IRIS_API_URL"
+    )
+    # Limitless CTF Exchange address on Base (market.venue.exchange). Needed
+    # only when bridge_split_base > 0; empty = skip the Limitless approval
+    # with a logged warning (see scripts/limitless_approve.py).
+    limitless_exchange: str = Field(default="", alias="LIMITLESS_EXCHANGE")
+
     # ---- Arbitrage watch (Telegram alerts) ---------------------------
     arb_notify_min_margin: float = Field(
         default=0.01, alias="BETBOT_ARB_NOTIFY_MIN_MARGIN"
