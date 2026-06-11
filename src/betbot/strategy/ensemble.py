@@ -86,6 +86,27 @@ def blend(
     return log_pool(components)
 
 
+def anchor_to_market(
+    p_model: float, p_market: float, w_model: float, w_market: float
+) -> float:
+    """Blend a single-outcome model probability toward the market price in
+    logit space (the binary-marginal version of :func:`log_pool`).
+
+    This deliberately SHRINKS edges: with equal weights, half the logit
+    distance to the market disappears, so only disagreements large enough to
+    survive the shrink clear the edge threshold — the bot bets selectively
+    where the model and the venue genuinely diverge.
+    """
+    total = w_model + w_market
+    if total <= 0 or not 0.0 < p_market < 1.0:
+        return p_model
+    pm, pk = _clip(p_model), _clip(p_market)
+    z = (
+        w_model * math.log(pm / (1.0 - pm)) + w_market * math.log(pk / (1.0 - pk))
+    ) / total
+    return 1.0 / (1.0 + math.exp(-z))
+
+
 class IsotonicCalibrator:
     """Pool-adjacent-violators isotonic regression: monotone map from
     predicted probability to observed frequency. Step function with

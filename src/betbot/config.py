@@ -177,6 +177,28 @@ class Settings(BaseSettings):
     glicko_host_home_mu: float = Field(default=0.2, alias="BETBOT_GLICKO_HOST_HOME_MU")
     glicko_results_csv: str = Field(default="", alias="BETBOT_GLICKO_RESULTS_CSV")
 
+    # ---- Ensemble (Klement fundamentals + Dixon-Coles + market) -------
+    # Artifacts are regenerable: scripts/fit_dixon_coles.py writes the DC
+    # params; scripts/backtest_ensemble.py writes the calibration. Missing
+    # files are fine — the engine falls back to pure Glicko.
+    dc_params_path: Path = Field(
+        default=Path("./data/dc_params.json"), alias="BETBOT_DC_PARAMS_PATH"
+    )
+    ensemble_calibration_path: Path = Field(
+        default=Path("./data/ensemble_calibration.json"),
+        alias="BETBOT_ENSEMBLE_CALIBRATION_PATH",
+    )
+    # Relative log-pool weights. Market-leaning by design: the closing line
+    # is the strongest single forecaster, so the models act as a
+    # disagreement detector rather than trying to out-predict it.
+    ensemble_weight_glicko: float = Field(
+        default=1.0, alias="BETBOT_ENSEMBLE_W_GLICKO"
+    )
+    ensemble_weight_dc: float = Field(default=1.5, alias="BETBOT_ENSEMBLE_W_DC")
+    ensemble_weight_market: float = Field(
+        default=2.5, alias="BETBOT_ENSEMBLE_W_MARKET"
+    )
+
     # ---- Storage ------------------------------------------------------
     db_path: Path = Field(
         default=Path("./data/betbot.sqlite"), alias="BETBOT_DB_PATH"

@@ -21,4 +21,8 @@ def settings() -> Settings:
         BETBOT_DRAW_SCORE=2.4,
         BETBOT_SOFTMAX_TEMP=1.0,
         BETBOT_OPP_STRENGTH_WEIGHT=0.5,
+        # Point ensemble artifacts at nonexistent paths so tests stay
+        # deterministic regardless of what's in the working tree's data/.
+        BETBOT_DC_PARAMS_PATH="./tests/_no_such_dc_params.json",
+        BETBOT_ENSEMBLE_CALIBRATION_PATH="./tests/_no_such_calibration.json",
     )
