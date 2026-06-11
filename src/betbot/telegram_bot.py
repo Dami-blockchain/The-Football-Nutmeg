@@ -14,11 +14,18 @@ from __future__ import annotations
 
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from betbot.backtest import backtest_stored
 from betbot.config import get_settings
 from betbot.gate import evaluate_gate
+from betbot.llm_agent import LLMAgent
 from betbot.logging import configure_logging, get_logger
 from betbot.storage.db import init_engine
 from betbot.storage.repos import get_or_create_user, get_user, list_recent_paper_bets
@@ -66,14 +73,34 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     u = _register(update)
     await update.message.reply_text(
         "⚽ *The Football Smart Manager*\n\n"
-        "You're registered with your own wallet (your funds stay yours — nothing "
-        "is pooled).\n\n"
-        f"*Your deposit wallet:*\n`{u.wallet_address}`\n\n"
-        "Commands:\n"
+        "I trade football prediction markets on Polymarket (Polygon) and "
+        "Limitless (Base) using a probability model, and I only bet when my "
+        "edge over the market price clears a threshold.\n\n"
+        "*You're registered.* You have your own isolated wallet — your funds "
+        "stay yours and are never pooled with anyone else's.\n\n"
+        f"*Your personal deposit address:*\n`{u.wallet_address}`\n\n"
+        "*Getting started*\n"
+        "1. Deposit at least *10 USDC* to your personal wallet address above "
+        "to begin.\n"
+        "2. The same address works on *Polygon* and *Base* — send USDC on "
+        "either chain (bridge between them with any standard bridge if "
+        "needed). /balance confirms arrival.\n"
+        "3. Trading starts in *paper mode*; live trading only switches on "
+        "once the performance gate passes.\n"
+        "4. Daily reports (Nairobi time): arbitrage digest at *9am*, "
+        "performance report at *9pm*.\n\n"
+        "*Commands*\n"
         "/deposit – your wallet address (Polygon + Base)\n"
         "/balance – your USDC balance\n"
         "/status – mode, gate, performance\n"
-        "/bets – recent bets",
+        "/bets – recent bets\n"
+        "/help – this guide\n\n"
+        "You can also just *ask me anything* in plain text — how deposits "
+        "work, what the bot is doing, what a report means.\n\n"
+        "⚠️ *Risk disclaimer:* prediction-market trading can lose money, "
+        "including everything you deposit. Past performance never guarantees "
+        "future results. This is not financial advice — only deposit what "
+        "you can afford to lose.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -135,6 +162,34 @@ async def bets_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("*Recent bets*\n" + "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
+# Lazily constructed so importing this module never needs settings; tests
+# inject their own agent by assigning to ``_llm_agent``.
+_llm_agent: LLMAgent | None = None
+
+
+def _get_llm_agent() -> LLMAgent:
+    global _llm_agent
+    if _llm_agent is None:
+        _llm_agent = LLMAgent(get_settings())
+    return _llm_agent
+
+
+@_authed
+async def chat_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Any non-command text becomes a question for the LLM assistant.
+
+    Registers the user first (same flow as /start) so a brand-new user who
+    opens with "hi" still gets a wallet and counts as registered.
+    """
+    if update.message is None or not (update.message.text or "").strip():
+        return
+    _register(update)
+    reply = await _get_llm_agent().answer(
+        update.effective_user.id, update.message.text.strip()
+    )
+    await update.message.reply_text(reply)
+
+
 def build_application(settings) -> Application:
     app = Application.builder().token(settings.telegram_bot_token).build()
     app.add_handler(CommandHandler("start", start_cmd))
@@ -143,6 +198,8 @@ def build_application(settings) -> Application:
     app.add_handler(CommandHandler("balance", balance_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("bets", bets_cmd))
+    # Free-text → LLM assistant. Added LAST so commands keep priority.
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_handler))
     return app
 
 

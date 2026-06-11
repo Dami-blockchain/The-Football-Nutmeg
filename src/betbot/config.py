@@ -101,8 +101,26 @@ class Settings(BaseSettings):
     telegram_allowed_user_ids: str = Field(
         default="", alias="TELEGRAM_ALLOWED_USER_IDS"
     )
+    # Open to the public by default: anyone who messages the bot can register
+    # and gets their own isolated wallet. Funds are never pooled, and live
+    # trading stays behind the mode=paper default + gate, so opening
+    # registration does not weaken any money-moving safeguard.
     telegram_open_registration: bool = Field(
-        default=False, alias="TELEGRAM_OPEN_REGISTRATION"
+        default=True, alias="TELEGRAM_OPEN_REGISTRATION"
+    )
+
+    # ---- LLM assistant (free-text Telegram Q&A via Anthropic) ---------
+    # No SDK dependency by design — llm_agent.py calls the Messages API with
+    # httpx directly. Empty key = graceful fallback (commands still work).
+    anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
+    llm_model: str = Field(
+        default="claude-haiku-4-5-20251001", alias="BETBOT_LLM_MODEL"
+    )
+    llm_max_tokens: int = Field(default=500, alias="BETBOT_LLM_MAX_TOKENS")
+    # Per-user daily question cap: the bot is public, so this bounds API spend
+    # per Telegram user per UTC day.
+    llm_daily_limit_per_user: int = Field(
+        default=20, alias="BETBOT_LLM_DAILY_LIMIT_PER_USER"
     )
 
     @property
