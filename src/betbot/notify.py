@@ -15,10 +15,16 @@ log = get_logger(__name__)
 
 
 async def send_telegram(settings, text: str) -> bool:
+    """Push a message to the operator (the original single-recipient path)."""
+    return await send_telegram_to(settings, settings.telegram_allowed_user_id, text)
+
+
+async def send_telegram_to(settings, chat_id: int, text: str) -> bool:
+    """Push a message to one chat id — used to broadcast the daily reports to
+    the operator AND every registered user, not just the operator."""
     token = settings.telegram_bot_token
-    chat_id = settings.telegram_allowed_user_id
     if not token or not chat_id:
-        log.warning("telegram_notify_skipped", reason="no bot token or allowed user id")
+        log.warning("telegram_notify_skipped", reason="no bot token or chat id")
         return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
