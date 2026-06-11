@@ -9,6 +9,7 @@ __pycache__/
 .env
 /data/*
 !/data/fundamentals_2026.csv
+!/data/wc2026_groups.csv
 *.sqlite
 *.sqlite-journal
 .DS_Store
