@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from betbot.strategy.fundamentals import (
@@ -13,14 +15,19 @@ from betbot.strategy.fundamentals import (
     load_fundamentals,
     population_factor,
     prior_ratings,
+    squad_value_factor,
     temperature_factor,
 )
 
 
-def _tf(team, *, gdp=20_000.0, pop=50_000_000, temp=14.0, fifa=1500.0, host=False):
+def _tf(
+    team, *, gdp=20_000.0, pop=50_000_000, temp=14.0, fifa=1500.0, host=False,
+    squad_value_eur=300_000_000.0,
+):
     return TeamFundamentals(
         team=team, iso3="XXX", gdp_per_capita_usd=gdp, population=pop,
         avg_temp_c=temp, fifa_points=fifa, host=host,
+        squad_value_eur=squad_value_eur,
     )
 
 
@@ -42,6 +49,20 @@ def test_temperature_optimum_at_14c():
 def test_population_is_log_scaled():
     tenfold = population_factor(100_000_000) - population_factor(10_000_000)
     assert tenfold == pytest.approx(1.0)
+
+
+def test_squad_value_monotone_and_log():
+    # Monotone increasing in value.
+    assert squad_value_factor(1_000_000_000) > squad_value_factor(20_000_000)
+    # Diminishing returns: natural log, so a 10x value is +ln(10), not +10.
+    step = squad_value_factor(2_000_000_000) - squad_value_factor(200_000_000)
+    assert step == pytest.approx(math.log(10))
+
+
+def test_squad_value_guards_zero():
+    # log(0) would explode; the guard maps it to log(1) = 0.0, no error.
+    assert squad_value_factor(0.0) == 0.0
+    assert squad_value_factor(-5.0) == 0.0
 
 
 # ---- composite + priors ------------------------------------------------
@@ -92,6 +113,56 @@ def test_host_weight_opt_in():
     assert scores["usa"] > scores["ger"]
 
 
+# ---- squad value in the composite --------------------------------------
+
+def test_high_squad_value_lifts_a_team():
+    # Two teams identical on every factor; give one a much higher squad value
+    # and it must rank above the other (squad value carries real weight).
+    base = dict(gdp=20_000, pop=50_000_000, temp=14, fifa=1500)
+    cohort = {
+        "rich": _tf("Rich", **base, squad_value_eur=1_000_000_000),
+        "poor": _tf("Poor", **base, squad_value_eur=20_000_000),
+    }
+    scores = composite_scores(cohort)
+    assert scores["rich"] > scores["poor"]
+
+
+def test_squad_factor_skipped_when_majority_unknown():
+    # >50% of the cohort has unknown (0.0) squad value -> factor drops out, so
+    # the one team that DOES have a value gets no squad-driven lift, and the
+    # composite is identical to one where squad value is uniformly unknown.
+    base = dict(gdp=20_000, pop=50_000_000, temp=14)
+    cohort_sparse = {
+        "a": _tf("A", fifa=1500, **base, squad_value_eur=1_000_000_000),
+        "b": _tf("B", fifa=1400, **base, squad_value_eur=0.0),
+        "c": _tf("C", fifa=1300, **base, squad_value_eur=0.0),
+    }
+    cohort_none = {
+        "a": _tf("A", fifa=1500, **base, squad_value_eur=0.0),
+        "b": _tf("B", fifa=1400, **base, squad_value_eur=0.0),
+        "c": _tf("C", fifa=1300, **base, squad_value_eur=0.0),
+    }
+    assert composite_scores(cohort_sparse) == composite_scores(cohort_none)
+
+
+def test_missing_squad_value_imputed_to_median_not_floor():
+    # Minority unknown -> the unknown team is imputed to the cohort median, so
+    # it sits at the centre on the squad factor (not dragged to the bottom).
+    # Build a cohort where everything but squad value is equal; the team with a
+    # missing value must NOT score below the cheapest known team.
+    base = dict(gdp=20_000, pop=50_000_000, temp=14, fifa=1500)
+    cohort = {
+        "top": _tf("Top", **base, squad_value_eur=1_000_000_000),
+        "mid": _tf("Mid", **base, squad_value_eur=300_000_000),
+        "cheap": _tf("Cheap", **base, squad_value_eur=20_000_000),
+        "unknown": _tf("Unknown", **base, squad_value_eur=0.0),
+    }
+    scores = composite_scores(cohort)
+    # Imputed to the median of {1000M, 300M, 20M} -> 300M, so "unknown" lands
+    # near "mid" and strictly above the cheapest, never at the floor.
+    assert scores["unknown"] > scores["cheap"]
+
+
 # ---- CSV loader ---------------------------------------------------------
 
 def test_load_fundamentals_roundtrip(tmp_path):
@@ -109,3 +180,28 @@ def test_load_fundamentals_roundtrip(tmp_path):
     assert mx.host is True
     assert mx.gdp_per_capita_usd == pytest.approx(13800.5)
     assert funds["japan"].host is False
+
+
+def test_load_tolerates_missing_squad_value_column(tmp_path):
+    # Older CSVs (written before squad_value_eur existed) must still load,
+    # defaulting the new column to 0.0 (unknown).
+    p = tmp_path / "old.csv"
+    p.write_text(
+        "team,iso3,gdp_per_capita_usd,population,avg_temp_c,fifa_points,host\n"
+        "Japan,JPN,33800,124000000,11.2,1652,false\n",
+        encoding="utf-8",
+    )
+    funds = load_fundamentals(p)
+    assert funds["japan"].squad_value_eur == 0.0
+
+
+def test_load_reads_squad_value_when_present(tmp_path):
+    p = tmp_path / "new.csv"
+    p.write_text(
+        "team,iso3,gdp_per_capita_usd,population,avg_temp_c,fifa_points,host,"
+        "squad_value_eur\n"
+        "Spain,ESP,35326,48848840,13.3,1880,false,1400000000.0\n",
+        encoding="utf-8",
+    )
+    funds = load_fundamentals(p)
+    assert funds["spain"].squad_value_eur == pytest.approx(1_400_000_000.0)

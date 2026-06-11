@@ -1,4 +1,4 @@
-"""Klement 5-factor fundamentals — ensemble Layer 1 (structural priors).
+"""Klement fundamentals + squad value — ensemble Layer 1 (structural priors).
 
 Joachim Klement's World Cup model (Panmure Liberum; correct outright winner
 2014/2018/2022) explains ~55% of tournament success with five slow-moving
@@ -8,6 +8,14 @@ FIFA ranking points, and host advantage. His fitted coefficients are not
 public, so this module reproduces the *structure*: transform each covariate,
 z-score it within the tournament cohort, and combine with documented weights
 into a composite that maps onto the Glicko rating scale as a prior.
+
+We add a sixth factor Klement does not use: total squad market value (EUR,
+Transfermarkt-style). This is the bottom-up "EA-style" squad-strength signal —
+a golden generation shows up in player valuations before it shows up in
+results — and is especially useful as a cold-start prior for sparse-data
+national teams whose FIFA points lag their actual talent. Squad value is a
+real sporting signal (unlike the socioeconomic proxies, which only correlate),
+so it carries meaningful weight in the default mix.
 
 Its job is regularisation for sparse-data teams — a structurally sensible
 starting strength where match history is thin — NOT match-level edge
@@ -47,22 +55,36 @@ class TeamFundamentals:
     avg_temp_c: float
     fifa_points: float
     host: bool = False
+    # Total squad market value in EUR (Transfermarkt-style). 0.0 means
+    # "unknown" and is treated as no-signal in z-scoring (see composite_scores),
+    # NOT as a genuine zero — so a missing value can't drag a team to the floor.
+    squad_value_eur: float = 0.0
 
 
 @dataclass(frozen=True)
 class FactorWeights:
-    """Relative factor weights (normalised at use). FIFA points dominate —
-    they are the only sporting input; the socioeconomic factors refine.
+    """Relative factor weights (normalised at use). FIFA points stay dominant —
+    they are a direct sporting input. Squad value is the *second* genuine
+    sporting signal (player valuations encode squad strength, often ahead of
+    the FIFA ranking), so it carries meaningful weight; the socioeconomic
+    proxies (gdp/population/temperature) only correlate with footballing
+    strength and merely refine, so each is trimmed to make room.
+
+    Defaults: fifa 0.45, squad_value 0.20, gdp/population/temperature 0.10 each,
+    host 0.0. These are relative weights — they are sum-normalised at use, so a
+    factor that is skipped (e.g. squad value when >50% of the cohort is unknown,
+    see composite_scores) simply drops out and the rest re-normalise.
 
     ``host`` defaults to 0 because host advantage is already applied
     per-match by the engine (``glicko_host_home_mu``); weighting it here too
     would double-count. Raise it only if that per-match bump is disabled.
     """
 
-    fifa: float = 0.55
-    gdp: float = 0.15
-    population: float = 0.15
-    temperature: float = 0.15
+    fifa: float = 0.45
+    gdp: float = 0.10
+    population: float = 0.10
+    temperature: float = 0.10
+    squad_value: float = 0.20
     host: float = 0.0
 
 
@@ -81,6 +103,32 @@ def population_factor(population: int) -> float:
 def temperature_factor(avg_temp_c: float) -> float:
     """Penalty for distance from the ~14C optimum (0 at the optimum)."""
     return -abs(avg_temp_c - TEMP_OPTIMUM_C)
+
+
+def squad_value_factor(value_eur: float) -> float:
+    """Log total squad market value — diminishing returns, like population:
+    a 10x more valuable squad is not 10x stronger. Guards log(0); a missing
+    (0.0) value maps to the same floor as the cheapest possible squad here,
+    but composite_scores imputes/skips missing values *before* z-scoring so a
+    0 never actually reaches this on the unknown-value path."""
+    return math.log(max(value_eur, 1.0))
+
+
+def _squad_value_zscores(values: list[float]) -> list[float] | None:
+    """Z-score squad values with missing-data handling.
+
+    A value of 0.0 means "unknown". If more than half the cohort is unknown the
+    factor is too sparse to trust, so we return ``None`` (caller drops it). If
+    some are unknown but most are known, impute each missing value as the
+    cohort median of the *known* values before transforming + z-scoring, so an
+    unknown squad sits at the cohort centre (no signal) rather than the floor.
+    """
+    known = [v for v in values if v > 0.0]
+    if len(known) * 2 <= len(values):  # >=50% unknown -> skip the factor
+        return None
+    median = statistics.median(known)
+    imputed = [v if v > 0.0 else median for v in values]
+    return _zscores([squad_value_factor(v) for v in imputed])
 
 
 def _zscores(values: list[float]) -> list[float]:
@@ -111,6 +159,11 @@ def composite_scores(
         (w.temperature, _zscores([temperature_factor(t.avg_temp_c) for t in teams])),
         (w.host, _zscores([1.0 if t.host else 0.0 for t in teams])),
     ]
+    # Squad value handles missing data specially: it imputes the cohort median
+    # for unknowns, or drops out entirely when >50% of the cohort is unknown.
+    squad_zs = _squad_value_zscores([t.squad_value_eur for t in teams])
+    if squad_zs is not None:
+        factors.append((w.squad_value, squad_zs))
     total_w = sum(fw for fw, _ in factors)
     if total_w <= 0:
         return {k: 0.0 for k in keys}
@@ -151,6 +204,9 @@ def load_fundamentals(path: str | Path) -> dict[str, TeamFundamentals]:
                 avg_temp_c=float(row["avg_temp_c"]),
                 fifa_points=float(row["fifa_points"]),
                 host=row.get("host", "").strip().lower() in {"1", "true", "yes"},
+                # Optional/additive: older CSVs (written before this column
+                # existed) lack it; default 0.0 = unknown so they still load.
+                squad_value_eur=float(row.get("squad_value_eur") or 0.0),
             )
             out[normalize(tf.team)] = tf
     return out

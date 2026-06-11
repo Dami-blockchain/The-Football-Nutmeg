@@ -118,6 +118,44 @@ FIFA_POINTS = {
     "wales": 1535,
 }
 
+# Total squad market value in MILLIONS of EUR. APPROXIMATE Transfermarkt-style
+# total-squad valuations, snapshotted 2026-06; well-known public figures rounded
+# to round numbers. Squad value is a slow-moving prior — approximate is fine.
+# The elite (Spain/France/England/Brazil/Portugal/Germany) cluster ~900M-1.1B;
+# the minnows (Curacao, Cape Verde, etc.) sit ~15-40M. Refresh before reuse.
+SQUAD_VALUE_EUR_M = {
+    "algeria": 230, "argentina": 720, "australia": 110, "austria": 480,
+    "belgium": 640, "bolivia": 25, "bosnia-herzegovina": 250,
+    "bosnia herzegovina": 250, "bosnia and herzegovina": 250,
+    "brazil": 1000, "cameroon": 320, "canada": 180, "cape verde": 40,
+    "cape verde islands": 40, "chile": 130, "colombia": 430,
+    "congo dr": 280, "dr congo": 280, "costa rica": 45,
+    "croatia": 420, "curacao": 20, "czechia": 320, "czech republic": 320,
+    "denmark": 560, "ecuador": 380, "egypt": 220, "england": 1500,
+    "finland": 130, "france": 1400, "germany": 1000, "ghana": 290,
+    "haiti": 30, "honduras": 30, "hungary": 230,
+    "iran": 90, "iraq": 50, "ireland": 220, "italy": 720,
+    "ivory coast": 360, "cote divoire": 360, "jamaica": 110,
+    "japan": 360, "jordan": 25, "mali": 280, "mexico": 220,
+    "morocco": 520, "netherlands": 880, "new zealand": 40,
+    "nigeria": 470, "north macedonia": 110, "norway": 620,
+    "panama": 35, "paraguay": 110, "peru": 80, "poland": 350,
+    "portugal": 1100, "qatar": 35, "romania": 200, "saudi arabia": 50,
+    "scotland": 290, "senegal": 600, "serbia": 480, "slovakia": 200,
+    "slovenia": 220, "south africa": 90, "south korea": 200,
+    "korea republic": 200, "spain": 1400, "sweden": 360,
+    "switzerland": 400, "tunisia": 130, "turkey": 540, "turkiye": 540,
+    "ukraine": 350, "united arab emirates": 30, "united states": 320,
+    "usa": 320, "uruguay": 380, "uzbekistan": 60, "venezuela": 130,
+    "wales": 280,
+}
+
+
+def _squad_value_eur(key: str) -> float:
+    """Total squad market value in EUR for a normalised team name (0.0 if
+    unknown — treated as no-signal downstream)."""
+    return float(SQUAD_VALUE_EUR_M.get(key, 0)) * 1_000_000
+
 
 async def _wc_team_names() -> list[str]:
     from betbot.data.football_data import FootballDataClient
@@ -185,6 +223,7 @@ async def build(team_names: list[str], out_path: Path) -> None:
                 "avg_temp_c": AVG_TEMP_C[key],
                 "fifa_points": FIFA_POINTS[key],
                 "host": str(key in HOSTS).lower(),
+                "squad_value_eur": _squad_value_eur(key),
             })
             print(f"  {name:24s} {iso3}  gdp_pc={gdp:>10.0f}  pop={int(pop):>11d}")
 
@@ -194,6 +233,31 @@ async def build(team_names: list[str], out_path: Path) -> None:
         writer.writeheader()
         writer.writerows(rows)
     print(f"\nWrote {len(rows)} teams -> {out_path}")
+
+
+def augment_squad_value(path: Path) -> None:
+    """Add (or refresh) the squad_value_eur column on an EXISTING CSV without
+    touching the network. Reads the current rows, fills squad_value_eur from
+    SQUAD_VALUE_EUR_M keyed on the normalised team name, and rewrites the file.
+
+    This is how the committed data/fundamentals_2026.csv gets the new column
+    without re-running the World Bank / football-data pull.
+    """
+    with open(path, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        rows = list(reader)
+        fields = list(reader.fieldnames or [])
+
+    if "squad_value_eur" not in fields:
+        fields.append("squad_value_eur")
+    for row in rows:
+        row["squad_value_eur"] = _squad_value_eur(normalize(row["team"]))
+
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"Augmented squad_value_eur for {len(rows)} teams -> {path}")
 
 
 def main() -> None:
@@ -206,7 +270,15 @@ def main() -> None:
         "--out", default="data/fundamentals_2026.csv", type=Path,
         help="Output CSV path (default: data/fundamentals_2026.csv)",
     )
+    ap.add_argument(
+        "--augment-only", action="store_true",
+        help="No network: just add/refresh the squad_value_eur column on --out.",
+    )
     args = ap.parse_args()
+
+    if args.augment_only:
+        augment_squad_value(args.out)
+        return
 
     if args.teams:
         names = [t.strip() for t in args.teams.split(",") if t.strip()]
