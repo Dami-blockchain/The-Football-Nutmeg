@@ -7,7 +7,8 @@ __pycache__/
 .ruff_cache/
 *.egg-info/
 .env
-/data/
+/data/*
+!/data/fundamentals_2026.csv
 *.sqlite
 *.sqlite-journal
 .DS_Store
