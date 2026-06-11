@@ -9,6 +9,7 @@ from sqlalchemy import select
 from betbot.logging import get_logger
 from betbot.storage.db import session_scope
 from betbot.storage.models import (
+    ArbExecution,
     GlickoRating,
     KillSwitch,
     PaperBet,
@@ -364,6 +365,94 @@ def apply_rating_period(
     for t in teams:
         upsert_rating(t, update_rating(current[t], per_team[t], tau=tau, period=period))
     return len(teams)
+
+
+# ----------------------------------------------------------------------
+# Arbitrage executions
+# ----------------------------------------------------------------------
+def insert_arb_execution(
+    *,
+    home_team: str,
+    away_team: str,
+    margin: float,
+    price_sum: float,
+    stake_usd: float,
+    status: str,
+    legs_json: str,
+    net_expected_usd: float | None = None,
+    error: str | None = None,
+) -> int:
+    """Persist one arb execution attempt; returns the row id."""
+    with session_scope() as s:
+        row = ArbExecution(
+            home_team=home_team[:80],
+            away_team=away_team[:80],
+            margin=margin,
+            price_sum=price_sum,
+            stake_usd=stake_usd,
+            status=status,
+            legs_json=legs_json,
+            net_expected_usd=net_expected_usd,
+            error=error[:500] if error else None,
+        )
+        s.add(row)
+        s.flush()
+        return row.id
+
+
+def update_arb_execution(
+    exec_id: int,
+    *,
+    status: str | None = None,
+    legs_json: str | None = None,
+    net_expected_usd: float | None = None,
+    error: str | None = None,
+) -> None:
+    with session_scope() as s:
+        row = s.get(ArbExecution, exec_id)
+        if row is None:
+            return
+        if status is not None:
+            row.status = status
+        if legs_json is not None:
+            row.legs_json = legs_json
+        if net_expected_usd is not None:
+            row.net_expected_usd = net_expected_usd
+        if error is not None:
+            row.error = error[:500]
+
+
+def arb_staked_today_usd() -> float:
+    """Today's total arb stake over rows where money moved (or may have).
+
+    ``rejected_*`` rows were gated before any order and don't count; everything
+    else (executing / aborted / partial / filled) counts conservatively toward
+    the BETBOT_ARB_DAILY_CAP_USD daily cap.
+    """
+    today_start = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    with session_scope() as s:
+        rows = s.execute(
+            select(ArbExecution.stake_usd)
+            .where(ArbExecution.created_at >= today_start)
+            .where(ArbExecution.status.not_like("rejected%"))
+        ).scalars()
+        return float(sum(rows))
+
+
+def list_recent_arb_executions(days: int = 7) -> list[ArbExecution]:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    with session_scope() as s:
+        rows = list(
+            s.execute(
+                select(ArbExecution)
+                .where(ArbExecution.created_at >= cutoff)
+                .order_by(ArbExecution.created_at.desc())
+            ).scalars()
+        )
+        s.expunge_all()
+        return rows
 
 
 # ----------------------------------------------------------------------

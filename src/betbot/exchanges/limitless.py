@@ -29,6 +29,7 @@ from betbot.exchanges.base import (
     Outcome,
 )
 from betbot.exchanges.limitless_client import (
+    LimitlessAuthError,
     LimitlessClient,
     LimitlessError,
     LimitlessGeoBlockedError,
@@ -38,7 +39,9 @@ from betbot.logging import get_logger
 
 log = get_logger(__name__)
 
-# Orderbook level sizes are in 6-decimal collateral (USDC) units.
+# Orderbook level sizes and settings.minSize are in OUTCOME-TOKEN SHARES with
+# 6 decimals ("100000000" = 100 shares), NOT USDC. The dollar cost of an order
+# of N shares at price p is N * p. (Verified 2026-06-11 against the live API.)
 _SIZE_DECIMALS = 1_000_000
 
 
@@ -58,6 +61,7 @@ class LimitlessAdapter:
         mode: str = "paper",
         private_key: str | None = None,
         fee_rate_bps: int = 0,
+        max_order_usd: float | None = None,
     ) -> None:
         self._client = client
         self._resolver = resolver
@@ -65,12 +69,15 @@ class LimitlessAdapter:
         self._mode = mode
         self._private_key = private_key
         # feeRateBps must fall in the exchange's per-user "band" — a zero fee is
-        # rejected ("feeRateBps[0] is out of user's band"). The exact required
-        # value is not exposed by the public API; resolve it from the Limitless
-        # docs/support before live orders, then pass it through here. Also note
-        # the per-market minSize floor (100 USDC on WC group markets), which
-        # rules out sub-$100 test orders.
+        # rejected ("feeRateBps[0] is out of user's band"). The authoritative
+        # value is GET /profiles/me -> rank.feeRateBps ("use this value when
+        # constructing signed orders"); we fetch it at order-build time. A
+        # non-zero LIMITLESS_FEE_RATE_BPS config override takes precedence.
+        # Per-market settings.minSize is a floor in OUTCOME-TOKEN SHARES (6
+        # decimals) — e.g. "100000000" = 100 shares, costing 100 * price USDC.
+        # (An older comment here misread it as a 100 USDC floor.)
         self._fee_rate_bps = fee_rate_bps
+        self._max_order_usd = max_order_usd
         self._detail_cache: dict[str, dict[str, Any]] = {}
 
     @property
@@ -112,6 +119,22 @@ class LimitlessAdapter:
         swapped = resolver.same_team(m_home, away) and resolver.same_team(m_away, home)
         return straight or swapped
 
+    @staticmethod
+    def _min_shares_of(child: dict[str, Any], detail: dict[str, Any]) -> float:
+        """Per-market minimum order size in OUTCOME-TOKEN SHARES.
+
+        ``settings.minSize`` is a 6-decimal share count ("100000000" = 100
+        shares); the minimum order's dollar cost is ``min_shares * price``.
+        Falls back from the child market to the group, 0.0 if absent.
+        """
+        raw = (child.get("settings") or {}).get("minSize")
+        if raw is None:
+            raw = (detail.get("settings") or {}).get("minSize")
+        try:
+            return float(raw) / _SIZE_DECIMALS if raw is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
     def _classify_children(
         self, detail: dict[str, Any], home_team: str, away_team: str
     ) -> dict[Outcome, dict[str, Any]]:
@@ -126,6 +149,7 @@ class LimitlessAdapter:
                 "slug": child.get("slug"),
                 "yes_token": tokens.get("yes"),
                 "prices": child.get("prices"),
+                "min_shares": self._min_shares_of(child, detail),
             }
         return mapping
 
@@ -218,6 +242,38 @@ class LimitlessAdapter:
         )
 
     # ------------------------------------------------------------------
+    # Per-market sizing + per-user fee rate (live orders)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def min_shares_for(market: MarketRef, outcome: Outcome) -> float:
+        """Market minimum order size in outcome-token shares (0.0 if unknown).
+
+        Min order dollar cost = ``min_shares_for(...) * price``.
+        """
+        child = market.metadata.get("outcome_markets", {}).get(outcome.value) or {}
+        return float(child.get("min_shares") or 0.0)
+
+    async def fetch_user_fee_rate_bps(self) -> int:
+        """The user's fee rate from ``GET /profiles/me -> rank.feeRateBps``.
+
+        This is the value to embed in signed orders. Raises
+        :class:`LimitlessAuthError` when the API key is invalid/revoked (401),
+        so callers can degrade gracefully with a clear operator message.
+        """
+        profile = await self._client.get_profile()
+        return self._fee_from_profile(profile)
+
+    @staticmethod
+    def _fee_from_profile(profile: dict[str, Any]) -> int:
+        fee = ((profile or {}).get("rank") or {}).get("feeRateBps")
+        if fee is None:
+            raise LimitlessError(
+                "Limitless profile has no rank.feeRateBps — cannot build a signed "
+                "order (set LIMITLESS_FEE_RATE_BPS to override)"
+            )
+        return int(fee)
+
+    # ------------------------------------------------------------------
     async def place_order(
         self,
         market: MarketRef,
@@ -236,6 +292,8 @@ class LimitlessAdapter:
         child = market.metadata.get("outcome_markets", {}).get(outcome.value)
         token_id = (child or {}).get("yes_token")
         market_slug = (child or {}).get("slug")
+        # EIP-712 verifyingContract (and approval spender) is PER-MARKET — read
+        # from the market payload (venue.exchange), never hardcoded.
         venue_exchange = market.metadata.get("venue_exchange")
         if not token_id or not venue_exchange or not market_slug:
             raise LimitlessError("missing yes_token / venue_exchange / slug for live order")
@@ -244,14 +302,52 @@ class LimitlessAdapter:
 
         from betbot.exchanges import limitless_signing as sg
 
-        # ownerId (numeric profile id) is required in the order request.
+        # ownerId (numeric profile id) is required in the order request; the
+        # same response carries rank.feeRateBps. A 401 here means the API key
+        # is invalid/revoked — surfaced as LimitlessAuthError, not swallowed.
         try:
-            owner_id = (await self._client.get_profile()).get("id")
+            profile = await self._client.get_profile()
+        except (LimitlessAuthError, LimitlessGeoBlockedError):
+            raise
         except Exception as e:  # noqa: BLE001
             raise LimitlessError(f"could not fetch Limitless profile/ownerId: {e}") from e
+        owner_id = profile.get("id")
+
+        # feeRateBps: config override (non-zero LIMITLESS_FEE_RATE_BPS) wins,
+        # else the per-user value the API tells us to use.
+        fee_rate_bps = self._fee_rate_bps or self._fee_from_profile(profile)
+
+        # minSize: the market floor is in shares; its dollar cost at our price
+        # cap is min_shares * max_price. Bump the spend up to that floor, but
+        # never beyond the configured cap — reject loudly instead.
+        spend_usd = size_usd
+        min_shares = self.min_shares_for(market, outcome)
+        min_cost_usd = min_shares * max_price
+        if spend_usd < min_cost_usd:
+            log.info(
+                "limitless_order_bumped_to_min",
+                slug=market_slug,
+                min_shares=min_shares,
+                min_cost_usd=round(min_cost_usd, 2),
+                requested_usd=round(size_usd, 2),
+            )
+            spend_usd = min_cost_usd
+        if self._max_order_usd is not None and spend_usd > self._max_order_usd:
+            log.error(
+                "limitless_order_rejected_min_size_over_cap",
+                slug=market_slug,
+                min_shares=min_shares,
+                min_cost_usd=round(min_cost_usd, 2),
+                cap_usd=self._max_order_usd,
+                note="market minimum order costs more than the per-order cap",
+            )
+            raise LimitlessError(
+                f"min order cost ${min_cost_usd:.2f} ({min_shares:g} shares @ "
+                f"{max_price:.3f}) exceeds cap ${self._max_order_usd:.2f}"
+            )
 
         maker = Account.from_key(self._private_key).address
-        maker_units = sg.to_usdc_units(size_usd)
+        maker_units = sg.to_usdc_units(spend_usd)
         # Limitless FOK semantics (validated 2026-06-11 against the live API):
         # takerAmount MUST be exactly 1 (a market-order sentinel — "spend
         # makerAmount of collateral, accept the best available fill"); max_price
@@ -259,7 +355,7 @@ class LimitlessAdapter:
         order = sg.build_order(
             token_id=token_id, maker=maker,
             maker_amount_units=maker_units, taker_amount_units=1, side=sg.BUY,
-            fee_rate_bps=self._fee_rate_bps,
+            fee_rate_bps=fee_rate_bps,
         )
         signed = sg.sign_order(order, self._private_key, verifying_contract=venue_exchange)
         # Wire schema (validated against the live API): the signature is nested
@@ -269,11 +365,15 @@ class LimitlessAdapter:
         _str_fields = {"salt", "tokenId", "expiration"}
         order_payload = {k: (str(v) if k in _str_fields else v) for k, v in order.items()}
         order_payload["signature"] = signed["signature"]
+        import uuid
+
         payload = {
             "order": order_payload,
             "orderType": "FOK",
             "marketSlug": market_slug,
             "ownerId": owner_id,
+            # Idempotency key: a resubmit of the same attempt can't double-fill.
+            "clientOrderId": f"tfsm-{uuid.uuid4().hex}",
         }
         resp = await self._client.post_order(payload)
         return OrderResult(

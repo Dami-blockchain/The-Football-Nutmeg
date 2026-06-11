@@ -168,6 +168,20 @@ class Settings(BaseSettings):
     )
     arb_scan_limit: int = Field(default=80, alias="BETBOT_ARB_SCAN_LIMIT")
 
+    # ---- Arbitrage EXECUTION (heavily gated; OFF by default) ----------
+    # Master switch. Even when true, execution also requires mode=live, a clear
+    # kill switch, margin >= arb_execute_min_margin, and funded balances on
+    # BOTH venues. The executor self-gates on every opportunity.
+    arb_execute: bool = Field(default=False, alias="BETBOT_ARB_EXECUTE")
+    # Execution threshold — deliberately stricter than the 0.01 alert threshold.
+    arb_execute_min_margin: float = Field(
+        default=0.02, alias="BETBOT_ARB_EXECUTE_MIN_MARGIN"
+    )
+    # Total stake per opportunity, summed across all legs.
+    arb_max_stake_usd: float = Field(default=25.0, alias="BETBOT_ARB_MAX_STAKE_USD")
+    # Per-day cap summed over arb_executions rows that (may have) moved money.
+    arb_daily_cap_usd: float = Field(default=100.0, alias="BETBOT_ARB_DAILY_CAP_USD")
+
     # ---- Glicko-2 (international / World Cup, Phase 5.5) --------------
     glicko_tau: float = Field(default=0.5, alias="BETBOT_GLICKO_TAU")
     glicko_default_rating: float = Field(default=1500.0, alias="BETBOT_GLICKO_DEFAULT_RATING")
