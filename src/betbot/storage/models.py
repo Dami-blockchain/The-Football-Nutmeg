@@ -163,3 +163,44 @@ class User(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
     )
+
+
+class ModelPrediction(Base):
+    """Dual-logged model comparison for online selection (Hedge).
+
+    One row per WC fixture: what pure Glicko and the ensemble each predicted
+    pre-match, the Hedge weights actually used, and — once settled — each
+    model's RPS. The cumulative RPS sums drive the live weighting, so the bot
+    converges onto whichever model is winning THIS tournament.
+    """
+
+    __tablename__ = "model_predictions"
+    __table_args__ = (
+        UniqueConstraint("fixture_id", name="uq_model_pred_fixture"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    fixture_id: Mapped[int] = mapped_column(Integer, index=True)
+    home_team: Mapped[str] = mapped_column(String(80))
+    away_team: Mapped[str] = mapped_column(String(80))
+
+    g_home: Mapped[float] = mapped_column(Float)   # pure-Glicko triple
+    g_draw: Mapped[float] = mapped_column(Float)
+    g_away: Mapped[float] = mapped_column(Float)
+    e_home: Mapped[float] = mapped_column(Float)   # ensemble triple
+    e_draw: Mapped[float] = mapped_column(Float)
+    e_away: Mapped[float] = mapped_column(Float)
+    w_glicko: Mapped[float] = mapped_column(Float)     # Hedge weights used
+    w_ensemble: Mapped[float] = mapped_column(Float)
+
+    # Filled at settlement.
+    outcome: Mapped[str | None] = mapped_column(String(4), nullable=True)
+    rps_glicko: Mapped[float | None] = mapped_column(Float, nullable=True)
+    rps_ensemble: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )

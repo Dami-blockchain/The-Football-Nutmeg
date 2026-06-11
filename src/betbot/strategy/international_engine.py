@@ -36,9 +36,11 @@ from betbot.strategy.ensemble import (
     anchor_to_market,
     blend,
     calibrate,
+    log_pool,
     EnsembleWeights,
 )
 from betbot.strategy.glicko import Glicko2Rating, match_probabilities
+from betbot.strategy.model_select import hedge_weights
 
 # 2026 World Cup hosts — genuine home advantage applies only to these.
 HOST_NATIONS_2026 = frozenset({"united states", "usa", "canada", "mexico"})
@@ -66,6 +68,27 @@ def _load_calibrators(path: Path) -> tuple[IsotonicCalibrator, ...] | None:
         return None
 
 
+def _safe_model_losses() -> tuple[float, float, int]:
+    """Default loss source: the model_predictions table. Degrades to
+    no-evidence (50/50 Hedge) rather than crashing when the DB isn't up."""
+    try:
+        from betbot.storage.repos import model_select_losses
+
+        return model_select_losses()
+    except Exception:  # noqa: BLE001 — prediction must never die on telemetry
+        return (0.0, 0.0, 0)
+
+
+def _safe_record_model_prediction(*args) -> None:
+    """Default recorder; same never-crash contract as _safe_model_losses."""
+    try:
+        from betbot.storage.repos import upsert_model_prediction
+
+        upsert_model_prediction(*args)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 class InternationalStrategyEngine:
     def __init__(
         self,
@@ -74,6 +97,8 @@ class InternationalStrategyEngine:
         *,
         dc_params: dc.DCParams | None = None,
         calibrators: tuple[IsotonicCalibrator, ...] | None = None,
+        get_model_losses: Callable[[], tuple[float, float, int]] | None = None,
+        record_model_prediction: Callable[..., None] | None = None,
     ) -> None:
         self._settings = settings
         self._base = StrategyEngine(settings)  # reuse the edge filter unchanged
@@ -97,6 +122,14 @@ class InternationalStrategyEngine:
                 default_rd=settings.glicko_default_rd,
                 default_vol=settings.glicko_default_vol,
             )
+        if get_model_losses is not None:
+            self._get_model_losses = get_model_losses
+        else:
+            self._get_model_losses = _safe_model_losses
+        if record_model_prediction is not None:
+            self._record_model_prediction = record_model_prediction
+        else:
+            self._record_model_prediction = _safe_record_model_prediction
 
     def predict(self, fixture_form: FixtureForm) -> Prediction:
         s = self._settings
@@ -115,7 +148,19 @@ class InternationalStrategyEngine:
                 normalize(away_name),
                 home_field=_is_host(home_name),
             )
-            probs = blend(glicko_probs, dc_probs, weights=self._weights)
+            ens_probs = blend(glicko_probs, dc_probs, weights=self._weights)
+            if s.model_select_enabled:
+                # Online selection: weight glicko vs ensemble by Hedge over
+                # their settled-match RPS this tournament, and dual-log both
+                # views so settlement can keep score.
+                loss_g, loss_e, _n = self._get_model_losses()
+                w_g, w_e = hedge_weights(loss_g, loss_e, eta=s.model_select_eta)
+                probs = log_pool([(w_g, glicko_probs), (w_e, ens_probs)])
+                self._record_model_prediction(
+                    fx.id, home_name, away_name, glicko_probs, ens_probs, (w_g, w_e)
+                )
+            else:
+                probs = ens_probs
         else:
             probs = glicko_probs  # pure-Glicko fallback (no DC artifact)
         p_home, p_draw, p_away = calibrate(probs, self._calibrators)
