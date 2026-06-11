@@ -22,6 +22,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from betbot.config import INTERNATIONAL_COMPETITIONS, get_settings
 from betbot.data.football_data import FootballDataClient, FootballDataError
 from betbot.data.form import FormService, _parse_kickoff, _parse_team
+from betbot.exchanges.base import ExchangeName
 from betbot.exchanges.limitless import LimitlessAdapter
 from betbot.exchanges.limitless_client import LimitlessClient
 from betbot.exchanges.matcher import TeamAliasResolver
@@ -40,11 +41,15 @@ from betbot.storage.repos import (
     insert_paper_bet_no_market,
     is_kill_switch_tripped,
     list_recent_paper_bets,
+    list_users,
     reset_kill_switch,
     upsert_prediction,
 )
 from betbot.strategy.engine import StrategyEngine
 from betbot.strategy.international_engine import InternationalStrategyEngine
+# NOTE: betbot.wallet pulls in web3 (the `api` extra) at import time, so it's
+# imported lazily inside the functions that need it — keeping `betbot.main`
+# importable (and testable) on the base install.
 
 # Repo root (…/tfsm), used to locate config/team_aliases.yaml regardless of cwd.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -63,42 +68,55 @@ app.add_typer(arb_app, name="arb")
 # ----------------------------------------------------------------------
 # Exchange routing
 # ----------------------------------------------------------------------
-def _build_router(settings) -> tuple[ExchangeRouter, list]:
+def _build_router(settings) -> tuple[ExchangeRouter, list, object]:
     """Construct the exchange router for a run.
 
-    Returns the router and the list of HTTP clients the caller must close.
+    Returns ``(router, http_clients_to_close, make_signer_adapters)``.
+
     ``enable_orders`` stays False through Phase 3 (paper only) — live ordering
     is wired in Phase 5; each adapter's double-gate keeps place_order inert
     regardless. Limitless football coverage is sparse and US IPs are geo-blocked
     (surfaced as LimitlessGeoBlockedError, which the router isolates per-adapter),
     so most runs route on Polymarket alone — expected, not an error.
+
+    ``make_signer_adapters(signing_key, funder)`` rebuilds the venue adapters
+    bound to a *different* signing key — this is how multi-tenant placement
+    trades each user's own wallet. Market discovery/scoring is wallet-independent
+    and done once via ``router``; only the final ``place_order`` is per-user.
     """
+    from betbot.wallet import get_private_key
+
     resolver = TeamAliasResolver.from_yaml(_REPO_ROOT / "config" / "team_aliases.yaml")
     enable = settings.mode == "live"  # double-gate: place_order also checks mode
 
     # Fall back to the agent wallet key (the one you deposit into) for signing
     # if explicit per-venue keys aren't set.
-    from betbot.wallet import get_private_key
     agent_key = get_private_key(settings.wallet_keyfile)
 
     gamma = GammaClient()
-    polymarket = PolymarketAdapter(
-        gamma, resolver, enable_orders=enable, mode=settings.mode,
-        private_key=settings.polymarket_private_key or agent_key,
-        funder=settings.polymarket_funder or None,
-    )
-
     limitless_client = LimitlessClient(
         api_key=settings.limitless_api_key,
         api_secret=settings.limitless_api_secret,
     )
-    limitless = LimitlessAdapter(
-        limitless_client, resolver, enable_orders=enable, mode=settings.mode,
-        private_key=settings.limitless_private_key or agent_key,
-    )
 
-    router = ExchangeRouter([polymarket, limitless])
-    return router, [gamma, limitless_client]
+    def make_signer_adapters(*, signing_key: str | None, funder: str | None = None) -> dict:
+        """Venue adapters bound to one signing key (shares the HTTP clients)."""
+        pm = PolymarketAdapter(
+            gamma, resolver, enable_orders=enable, mode=settings.mode,
+            private_key=signing_key, funder=funder,
+        )
+        lm = LimitlessAdapter(
+            limitless_client, resolver, enable_orders=enable, mode=settings.mode,
+            private_key=signing_key, fee_rate_bps=settings.limitless_fee_rate_bps,
+        )
+        return {ExchangeName.POLYMARKET: pm, ExchangeName.LIMITLESS: lm}
+
+    base = make_signer_adapters(
+        signing_key=settings.polymarket_private_key or agent_key,
+        funder=settings.polymarket_funder or None,
+    )
+    router = ExchangeRouter([base[ExchangeName.POLYMARKET], base[ExchangeName.LIMITLESS]])
+    return router, [gamma, limitless_client], make_signer_adapters
 
 
 # ----------------------------------------------------------------------
@@ -149,7 +167,10 @@ async def _score_once() -> int:
     date_to = (today + timedelta(days=2)).isoformat()
 
     paper_bets_logged = 0
-    router, _http_clients = _build_router(settings)
+    router, _http_clients, make_signer_adapters = _build_router(settings)
+    # Per-run cache of per-user signer adapters (keyed by wallet keyfile), so we
+    # build one ClobClient per user, not one per bet.
+    user_adapter_cache: dict[str, dict] = {}
 
     async with FootballDataClient(
         api_key=settings.football_data_api_key,
@@ -184,6 +205,7 @@ async def _score_once() -> int:
                         bets = await _score_and_log_one(
                             m, league, form_service, eng, router,
                             settings, kill_tripped, live_orders,
+                            make_signer_adapters, user_adapter_cache,
                         )
                         paper_bets_logged += bets
                     except FootballDataError as e:
@@ -221,6 +243,8 @@ async def _score_and_log_one(
     settings,
     kill_tripped: bool = False,
     live_orders: bool = False,
+    make_signer_adapters=None,
+    user_adapter_cache: dict | None = None,
 ) -> int:
     """Score one fixture and log a paper bet.
 
@@ -321,8 +345,12 @@ async def _score_and_log_one(
             )
         else:
             log.debug("paper_bet_already_logged", fixture_id=fixture_id)
-        # Phase 5: place the real order (gated; skipped for WC and when not live).
-        await _maybe_place_live_order(route, prediction, decision, settings, live_orders)
+        # Phase 5: place the real order on every active user's own wallet
+        # (gated; skipped for WC and when not live).
+        await _place_live_for_users(
+            route, prediction, decision, settings, live_orders,
+            make_signer_adapters, user_adapter_cache if user_adapter_cache is not None else {},
+        )
         return 1 if inserted else 0
 
     # ---- No market: Phase-1 favourite-only paper bet -----------------
@@ -352,13 +380,51 @@ async def _score_and_log_one(
     return 0
 
 
-async def _maybe_place_live_order(route, prediction, decision, settings, live_orders) -> None:
-    """Place a real order on the winning venue — heavily gated.
+async def _place_one(
+    adapter, route, prediction, decision, stake_usd, max_price, *, who
+) -> None:
+    """Place a single real order on one venue adapter (one wallet)."""
+    log = get_logger(__name__)
+    try:
+        result = await adapter.place_order(
+            route.market, decision.outcome, stake_usd, max_price
+        )
+        log.info(
+            "live_order_placed",
+            who=who,
+            fixture_id=prediction.fixture_id,
+            exchange=route.quote.exchange.value,
+            outcome=decision.outcome.value,
+            stake_usd=round(stake_usd, 2),
+            order_id=result.order_id,
+            status=result.status,
+        )
+    except Exception as e:  # noqa: BLE001 — paper row persists even if order fails
+        log.error(
+            "live_order_failed",
+            who=who,
+            fixture_id=prediction.fixture_id,
+            exchange=route.quote.exchange.value,
+            error=str(e),
+        )
+
+
+async def _place_live_for_users(
+    route, prediction, decision, settings, live_orders,
+    make_signer_adapters, user_adapter_cache: dict,
+) -> None:
+    """Place the decided bet on EVERY active user's own wallet — heavily gated.
+
+    Non-custodial multi-tenant placement: market discovery + the bet decision
+    are wallet-independent and already done by the caller; here we re-sign and
+    submit the same order from each user's isolated wallet, sized to that user's
+    own balance. One user's order never touches another's funds.
 
     No-ops unless ``live_orders`` (live mode + gate clear). NEVER places for
-    INTERNATIONAL_COMPETITIONS (World Cup) — that guard is the hard rule. The
-    paper bet has already been logged by the caller and persists regardless of
-    whether the live order succeeds.
+    INTERNATIONAL_COMPETITIONS (World Cup) unless explicitly allowed — that
+    guard is the hard rule. The paper bet has already been logged and persists
+    regardless of whether any live order succeeds. When no users are registered,
+    falls back to the single global agent wallet (backward-compatible).
     """
     log = get_logger(__name__)
     if not live_orders:
@@ -374,25 +440,54 @@ async def _maybe_place_live_order(route, prediction, decision, settings, live_or
             note="set BETBOT_ALLOW_INTERNATIONAL_LIVE=true to enable",
         )
         return
+
     max_price = min(0.99, route.quote.yes_price + settings.order_slippage)
-    try:
-        result = await route.adapter.place_order(
-            route.market, decision.outcome, decision.stake_usd, max_price
+    venue = route.quote.exchange
+
+    users = list_users()
+    if not users:
+        # Backward-compatible: trade the single global agent wallet. (No wallet
+        # import on this path — keeps the web3 dependency off the single-wallet
+        # flow and its tests.)
+        await _place_one(
+            route.adapter, route, prediction, decision,
+            decision.stake_usd, max_price, who="agent",
         )
-        log.info(
-            "live_order_placed",
-            fixture_id=prediction.fixture_id,
-            exchange=route.quote.exchange.value,
-            outcome=decision.outcome.value,
-            order_id=result.order_id,
-            status=result.status,
-        )
-    except Exception as e:  # noqa: BLE001 — paper row persists even if order fails
-        log.error(
-            "live_order_failed",
-            fixture_id=prediction.fixture_id,
-            exchange=route.quote.exchange.value,
-            error=str(e),
+        return
+
+    if make_signer_adapters is None:  # defensive — caller always supplies it live
+        log.error("multi_user_placement_unconfigured", fixture_id=prediction.fixture_id)
+        return
+
+    # Per-user path: size each order against that user's balance on the venue's
+    # chain. betbot.wallet pulls in web3, so import it only here.
+    from betbot.wallet import get_private_key, usdc_balance
+
+    chain = "polygon" if venue == ExchangeName.POLYMARKET else "base"
+    rpc = settings.polygon_rpc_url if chain == "polygon" else settings.base_rpc_url
+
+    for u in users:
+        who = f"user:{u.telegram_user_id}"
+        key = get_private_key(Path(u.wallet_keyfile))
+        if not key:
+            log.warning("user_key_missing", who=who, keyfile=u.wallet_keyfile)
+            continue
+        bal = usdc_balance(u.wallet_address, chain, rpc)
+        stake = min(decision.stake_usd, bal.usdc) if bal.ok else 0.0
+        if stake < settings.min_user_stake_usd:
+            log.info(
+                "user_bet_skipped_low_balance",
+                who=who, chain=chain,
+                balance=round(bal.usdc, 2) if bal.ok else None,
+                need=settings.min_user_stake_usd,
+            )
+            continue
+        adapters = user_adapter_cache.get(u.wallet_keyfile)
+        if adapters is None:
+            adapters = make_signer_adapters(signing_key=key, funder=u.wallet_address)
+            user_adapter_cache[u.wallet_keyfile] = adapters
+        await _place_one(
+            adapters[venue], route, prediction, decision, stake, max_price, who=who,
         )
 
 
@@ -547,7 +642,7 @@ async def _run_arb_scan(settings, limit: int, min_margin: float) -> list:
     from betbot.exchanges.sxbet import SXBetAdapter, SXBetClient
 
     win = re.compile(r"will\s+(.+?)\s+win", re.IGNORECASE)
-    router, clients = _build_router(settings)
+    router, clients, _make_adapters = _build_router(settings)
     gamma = clients[0]
     # SX Bet is scan-only — added to the arb scan, NOT the betting router.
     sx_client = SXBetClient()

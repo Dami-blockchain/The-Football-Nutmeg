@@ -60,20 +60,16 @@ ERC1155_ABI = [
 ]
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--confirm", action="store_true", help="send real transactions")
-    args = ap.parse_args()
+def approve_for_account(w3, acct, *, confirm: bool) -> None:
+    """Set every Polymarket allowance/operator approval for one account.
 
-    s = get_settings()
-    key = s.polymarket_private_key
-    if not key:
-        raise SystemExit("POLYMARKET_PRIVATE_KEY not set")
-
-    w3 = Web3(Web3.HTTPProvider(s.polygon_rpc_url))
-    acct = w3.eth.account.from_key(key)
+    Extracted so multi-tenant tooling can approve each user's own wallet by
+    passing that user's ``acct`` (see scripts/polymarket_approve_users.py).
+    Idempotent: already-approved spenders are skipped.
+    """
     print(f"wallet: {acct.address}")
-    print(f"chain:  Polygon ({w3.eth.chain_id})   confirm={args.confirm}")
+    print(f"chain:  Polygon ({w3.eth.chain_id})   confirm={confirm}")
+    args = argparse.Namespace(confirm=confirm)
 
     spenders = [("CTF Exchange V2", EXCHANGE_V2)]
     if NEG_RISK:
@@ -124,6 +120,21 @@ def main() -> None:
         w3.eth.wait_for_transaction_receipt(h)
 
     print("done." if args.confirm else "dry-run complete (pass --confirm to send).")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--confirm", action="store_true", help="send real transactions")
+    args = ap.parse_args()
+
+    s = get_settings()
+    key = s.polymarket_private_key
+    if not key:
+        raise SystemExit("POLYMARKET_PRIVATE_KEY not set")
+
+    w3 = Web3(Web3.HTTPProvider(s.polygon_rpc_url))
+    acct = w3.eth.account.from_key(key)
+    approve_for_account(w3, acct, confirm=args.confirm)
 
 
 if __name__ == "__main__":

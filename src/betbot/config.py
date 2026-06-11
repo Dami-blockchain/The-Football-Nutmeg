@@ -133,6 +133,12 @@ class Settings(BaseSettings):
     # then derive a scoped API token). Without these, live orders can't post.
     limitless_api_key: str = Field(default="", alias="LIMITLESS_API_KEY")
     limitless_api_secret: str = Field(default="", alias="LIMITLESS_API_SECRET")
+    # Limitless feeRateBps must fall in the exchange's per-user band (a 0 fee is
+    # rejected). Set the value from the Limitless docs/support before live orders.
+    limitless_fee_rate_bps: int = Field(default=0, alias="LIMITLESS_FEE_RATE_BPS")
+    # Multi-tenant: minimum per-user stake. A user whose wallet balance is below
+    # this is skipped for that bet (rather than placing a dust order or failing).
+    min_user_stake_usd: float = Field(default=1.0, alias="BETBOT_MIN_USER_STAKE_USD")
     # Max slippage added to the quoted price when sending a market buy.
     order_slippage: float = Field(default=0.02, alias="BETBOT_ORDER_SLIPPAGE")
     # Allow live orders on INTERNATIONAL_COMPETITIONS (World Cup). Default OFF:

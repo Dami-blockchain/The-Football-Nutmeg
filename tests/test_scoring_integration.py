@@ -190,3 +190,118 @@ async def test_exposure_cap_blocks_logging(fresh_db, settings):
                                  FakeRouter(None), settings)
     assert n == 0
     assert len(list_recent_paper_bets(days=7)) == 1  # only the first
+
+
+# --------------------------------------------------------------------------
+# Multi-tenant placement: the decided bet is placed on EVERY funded user's own
+# wallet (non-custodial), sized to that user's balance. These drive
+# `_place_live_for_users` directly (the existing live tests cover the no-users
+# fallback to the single global agent wallet).
+# --------------------------------------------------------------------------
+async def test_multi_user_places_on_each_funded_wallet(fresh_db, settings, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import betbot.wallet as wallet_mod
+    from betbot.exchanges.base import MarketRef
+    from betbot.main import _place_live_for_users
+    from betbot.storage.repos import get_or_create_user
+
+    secrets = tmp_path / "secrets"
+    alice = get_or_create_user(111, "Alice", secrets_dir=str(secrets))
+    get_or_create_user(222, "Bob", secrets_dir=str(secrets))  # under-funded -> skipped
+
+    def fake_balance(address, chain, rpc):
+        usd = 100.0 if address.lower() == alice.wallet_address.lower() else 0.0
+        return wallet_mod.ChainBalance(chain, chain, usd, True)
+
+    monkeypatch.setattr(wallet_mod, "usdc_balance", fake_balance)
+
+    built = []
+
+    def fake_make(*, signing_key, funder=None):
+        adapters = {ExchangeName.POLYMARKET: FakeAdapter(),
+                    ExchangeName.LIMITLESS: FakeAdapter()}
+        built.append((funder, adapters))
+        return adapters
+
+    route = RoutedQuote(
+        adapter=FakeAdapter(),  # global fallback — must NOT be used when users exist
+        market=MarketRef(ExchangeName.POLYMARKET, "m", "A vs B", {}),
+        quote=_home_quote(0.50),
+    )
+    prediction = SimpleNamespace(competition_code="PL", fixture_id=9001)
+    decision = SimpleNamespace(outcome=Outcome.HOME, stake_usd=10.0)
+
+    await _place_live_for_users(route, prediction, decision, settings, True, fake_make, {})
+
+    assert len(built) == 1                       # only Alice (funded) got an adapter
+    funder, adapters = built[0]
+    assert funder.lower() == alice.wallet_address.lower()
+    placed = adapters[ExchangeName.POLYMARKET].placed
+    assert len(placed) == 1
+    assert placed[0][1] == 10.0                  # stake = min(10 stake, 100 balance)
+    assert route.adapter.placed == []            # global fallback unused
+
+
+async def test_multi_user_sizes_down_to_balance(fresh_db, settings, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import betbot.wallet as wallet_mod
+    from betbot.exchanges.base import MarketRef
+    from betbot.main import _place_live_for_users
+    from betbot.storage.repos import get_or_create_user
+
+    get_or_create_user(333, "Carol", secrets_dir=str(tmp_path / "secrets"))
+    monkeypatch.setattr(
+        wallet_mod, "usdc_balance",
+        lambda a, c, r: wallet_mod.ChainBalance(c, c, 3.5, True),  # below the $10 stake
+    )
+
+    built = []
+
+    def fake_make(*, signing_key, funder=None):
+        d = {ExchangeName.POLYMARKET: FakeAdapter(), ExchangeName.LIMITLESS: FakeAdapter()}
+        built.append(d)
+        return d
+
+    route = RoutedQuote(adapter=FakeAdapter(),
+                        market=MarketRef(ExchangeName.POLYMARKET, "m", "A vs B", {}),
+                        quote=_home_quote(0.50))
+    prediction = SimpleNamespace(competition_code="PL", fixture_id=9001)
+    decision = SimpleNamespace(outcome=Outcome.HOME, stake_usd=10.0)
+
+    await _place_live_for_users(route, prediction, decision, settings, True, fake_make, {})
+
+    placed = built[0][ExchangeName.POLYMARKET].placed
+    assert len(placed) == 1
+    assert placed[0][1] == 3.5                   # capped to the user's balance
+
+
+async def test_multi_user_wc_guard_blocks_all(fresh_db, settings, tmp_path, monkeypatch):
+    """The World Cup hard-guard holds even with funded users (flag off)."""
+    from types import SimpleNamespace
+
+    import betbot.wallet as wallet_mod
+    from betbot.exchanges.base import MarketRef
+    from betbot.main import _place_live_for_users
+    from betbot.storage.repos import get_or_create_user
+
+    get_or_create_user(444, "Dave", secrets_dir=str(tmp_path / "secrets"))
+    monkeypatch.setattr(wallet_mod, "usdc_balance",
+                        lambda a, c, r: wallet_mod.ChainBalance(c, c, 100.0, True))
+
+    built = []
+
+    def fake_make(*, signing_key, funder=None):
+        d = {ExchangeName.POLYMARKET: FakeAdapter(), ExchangeName.LIMITLESS: FakeAdapter()}
+        built.append(d)
+        return d
+
+    route = RoutedQuote(adapter=FakeAdapter(),
+                        market=MarketRef(ExchangeName.POLYMARKET, "m", "A vs B", {}),
+                        quote=_home_quote(0.50))
+    prediction = SimpleNamespace(competition_code="WC", fixture_id=9001)
+    decision = SimpleNamespace(outcome=Outcome.HOME, stake_usd=10.0)
+
+    await _place_live_for_users(route, prediction, decision, settings, True, fake_make, {})
+    assert built == []                           # no per-user adapters built; guard held

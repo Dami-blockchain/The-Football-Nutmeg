@@ -57,12 +57,20 @@ class LimitlessAdapter:
         enable_orders: bool = False,
         mode: str = "paper",
         private_key: str | None = None,
+        fee_rate_bps: int = 0,
     ) -> None:
         self._client = client
         self._resolver = resolver
         self._enable_orders = enable_orders
         self._mode = mode
         self._private_key = private_key
+        # feeRateBps must fall in the exchange's per-user "band" — a zero fee is
+        # rejected ("feeRateBps[0] is out of user's band"). The exact required
+        # value is not exposed by the public API; resolve it from the Limitless
+        # docs/support before live orders, then pass it through here. Also note
+        # the per-market minSize floor (100 USDC on WC group markets), which
+        # rules out sub-$100 test orders.
+        self._fee_rate_bps = fee_rate_bps
         self._detail_cache: dict[str, dict[str, Any]] = {}
 
     @property
@@ -244,19 +252,28 @@ class LimitlessAdapter:
 
         maker = Account.from_key(self._private_key).address
         maker_units = sg.to_usdc_units(size_usd)
-        taker_units = sg.shares_for(maker_units, max_price)
+        # Limitless FOK semantics (validated 2026-06-11 against the live API):
+        # takerAmount MUST be exactly 1 (a market-order sentinel — "spend
+        # makerAmount of collateral, accept the best available fill"); max_price
+        # bounds slippage on our side via the chosen market, not the order.
         order = sg.build_order(
             token_id=token_id, maker=maker,
-            maker_amount_units=maker_units, taker_amount_units=taker_units, side=sg.BUY,
+            maker_amount_units=maker_units, taker_amount_units=1, side=sg.BUY,
+            fee_rate_bps=self._fee_rate_bps,
         )
         signed = sg.sign_order(order, self._private_key, verifying_contract=venue_exchange)
-        # Order ints are sent as strings (standard for ctf-exchange order APIs).
+        # Wire schema (validated against the live API): the signature is nested
+        # INSIDE `order`; salt/tokenId/expiration are decimal strings (uint256s
+        # exceed JS safe-int range); makerAmount/takerAmount/nonce/feeRateBps/
+        # side/signatureType stay numeric.
+        _str_fields = {"salt", "tokenId", "expiration"}
+        order_payload = {k: (str(v) if k in _str_fields else v) for k, v in order.items()}
+        order_payload["signature"] = signed["signature"]
         payload = {
-            "order": {k: (str(v) if isinstance(v, int) else v) for k, v in order.items()},
+            "order": order_payload,
             "orderType": "FOK",
             "marketSlug": market_slug,
             "ownerId": owner_id,
-            "signature": signed["signature"],
         }
         resp = await self._client.post_order(payload)
         return OrderResult(
