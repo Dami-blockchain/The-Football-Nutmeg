@@ -85,10 +85,10 @@ def format_arb_digest(lines: Sequence[ArbLine], day: date) -> str:
     return "\n".join(parts)
 
 
-def format_daily_report(report: DailyReport) -> str:
-    """The 21:00 full daily report body."""
-    parts = [f"*Daily report — {report.day.isoformat()}*", ""]
-
+def _activity_parts(report: DailyReport) -> list[str]:
+    """The day's shared trading activity (trades + settlements) — the part
+    of the report that is the same for every recipient."""
+    parts: list[str] = []
     if report.trades:
         parts.append(f"*Trades placed today ({len(report.trades)})*")
         parts.append(_mono(_trades_table(report.trades)))
@@ -100,6 +100,18 @@ def format_daily_report(report: DailyReport) -> str:
         parts.append(_mono(_settlements_table(report.settlements)))
     else:
         parts.append("*Settled today:* none")
+    return parts
+
+
+def format_daily_report(report: DailyReport) -> str:
+    """The 21:00 full daily report body — OPERATOR ONLY.
+
+    Contains every user's name and balances, the agent wallet and cumulative
+    P&L: financial data that must never be broadcast to registered users of
+    a public bot. Users get :func:`format_user_daily_report` instead.
+    """
+    parts = [f"*Daily report — {report.day.isoformat()}*", ""]
+    parts.extend(_activity_parts(report))
 
     parts.append(
         f"*Realised P&L:* today {report.realised_today_usd:+.2f} USD"
@@ -112,6 +124,32 @@ def format_daily_report(report: DailyReport) -> str:
         parts.append(_mono(_balances_table(report.balances)))
     else:
         parts.append("*Balances:* unavailable")
+    return "\n".join(parts)
+
+
+def format_user_daily_report(
+    report: DailyReport, balance: BalanceLine | None
+) -> str:
+    """The 21:00 report one registered USER receives: the day's shared
+    trading activity plus ONLY their own wallet balances.
+
+    WHY a separate formatter: registration is public, so the full report's
+    per-user balance table (identities + holdings), agent wallet balance and
+    cumulative P&L are operator-only. The trades/settlements sections are
+    shared bot activity — every user's wallet mirrors the same decisions —
+    so showing them leaks nothing about other users.
+    """
+    parts = [f"*Daily report — {report.day.isoformat()}*", ""]
+    parts.extend(_activity_parts(report))
+    parts.append(
+        f"*Realised P&L today:* {report.realised_today_usd:+.2f} USD"
+    )
+    parts.append(f"*Arb opportunities today:* {report.arb_count_today}")
+    if balance is not None:
+        parts.append("*Your balances (USDC)*")
+        parts.append(_mono(_balances_table([balance])))
+    else:
+        parts.append("*Your balances:* unavailable")
     return "\n".join(parts)
 
 

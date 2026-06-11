@@ -30,6 +30,7 @@ from betbot.reports import (
     DailyReport,
     format_arb_digest,
     format_daily_report,
+    format_user_daily_report,
 )
 from betbot.storage.repos import (
     count_arb_opportunities_between,
@@ -217,9 +218,40 @@ async def run_daily_report(
     send_fn: SendFn | None = None,
     now: datetime | None = None,
 ) -> int:
-    """Build + broadcast the full daily report. Returns messages delivered."""
+    """Build + send the daily report, scoped per recipient.
+
+    Privacy boundary (the bot is public — anyone can register): the FULL
+    report (every user's name + balances, the agent wallet, cumulative P&L)
+    goes ONLY to the operator chat id. Each registered user receives a
+    scoped report containing the day's shared trading activity and ONLY
+    their own wallet's balances. Returns messages delivered.
+    """
+    from betbot.notify import send_telegram_to
+
+    send = send_fn or send_telegram_to
     report = collect_daily_report(settings, balances_fn=balances_fn, now=now)
-    sent = await _broadcast(settings, format_daily_report(report), send_fn)
+    sent = 0
+
+    operator_id = settings.telegram_allowed_user_id
+    if operator_id:
+        if await send(settings, operator_id, format_daily_report(report)):
+            sent += 1
+    else:
+        log.warning(
+            "daily_report_no_operator",
+            note="TELEGRAM_ALLOWED_USER_ID unset — full report has no recipient",
+        )
+
+    by_address = {ln.address: ln for ln in report.balances}
+    for user in list_users():
+        if user.telegram_user_id == operator_id:
+            continue  # the operator already got the full report
+        text = format_user_daily_report(
+            report, by_address.get(user.wallet_address)
+        )
+        if await send(settings, user.telegram_user_id, text):
+            sent += 1
+
     log.info(
         "daily_report_sent",
         day=report.day.isoformat(),

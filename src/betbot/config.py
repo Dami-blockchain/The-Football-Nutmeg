@@ -193,6 +193,13 @@ class Settings(BaseSettings):
     # enough for a handful of simple transactions, not a balance to manage.
     gas_topup_pol: float = Field(default=0.5, alias="BETBOT_GAS_TOPUP_POL")
     gas_topup_eth: float = Field(default=0.0005, alias="BETBOT_GAS_TOPUP_ETH")
+    # Abuse guard for the public bot: max agent-funded gas top-ups per user
+    # wallet per UTC day (persisted in the gas_topups table, so restarts
+    # don't reset it). A normal deposit needs at most 2-3 top-ups (source
+    # chain + each trading chain); 4 leaves headroom for a retry. 0 = no cap.
+    gas_topup_daily_cap: int = Field(
+        default=4, alias="BETBOT_GAS_TOPUP_DAILY_CAP"
+    )
     deposit_scan_minutes: int = Field(
         default=10, alias="BETBOT_DEPOSIT_SCAN_MINUTES"
     )

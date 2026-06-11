@@ -11,6 +11,7 @@ from betbot.storage.db import session_scope
 from betbot.storage.models import (
     ArbScanResult,
     Deposit,
+    GasTopup,
     GlickoRating,
     KillSwitch,
     PaperBet,
@@ -512,6 +513,25 @@ def has_active_source_deposit(wallet_address: str, source_chain: str) -> bool:
         return row is not None
 
 
+def has_active_dest_deposit(wallet_address: str, dest_chain: str) -> bool:
+    """True while ANY unfinished leg is bridging TOWARD this (wallet, chain).
+
+    Detection guard: an in-flight leg's mint can land on the destination
+    chain before its status persists; detecting balances there while the leg
+    is active would record the bridged funds as a phantom new deposit and
+    double-count the delivered baseline.
+    """
+    with session_scope() as s:
+        row = s.execute(
+            select(Deposit.id)
+            .where(Deposit.wallet_address == wallet_address)
+            .where(Deposit.dest_chain == dest_chain)
+            .where(Deposit.status != DEPOSIT_DONE)
+            .limit(1)
+        ).scalar_one_or_none()
+        return row is not None
+
+
 def list_active_deposits() -> list[Deposit]:
     """Unfinished legs, oldest first — the scan tick resumes each of these."""
     with session_scope() as s:
@@ -572,6 +592,38 @@ def update_deposit(
             row.mint_tx = mint_tx
         if error is not None:
             row.error = error[:300]
+
+
+# ----------------------------------------------------------------------
+# Agent gas spend audit (deposit pipeline abuse guard)
+# ----------------------------------------------------------------------
+def record_gas_topup(
+    *, wallet_address: str, chain: str, amount: float, tx: str | None = None
+) -> None:
+    """Persist one agent-funded native-gas top-up (see bridge._ensure_gas)."""
+    with session_scope() as s:
+        s.add(
+            GasTopup(
+                wallet_address=wallet_address, chain=chain, amount=amount, tx=tx
+            )
+        )
+
+
+def count_gas_topups_since(wallet_address: str, since: datetime) -> int:
+    """Top-ups this wallet received since ``since`` — feeds the daily cap.
+
+    Persisted (not in-memory) ON PURPOSE: a daemon restart must not reset
+    the cap, or an attacker could trigger unlimited agent gas spend by
+    timing deposits around restarts.
+    """
+    with session_scope() as s:
+        n = s.execute(
+            select(func.count())
+            .select_from(GasTopup)
+            .where(GasTopup.wallet_address == wallet_address)
+            .where(GasTopup.created_at >= since)
+        ).scalar_one()
+        return int(n)
 
 
 # ----------------------------------------------------------------------

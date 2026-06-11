@@ -31,6 +31,7 @@ from betbot.reports import (
     DailyReport,
     format_arb_digest,
     format_daily_report,
+    format_user_daily_report,
 )
 from betbot.storage.db import init_engine
 from betbot.storage.repos import (
@@ -147,6 +148,47 @@ def test_daily_report_golden_format():
         "Alice    10.00    err   10.00\n"
         "```"
     )
+
+
+def test_user_daily_report_golden_format():
+    """The per-user 21:00 message: shared activity + ONLY the user's wallet.
+    No other users, no agent wallet, no cumulative P&L."""
+    report = DailyReport(
+        day=date(2026, 6, 11),
+        trades=(BetLine("Arsenal v Chelsea", "HOME", 10.0, 0.45),),
+        settlements=(),
+        realised_today_usd=0.0,
+        realised_cumulative_usd=-4.5,
+        arb_count_today=2,
+        balances=(
+            BalanceLine("agent", "0xabc", 120.0, 55.5),
+            BalanceLine("Alice", "0xdef", 10.0, None),
+        ),
+    )
+    assert format_user_daily_report(report, report.balances[1]) == (
+        "*Daily report — 2026-06-11*\n"
+        "\n"
+        "*Trades placed today (1)*\n"
+        "```\n"
+        "match              out   stake  price\n"
+        "Arsenal v Chelsea  HOME  10.00   0.45\n"
+        "```\n"
+        "*Settled today:* none\n"
+        "*Realised P&L today:* +0.00 USD\n"
+        "*Arb opportunities today:* 2\n"
+        "*Your balances (USDC)*\n"
+        "```\n"
+        "owner  polygon  base  total\n"
+        "Alice    10.00   err  10.00\n"
+        "```"
+    )
+
+
+def test_user_daily_report_without_balance_line():
+    report = DailyReport(date(2026, 6, 11), (), (), 0.0, 0.0, 0, ())
+    text = format_user_daily_report(report, None)
+    assert "*Your balances:* unavailable" in text
+    assert "cumulative" not in text
 
 
 def test_daily_report_empty_day_format():
@@ -303,6 +345,66 @@ async def test_run_daily_report_with_activity(db, tmp_path):
     assert "today +12.22 USD" in text
     assert "cumulative +12.22 USD" in text
     assert "agent   100.00  25.00  125.00" in text
+
+
+async def test_daily_report_full_version_goes_to_operator_only(db, tmp_path):
+    """Privacy boundary of the public bot: each registered user receives ONLY
+    their own balances; the multi-user table, agent wallet and cumulative
+    P&L go exclusively to the operator chat id."""
+    s = _tg_settings(tmp_path)  # operator chat id = 111
+    alice = get_or_create_user(222, "Alice", secrets_dir=str(tmp_path / "sec"))
+    bob = get_or_create_user(333, "Bob", secrets_dir=str(tmp_path / "sec"))
+    balances = [
+        BalanceLine("agent", "0xagent", 100.0, 25.0),
+        BalanceLine("Alice", alice.wallet_address, 50.0, 0.0),
+        BalanceLine("Bob", bob.wallet_address, 7.5, 0.0),
+    ]
+    sent: dict[int, str] = {}
+
+    async def fake_send(settings, chat_id, text):
+        sent[chat_id] = text
+        return True
+
+    delivered = await run_daily_report(
+        s, balances_fn=lambda: balances, send_fn=fake_send
+    )
+    assert delivered == 3
+    assert set(sent) == {111, 222, 333}
+
+    operator = sent[111]  # full report: everyone + agent + cumulative P&L
+    for fragment in ("agent", "Alice", "Bob", "cumulative"):
+        assert fragment in operator
+
+    alice_text = sent[222]
+    assert "Alice" in alice_text and "50.00" in alice_text
+    for leaked in ("Bob", "agent", "cumulative", "100.00", "7.50"):
+        assert leaked not in alice_text
+
+    bob_text = sent[333]
+    assert "Bob" in bob_text and "7.50" in bob_text
+    for leaked in ("Alice", "agent", "cumulative", "100.00", "50.00"):
+        assert leaked not in bob_text
+
+
+async def test_daily_report_operator_user_row_not_double_sent(db, tmp_path):
+    """The operator is usually also a registered user — they must get the
+    full report exactly once, never a second scoped copy."""
+    s = _tg_settings(tmp_path)
+    get_or_create_user(111, "Operator", secrets_dir=str(tmp_path / "sec"))
+    sent: list[tuple[int, str]] = []
+
+    async def fake_send(settings, chat_id, text):
+        sent.append((chat_id, text))
+        return True
+
+    delivered = await run_daily_report(
+        s,
+        balances_fn=lambda: [BalanceLine("agent", "0xabc", 10.0, 0.0)],
+        send_fn=fake_send,
+    )
+    assert delivered == 1
+    assert [chat_id for chat_id, _ in sent] == [111]
+    assert "cumulative" in sent[0][1]  # the FULL report
 
 
 def test_collect_daily_report_empty_day(db, tmp_path):

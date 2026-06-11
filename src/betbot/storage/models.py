@@ -168,10 +168,13 @@ class Deposit(Base):
 
     A detected deposit is split into one row per DESTINATION chain (the
     Polygon/Base allocation), each advancing through an explicit per-step
-    status (``detected → gas_topped_up → burned → minted → done``; local legs
-    where source == dest start at ``minted``). This table is the pipeline's
-    idempotency record: a leg is never burned or approved twice, and a
-    half-finished pipeline resumes from the last completed step.
+    status (``detected → gas_topped_up → burn_submitted → burned → minted →
+    done``; local legs where source == dest start at ``minted``). This table
+    is the pipeline's idempotency record: ``burn_submitted`` persists the
+    signed burn's tx hash BEFORE it is broadcast, so a crash or receipt
+    timeout in the broadcast window can never lose the hash — recovery
+    verifies that tx on-chain instead of re-burning, and a half-finished
+    pipeline resumes from the last completed step.
 
     No unique constraint on the balance snapshot ON PURPOSE: two deposits of
     the same amount on the same chain are legitimate over time. Double
@@ -199,6 +202,28 @@ class Deposit(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class GasTopup(Base):
+    """One agent-funded native-gas top-up sent to a user wallet.
+
+    The deposit pipeline's abuse guard: registration is open to the public,
+    so agent-wallet gas spend triggered by third-party deposits must be
+    bounded. ``bridge._ensure_gas`` counts rows here to enforce the
+    per-wallet per-UTC-day cap (``BETBOT_GAS_TOPUP_DAILY_CAP``) — persisted
+    rather than in-memory so a daemon restart never resets the budget.
+    """
+
+    __tablename__ = "gas_topups"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    wallet_address: Mapped[str] = mapped_column(String(64), index=True)
+    chain: Mapped[str] = mapped_column(String(16))
+    amount: Mapped[float] = mapped_column(Float)  # native units (POL / ETH)
+    tx: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, index=True
     )
 
 

@@ -30,11 +30,21 @@ live orders are un-parked — Base. This module closes that gap end to end:
 
 Safety properties:
 
-- **Gated**: ``BETBOT_AUTO_BRIDGE=false`` disables every on-chain action.
+- **Gated**: ``BETBOT_AUTO_BRIDGE=false`` disables every on-chain action,
+  including the resumption of already-active legs.
 - **Idempotent**: every leg is a row in the ``deposits`` table with an
-  explicit per-step status; a leg is never burned or approved twice, and a
-  half-finished pipeline resumes from its last completed step on the next
-  scan tick. See ``storage.models.Deposit`` for the dedupe model.
+  explicit per-step status; a half-finished pipeline resumes from its last
+  completed step on the next scan tick. The burn specifically persists its
+  signed tx hash (status ``burn_submitted``) BEFORE broadcasting, so a
+  receipt timeout or daemon crash after broadcast can never lose the hash
+  and re-burn — recovery checks the persisted tx's receipt (and the
+  wallet's USDC balance) before deciding anything. See
+  ``storage.models.Deposit`` for the dedupe model.
+- **Bounded**: agent-paid gas top-ups are capped per wallet per UTC day
+  (``BETBOT_GAS_TOPUP_DAILY_CAP``) — the bot is public, so a stranger's
+  deposits must not be able to drain the agent wallet through gas spend.
+  Registration alone never triggers any on-chain action; only a detected
+  deposit >= ``BETBOT_MIN_DEPOSIT_USDC`` does.
 - **Explicit**: every on-chain step logs what it did (tx hashes included).
 
 Operator note: the AGENT wallet pays for gas top-ups and mint relays — keep
@@ -45,17 +55,21 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from betbot.logging import get_logger
 from betbot.storage.repos import (
     DEPOSIT_DONE,
+    count_gas_topups_since,
     create_deposit,
     delivered_to_chain_usdc,
+    has_active_dest_deposit,
     has_active_source_deposit,
     list_active_deposits,
     list_users,
+    record_gas_topup,
     update_deposit,
 )
 
@@ -123,8 +137,12 @@ CCTP_CHAINS: dict[str, dict] = {
 
 # Per-leg pipeline statuses (persisted in deposits.status). Local legs
 # (source == dest) are created at MINTED — the funds never left the chain.
+# BURN_SUBMITTED is the crash-safety checkpoint: the signed burn's tx hash is
+# persisted BEFORE broadcasting, so the hash survives a receipt timeout or a
+# daemon death mid-broadcast and recovery never re-burns blindly.
 DETECTED = "detected"
 GAS_TOPPED_UP = "gas_topped_up"
+BURN_SUBMITTED = "burn_submitted"
 BURNED = "burned"
 MINTED = "minted"
 DONE = DEPOSIT_DONE  # "done"
@@ -170,6 +188,12 @@ _MESSAGE_TRANSMITTER_V2_ABI = [
      "inputs": [{"name": "message", "type": "bytes"},
                 {"name": "attestation", "type": "bytes"}],
      "outputs": [{"name": "", "type": "bool"}]},
+    # Replay protection registry: 1 = this message's nonce was consumed (the
+    # mint executed). Used to VERIFY "already relayed" instead of guessing
+    # from error text — see _step_mint.
+    {"name": "usedNonces", "type": "function", "stateMutability": "view",
+     "inputs": [{"name": "nonce", "type": "bytes32"}],
+     "outputs": [{"name": "", "type": "uint256"}]},
 ]
 
 
@@ -183,6 +207,31 @@ class Attestation:
 
     message: str
     attestation: str
+
+
+@dataclass(frozen=True)
+class SignedTx:
+    """A locally signed, not-yet-broadcast transaction.
+
+    The hash is known BEFORE broadcast (it's the keccak of the signed
+    payload), which is what lets the burn step persist its tx hash first and
+    broadcast second — the crash-safety ordering the pipeline relies on.
+    """
+
+    tx_hash: str
+    raw: bytes
+
+
+def _extract_cctp_nonce(message_hex: str) -> bytes:
+    """The bytes32 message nonce from a CCTP V2 message.
+
+    V2 header layout: version (4 bytes) | sourceDomain (4) | destDomain (4) |
+    nonce (32). The nonce is what MessageTransmitterV2.usedNonces keys on.
+    """
+    raw = bytes.fromhex(message_hex.removeprefix("0x"))
+    if len(raw) < 44:
+        raise BridgeError("CCTP message too short to contain a nonce")
+    return raw[12:44]
 
 
 def _rpc_for(chain: str, settings) -> str:
@@ -219,19 +268,30 @@ class DepositPipeline:
     # Orchestration
     # ------------------------------------------------------------------
     def run_once(self) -> int:
-        """One scan tick: resume unfinished legs, then detect new deposits.
+        """One scan tick: resume unfinished legs, THEN detect new deposits.
+
+        Order matters: a mint that landed on-chain but whose status update
+        didn't persist (crash, DB error) must be resumed — and counted into
+        the delivered baseline — BEFORE detection reads destination-chain
+        balances, or the freshly minted funds would be recorded as a phantom
+        brand-new local deposit and permanently inflate the baseline.
 
         Returns the number of NEW deposit legs recorded this tick.
         """
         if not self.settings.auto_bridge:
             log.info("deposit_scan_disabled", note="BETBOT_AUTO_BRIDGE=false")
             return 0
-        created = self.detect_new_deposits()
-        # Single pass over EVERY unfinished leg — both the ones just created
-        # and the ones resuming from an earlier tick (e.g. awaiting Circle's
-        # attestation, or whose last step failed).
+        resumed: set[int] = set()
         for leg in list_active_deposits():
+            resumed.add(leg.id)
             self.process_deposit(leg)
+        created = self.detect_new_deposits()
+        if created:
+            # Advance only the legs detection just created — resumed legs
+            # already had their turn this tick.
+            for leg in list_active_deposits():
+                if leg.id not in resumed:
+                    self.process_deposit(leg)
         return created
 
     def detect_new_deposits(self) -> int:
@@ -245,6 +305,15 @@ class DepositPipeline:
     def _detect_one(self, user, chain: str) -> int:
         # Guard 1: never re-detect while a leg from this chain is in flight.
         if has_active_source_deposit(user.wallet_address, chain):
+            return 0
+        # Guard 1b: never detect on a chain that an unfinished leg is bridging
+        # TOWARD. A bridged mint can land on-chain before its status persists
+        # (crash, DB error, RPC failure during resume); until that leg reaches
+        # a recorded delivery, any new balance here could be its funds — and
+        # recording them as a fresh local deposit would double-count the
+        # amount into the delivered baseline. Real deposits are just picked
+        # up a tick later, once the in-flight leg settles.
+        if has_active_dest_deposit(user.wallet_address, chain):
             return 0
         balance = self._usdc_balance(chain, user.wallet_address)
         if balance is None:
@@ -304,6 +373,11 @@ class DepositPipeline:
         try:
             if leg.status == DETECTED:
                 self._step_source_gas(leg)
+            if leg.status == BURN_SUBMITTED:
+                # A previous tick crashed/timed out between persisting the
+                # burn hash and confirming the receipt — resolve before
+                # anything else may run.
+                self._resume_submitted_burn(leg)
             if leg.status == GAS_TOPPED_UP:
                 self._step_burn(leg)
             if leg.status == BURNED:
@@ -332,9 +406,31 @@ class DepositPipeline:
         leg.status = GAS_TOPPED_UP
 
     def _step_burn(self, leg) -> None:
-        """Approve USDC to the TokenMessenger and burn it toward dest."""
+        """Approve USDC to the TokenMessenger and burn it toward dest.
+
+        Crash-safety ordering: the burn tx is SIGNED first, its hash persisted
+        (status BURN_SUBMITTED), and only then broadcast. If the receipt wait
+        times out or the daemon dies after broadcast, the mined burn's hash is
+        already on the leg — recovery (:meth:`_resume_submitted_burn`) checks
+        that hash instead of ever re-running the burn blindly, which is what
+        prevents both the stranded-deposit and the double-burn failure modes.
+        """
         cfg = CCTP_CHAINS[leg.source_chain]
         units = int(round(leg.amount_usdc * 10**_USDC_DECIMALS))
+        # Defense in depth: never burn unless the wallet demonstrably still
+        # holds the leg's amount. A balance below the leg amount means an
+        # earlier (unrecorded) burn already consumed it — re-burning would
+        # either revert forever or, worse, consume a SECOND deposit.
+        balance = self._usdc_balance(leg.source_chain, leg.wallet_address)
+        if balance is None:
+            raise BridgeError(
+                f"burn aborted for deposit {leg.id}: balance read failed"
+            )
+        if int(round(balance * 10**_USDC_DECIMALS)) < units:
+            raise BridgeError(
+                f"burn aborted for deposit {leg.id}: source balance {balance}"
+                f" below leg amount {leg.amount_usdc} — possible unrecorded burn"
+            )
         acct = self._user_account(leg)
         if self._allowance(
             leg.source_chain, cfg["usdc"], leg.wallet_address, cfg["token_messenger"]
@@ -349,23 +445,87 @@ class DepositPipeline:
                 spender="TokenMessengerV2",
                 tx=tx,
             )
-        burn_tx = self._deposit_for_burn(
+        signed = self._sign_deposit_for_burn(
             leg.source_chain,
             acct,
             amount_units=units,
             dest_domain=CCTP_CHAINS[leg.dest_chain]["domain"],
             mint_recipient=leg.wallet_address,
         )
-        update_deposit(leg.id, status=BURNED, burn_tx=burn_tx)
-        leg.status, leg.burn_tx = BURNED, burn_tx
+        # Persist the hash BEFORE broadcasting — the one ordering that makes
+        # the burn step idempotent across any crash/timeout window.
+        update_deposit(leg.id, status=BURN_SUBMITTED, burn_tx=signed.tx_hash)
+        leg.status, leg.burn_tx = BURN_SUBMITTED, signed.tx_hash
+        log.info(
+            "deposit_burn_submitted",
+            deposit_id=leg.id,
+            source_chain=leg.source_chain,
+            tx=signed.tx_hash,
+        )
+        self._broadcast_signed(leg.source_chain, signed)
+        update_deposit(leg.id, status=BURNED)
+        leg.status = BURNED
         log.info(
             "deposit_burned",
             deposit_id=leg.id,
             source_chain=leg.source_chain,
             dest_chain=leg.dest_chain,
             amount_usdc=leg.amount_usdc,
-            tx=burn_tx,
+            tx=signed.tx_hash,
         )
+
+    def _resume_submitted_burn(self, leg) -> None:
+        """Resolve a leg stranded at BURN_SUBMITTED (crash/timeout window).
+
+        The persisted hash is the source of truth:
+
+        - receipt mined + success → the burn happened; advance to BURNED so
+          the attestation for THIS hash gets fetched (funds never stranded).
+        - receipt mined + reverted → funds untouched; retry the burn step.
+        - no receipt → disambiguate via the wallet's USDC balance: funds
+          still present means the broadcast never landed (safe to re-sign —
+          the account nonce is unchanged, so a re-send replaces rather than
+          duplicates); funds gone means the burn almost certainly mined and
+          the RPC is lagging — keep waiting, NEVER re-burn.
+        """
+        status = self._tx_status(leg.source_chain, leg.burn_tx)
+        if status is True:
+            update_deposit(leg.id, status=BURNED)
+            leg.status = BURNED
+            log.info(
+                "deposit_burn_confirmed", deposit_id=leg.id, tx=leg.burn_tx
+            )
+            return
+        if status is False:
+            update_deposit(leg.id, status=GAS_TOPPED_UP)
+            leg.status = GAS_TOPPED_UP
+            log.warning(
+                "deposit_burn_reverted_retrying",
+                deposit_id=leg.id,
+                tx=leg.burn_tx,
+            )
+            return
+        units = int(round(leg.amount_usdc * 10**_USDC_DECIMALS))
+        balance = self._usdc_balance(leg.source_chain, leg.wallet_address)
+        if (
+            balance is not None
+            and int(round(balance * 10**_USDC_DECIMALS)) >= units
+        ):
+            update_deposit(leg.id, status=GAS_TOPPED_UP)
+            leg.status = GAS_TOPPED_UP
+            log.warning(
+                "deposit_burn_not_found_retrying",
+                deposit_id=leg.id,
+                tx=leg.burn_tx,
+                note="funds still in wallet — broadcast never landed",
+            )
+        else:
+            log.info(
+                "deposit_burn_receipt_pending",
+                deposit_id=leg.id,
+                tx=leg.burn_tx,
+                note="funds left the wallet — waiting for the receipt, not re-burning",
+            )
 
     def _step_mint(self, leg) -> bool:
         """Relay the attested mint on the destination. False = not ready yet.
@@ -385,10 +545,15 @@ class DepositPipeline:
             return False
         try:
             mint_tx = self._receive_message(leg.dest_chain, att)
-        except Exception as e:  # noqa: BLE001 — replays revert with "nonce already used"
-            if "nonce" in str(e).lower():
-                # A previous tick's mint landed but we crashed before
-                # recording it — the funds are there; advance.
+        except Exception as e:  # noqa: BLE001 — replays revert with "Nonce already used"
+            # NEVER trust error text: "nonce too low/high" are ordinary
+            # ACCOUNT-nonce errors from the agent wallet's own submission
+            # (routine on load-balanced public RPCs) and have nothing to do
+            # with the CCTP message nonce. Instead VERIFY on-chain: extract
+            # the message nonce and ask the MessageTransmitter's replay
+            # registry whether it was consumed. Only a confirmed
+            # already-relayed mint may advance the leg.
+            if self._message_nonce_consumed(leg.dest_chain, att):
                 log.warning(
                     "deposit_mint_already_relayed", deposit_id=leg.id, error=str(e)
                 )
@@ -436,7 +601,13 @@ class DepositPipeline:
         )
 
     def _ensure_gas(self, chain: str, address: str) -> None:
-        """Top the wallet up with native gas from the agent wallet if low."""
+        """Top the wallet up with native gas from the agent wallet if low.
+
+        Capped per wallet per UTC day (``BETBOT_GAS_TOPUP_DAILY_CAP``): the
+        bot is public, so agent-wallet gas spend driven by third-party
+        deposits must be bounded. Hitting the cap raises — the leg stays put
+        and resumes once the day rolls over (no funds at risk, only delayed).
+        """
         amount = (
             self.settings.gas_topup_pol
             if chain == "polygon"
@@ -447,7 +618,18 @@ class DepositPipeline:
         if have_wei >= needed_wei:
             log.debug("gas_topup_skipped", chain=chain, wallet=address)
             return
+        cap = self.settings.gas_topup_daily_cap
+        if cap > 0:
+            day_start = datetime.now(timezone.utc).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            if count_gas_topups_since(address, day_start) >= cap:
+                raise BridgeError(
+                    f"gas top-up daily cap ({cap}) reached for {address};"
+                    " leg resumes after the UTC day rolls over"
+                )
         tx = self._send_native(chain, address, needed_wei)
+        record_gas_topup(wallet_address=address, chain=chain, amount=amount, tx=tx)
         log.info(
             "gas_topup_sent",
             chain=chain,
@@ -498,16 +680,70 @@ class DepositPipeline:
 
         return Account.from_key(key)
 
-    def _sign_and_send(self, chain: str, acct, tx: dict) -> str:
+    def _sign_tx(self, chain: str, acct, tx: dict) -> SignedTx:
         w3 = self._w3(chain)
         tx.setdefault("nonce", w3.eth.get_transaction_count(acct.address))
         tx.setdefault("chainId", CCTP_CHAINS[chain]["chain_id"])
         signed = acct.sign_transaction(tx)
-        h = w3.eth.send_raw_transaction(signed.raw_transaction)
-        receipt = w3.eth.wait_for_transaction_receipt(h)
+        # Normalise to the canonical 0x form: the hash is persisted (burn_tx)
+        # and fed to Circle's attestation API + receipt lookups.
+        tx_hash = signed.hash.hex()
+        if not tx_hash.startswith("0x"):
+            tx_hash = "0x" + tx_hash
+        return SignedTx(tx_hash=tx_hash, raw=bytes(signed.raw_transaction))
+
+    def _broadcast_signed(self, chain: str, signed: SignedTx) -> None:
+        """Broadcast a signed tx and wait for a successful receipt."""
+        w3 = self._w3(chain)
+        w3.eth.send_raw_transaction(signed.raw)
+        receipt = w3.eth.wait_for_transaction_receipt(signed.tx_hash)
         if receipt.get("status") != 1:
-            raise BridgeError(f"transaction reverted on {chain}: {h.hex()}")
-        return h.hex()
+            raise BridgeError(
+                f"transaction reverted on {chain}: {signed.tx_hash}"
+            )
+
+    def _sign_and_send(self, chain: str, acct, tx: dict) -> str:
+        signed = self._sign_tx(chain, acct, tx)
+        self._broadcast_signed(chain, signed)
+        return signed.tx_hash
+
+    def _tx_status(self, chain: str, tx_hash: str) -> bool | None:
+        """Receipt verdict for a tx: True mined+ok, False reverted, None unknown.
+
+        ``None`` (not found / RPC failure) deliberately tells the caller
+        nothing — burn recovery treats it as "cannot prove anything" and
+        falls back to the balance check rather than guessing.
+        """
+        try:
+            receipt = self._w3(chain).eth.get_transaction_receipt(tx_hash)
+        except Exception as e:  # noqa: BLE001 — includes TransactionNotFound
+            log.debug("tx_receipt_unavailable", tx=tx_hash, error=str(e))
+            return None
+        if receipt is None:
+            return None
+        return receipt.get("status") == 1
+
+    def _message_nonce_consumed(self, dest_chain: str, att: Attestation) -> bool:
+        """True iff the MessageTransmitter consumed this message's nonce.
+
+        On-chain ground truth for "the mint already executed". Any failure
+        (bad RPC, malformed message) returns False so the original mint
+        error propagates and the leg is retried — never silently advanced.
+        """
+        from web3 import Web3
+
+        try:
+            nonce = _extract_cctp_nonce(att.message)
+            c = self._w3(dest_chain).eth.contract(
+                address=Web3.to_checksum_address(
+                    CCTP_CHAINS[dest_chain]["message_transmitter"]
+                ),
+                abi=_MESSAGE_TRANSMITTER_V2_ABI,
+            )
+            return int(c.functions.usedNonces(nonce).call()) == 1
+        except Exception as e:  # noqa: BLE001 — verification must fail closed
+            log.warning("nonce_verification_failed", error=str(e))
+            return False
 
     def _usdc_balance(self, chain: str, address: str) -> float | None:
         from web3 import Web3
@@ -569,7 +805,7 @@ class DepositPipeline:
         ).build_transaction({"from": acct.address})
         return self._sign_and_send(chain, acct, tx)
 
-    def _deposit_for_burn(
+    def _sign_deposit_for_burn(
         self,
         chain: str,
         acct,
@@ -577,7 +813,9 @@ class DepositPipeline:
         amount_units: int,
         dest_domain: int,
         mint_recipient: str,
-    ) -> str:
+    ) -> SignedTx:
+        """Build + sign (NOT send) the depositForBurn — the caller persists
+        the hash first, then broadcasts. See _step_burn for why."""
         from web3 import Web3
 
         cfg = CCTP_CHAINS[chain]
@@ -594,7 +832,7 @@ class DepositPipeline:
             _MAX_FEE_STANDARD,
             _MIN_FINALITY_STANDARD,
         ).build_transaction({"from": acct.address})
-        return self._sign_and_send(chain, acct, tx)
+        return self._sign_tx(chain, acct, tx)
 
     def _fetch_attestation(self, source_chain: str, burn_tx: str) -> Attestation | None:
         """Poll Circle's attestation API once. None = not attested yet."""
