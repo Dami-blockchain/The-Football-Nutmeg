@@ -62,6 +62,9 @@ class DailyReport:
     realised_cumulative_usd: float
     arb_count_today: int
     balances: tuple[BalanceLine, ...]
+    # Optional one-liner on the live Glicko-vs-ensemble model race (Hedge).
+    # Operator-only; None when model selection is off or has no data yet.
+    model_race: str | None = None
 
 
 # ----------------------------------------------------------------------
@@ -118,6 +121,8 @@ def format_daily_report(report: DailyReport) -> str:
         f" | cumulative {report.realised_cumulative_usd:+.2f} USD"
     )
     parts.append(f"*Arb opportunities today:* {report.arb_count_today}")
+    if report.model_race:
+        parts.append(f"*Model race:* {report.model_race}")
 
     if report.balances:
         parts.append("*Balances (USDC)*")
@@ -145,6 +150,8 @@ def format_user_daily_report(
         f"*Realised P&L today:* {report.realised_today_usd:+.2f} USD"
     )
     parts.append(f"*Arb opportunities today:* {report.arb_count_today}")
+    if report.model_race:
+        parts.append(f"*Model race:* {report.model_race}")
     if balance is not None:
         parts.append("*Your balances (USDC)*")
         parts.append(_mono(_balances_table([balance])))

@@ -208,7 +208,29 @@ def collect_daily_report(
         realised_cumulative_usd=cumulative_realized_pnl_usd(),
         arb_count_today=count_arb_opportunities_between(start, end),
         balances=tuple(balances),
+        model_race=_model_race_line(settings),
     )
+
+
+def _model_race_line(settings) -> str | None:
+    """One operator-facing line on the live Glicko-vs-ensemble Hedge race.
+    Never raises — the report must not die on telemetry."""
+    if not getattr(settings, "model_select_enabled", False):
+        return None
+    try:
+        from betbot.storage.repos import model_select_summary
+
+        s = model_select_summary(eta=settings.model_select_eta)
+        if not s["scored_matches"]:
+            return "no scored matches yet (weights 50/50)"
+        return (
+            f"{s['leader']} leads after {s['scored_matches']} matches "
+            f"(avg RPS glicko {s['avg_rps_glicko']} vs ensemble "
+            f"{s['avg_rps_ensemble']}; weights {s['weight_glicko']}/"
+            f"{s['weight_ensemble']})"
+        )
+    except Exception:  # noqa: BLE001
+        return None
 
 
 async def run_daily_report(
