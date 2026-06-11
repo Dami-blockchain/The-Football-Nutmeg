@@ -141,6 +141,28 @@ class GlickoRating(Base):
     )
 
 
+class ArbScanResult(Base):
+    """One row per arb opportunity surfaced by any scan (the periodic watcher
+    or the 09:00 digest).
+
+    Scans were previously fire-and-forget Telegram messages; persisting each
+    hit is what lets the 21:00 daily report answer "how many arb opportunities
+    did we see today?" without re-scanning.
+    """
+
+    __tablename__ = "arb_scan_results"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    scanned_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, index=True
+    )
+    home_team: Mapped[str] = mapped_column(String(80))
+    away_team: Mapped[str] = mapped_column(String(80))
+    venues: Mapped[str] = mapped_column(String(120))  # e.g. "LIMITLESS+POLYMARKET"
+    margin: Mapped[float] = mapped_column(Float)
+    price_sum: Mapped[float] = mapped_column(Float)
+
+
 class User(Base):
     """A tenant of the multi-user bot. Each user has their OWN isolated wallet
     and funds — nothing is pooled. The bot trades each user's wallet

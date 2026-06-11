@@ -168,6 +168,19 @@ class Settings(BaseSettings):
     )
     arb_scan_limit: int = Field(default=80, alias="BETBOT_ARB_SCAN_LIMIT")
 
+    # ---- Daily Telegram jobs (Nairobi wall-clock schedule) ------------
+    # The cron triggers pin timezone="Africa/Nairobi" (NOT a UTC offset), so
+    # "09:00" and "exactly 9pm" stay true to the operator's wall clock even
+    # if the zone's rules ever change.
+    arb_digest_enabled: bool = Field(
+        default=True, alias="BETBOT_ARB_DIGEST_ENABLED"
+    )
+    arb_digest_hour: int = Field(default=9, alias="BETBOT_ARB_DIGEST_HOUR")
+    daily_report_enabled: bool = Field(
+        default=True, alias="BETBOT_DAILY_REPORT_ENABLED"
+    )
+    daily_report_hour: int = Field(default=21, alias="BETBOT_DAILY_REPORT_HOUR")
+
     # ---- Glicko-2 (international / World Cup, Phase 5.5) --------------
     glicko_tau: float = Field(default=0.5, alias="BETBOT_GLICKO_TAU")
     glicko_default_rating: float = Field(default=1500.0, alias="BETBOT_GLICKO_DEFAULT_RATING")

@@ -30,6 +30,12 @@ from betbot.exchanges.polymarket import PolymarketAdapter
 from betbot.exchanges.polymarket_gamma import GammaClient
 from betbot.exchanges.router import ExchangeRouter
 from betbot.backtest import backtest_mock, backtest_stored
+from betbot.daily_jobs import (
+    persist_arb_opportunities,
+    register_daily_jobs,
+    run_arb_digest,
+    run_daily_report,
+)
 from betbot.gate import evaluate_gate
 from betbot.logging import configure_logging, get_logger
 from betbot.settlement import SettlementWatcher
@@ -697,6 +703,8 @@ async def _arb_scan_and_notify(settings) -> int:
     found = await _run_arb_scan(
         settings, settings.arb_scan_limit, settings.arb_notify_min_margin
     )
+    # Persist every hit so the 21:00 daily report can count today's total.
+    persist_arb_opportunities(found)
     sent = 0
     for o in found:
         legs = "\n".join(f"  {ov}: {lg.exchange.value} @ {lg.price:.3f}"
@@ -727,6 +735,7 @@ def arb_watch() -> None:
     automatically every BETBOT_ARB_SCAN_INTERVAL_MIN minutes)."""
     settings = get_settings()
     configure_logging(settings.log_level)
+    init_engine(settings.db_path)  # scan results are persisted for the daily report
     n = asyncio.run(_arb_scan_and_notify(settings))
     typer.echo(f"Notified {n} opportunity(ies).")
 
@@ -758,8 +767,27 @@ def run_daemon(
         except Exception as e:  # noqa: BLE001 — never let the watcher crash the daemon
             get_logger(__name__).warning("arb_tick_failed", error=str(e))
 
+    async def _arb_digest_tick() -> None:
+        # 09:00 Africa/Nairobi: one scan + digest to operator AND all users.
+        try:
+            s = get_settings()
+            await run_arb_digest(
+                s,
+                lambda: _run_arb_scan(s, s.arb_scan_limit, s.arb_notify_min_margin),
+            )
+        except Exception as e:  # noqa: BLE001 — never crash the daemon
+            get_logger(__name__).warning("arb_digest_failed", error=str(e))
+
+    async def _daily_report_tick() -> None:
+        # 21:00 Africa/Nairobi: trades/settlements/P&L/arb-count/balances.
+        try:
+            await run_daily_report(get_settings())
+        except Exception as e:  # noqa: BLE001 — never crash the daemon
+            get_logger(__name__).warning("daily_report_failed", error=str(e))
+
     async def _main() -> None:
         s = get_settings()
+        init_engine(s.db_path)  # cron jobs may fire before the first scoring tick
         scheduler = AsyncIOScheduler(timezone=timezone.utc)
         scheduler.add_job(_tick, trigger=trigger, id="score_and_settle")
         scheduler.add_job(
@@ -767,8 +795,21 @@ def run_daemon(
             trigger=IntervalTrigger(minutes=s.arb_scan_interval_min),
             id="arb_watch",
         )
+        register_daily_jobs(
+            scheduler, s,
+            arb_digest=_arb_digest_tick,
+            daily_report=_daily_report_tick,
+        )
         scheduler.start()
-        log.info("daemon_started", cron=cron_expr, arb_scan_min=s.arb_scan_interval_min)
+        log.info(
+            "daemon_started",
+            cron=cron_expr,
+            arb_scan_min=s.arb_scan_interval_min,
+            arb_digest_hour_nairobi=s.arb_digest_hour if s.arb_digest_enabled else None,
+            daily_report_hour_nairobi=(
+                s.daily_report_hour if s.daily_report_enabled else None
+            ),
+        )
         await _tick()  # immediate first run
         try:
             await asyncio.Event().wait()

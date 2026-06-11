@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from betbot.logging import get_logger
 from betbot.storage.db import session_scope
 from betbot.storage.models import (
+    ArbScanResult,
     GlickoRating,
     KillSwitch,
     PaperBet,
@@ -239,6 +240,99 @@ def list_settled_market_bets(window_days: int | None = None) -> list[PaperBet]:
         rows = list(s.execute(stmt).scalars())
         s.expunge_all()
         return rows
+
+
+# ----------------------------------------------------------------------
+# Daily report queries (scheduled Telegram jobs)
+# ----------------------------------------------------------------------
+def list_bets_created_between(
+    start: datetime, end: datetime
+) -> list[tuple[PaperBet, str, str]]:
+    """``(bet, home_team, away_team)`` for bets logged in ``[start, end)``.
+
+    Team names are joined in here (rather than via the lazy relationship)
+    because rows are detached before returning — relationship access on a
+    detached row raises DetachedInstanceError.
+    """
+    with session_scope() as s:
+        rows = list(
+            s.execute(
+                select(PaperBet, PredictionRow.home_team, PredictionRow.away_team)
+                .join(PredictionRow, PaperBet.prediction_id == PredictionRow.id)
+                .where(PaperBet.created_at >= start)
+                .where(PaperBet.created_at < end)
+                .order_by(PaperBet.created_at.asc())
+            )
+        )
+        s.expunge_all()
+        return [(r[0], r[1], r[2]) for r in rows]
+
+
+def list_bets_settled_between(
+    start: datetime, end: datetime
+) -> list[tuple[PaperBet, str, str]]:
+    """``(bet, home_team, away_team)`` for bets settled in ``[start, end)``."""
+    with session_scope() as s:
+        rows = list(
+            s.execute(
+                select(PaperBet, PredictionRow.home_team, PredictionRow.away_team)
+                .join(PredictionRow, PaperBet.prediction_id == PredictionRow.id)
+                .where(PaperBet.settled_at.is_not(None))
+                .where(PaperBet.settled_at >= start)
+                .where(PaperBet.settled_at < end)
+                .order_by(PaperBet.settled_at.asc())
+            )
+        )
+        s.expunge_all()
+        return [(r[0], r[1], r[2]) for r in rows]
+
+
+def cumulative_realized_pnl_usd() -> float:
+    """All-time realised P&L over settled bets.
+
+    No-market (favourite-only) bets settle at 0 by design, so including them
+    changes nothing — this is the honest "since inception" number.
+    """
+    with session_scope() as s:
+        rows = s.execute(
+            select(PaperBet.pnl_usd).where(PaperBet.settled_at.is_not(None))
+        ).scalars()
+        return float(sum(r or 0.0 for r in rows))
+
+
+def record_arb_opportunity(
+    *,
+    home_team: str,
+    away_team: str,
+    venues: str,
+    margin: float,
+    price_sum: float,
+    scanned_at: datetime | None = None,
+) -> None:
+    """Persist one arb-scan hit so the daily report can count today's total."""
+    with session_scope() as s:
+        s.add(
+            ArbScanResult(
+                scanned_at=scanned_at or datetime.now(timezone.utc),
+                home_team=home_team[:80],
+                away_team=away_team[:80],
+                venues=venues[:120],
+                margin=margin,
+                price_sum=price_sum,
+            )
+        )
+
+
+def count_arb_opportunities_between(start: datetime, end: datetime) -> int:
+    """How many arb opportunities all scans recorded in ``[start, end)``."""
+    with session_scope() as s:
+        n = s.execute(
+            select(func.count())
+            .select_from(ArbScanResult)
+            .where(ArbScanResult.scanned_at >= start)
+            .where(ArbScanResult.scanned_at < end)
+        ).scalar_one()
+        return int(n)
 
 
 # ----------------------------------------------------------------------
