@@ -36,7 +36,7 @@ MAX_HISTORY_MESSAGES = 12
 _MAX_REPLY_CHARS = 3900
 
 SYSTEM_PROMPT = """\
-You are the assistant for "The Football Smart Manager", a Telegram bot that
+You are the assistant for "The Football Nutmeg Agent", a Telegram bot that
 paper-trades (and, when its safety gate passes, live-trades) football
 prediction markets on Polymarket (Polygon) and Limitless (Base).
 

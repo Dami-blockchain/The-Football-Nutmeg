@@ -17,7 +17,7 @@ export default function App() {
   return (
     <div className="max-w-5xl mx-auto px-4 py-6 pb-16">
       <header className="flex flex-wrap items-center justify-between gap-3 mb-4">
-        <h1 className="text-xl font-semibold">⚽ The Football Smart Manager</h1>
+        <h1 className="text-xl font-semibold">⚽ The Football Nutmeg Agent</h1>
         <div className="flex gap-2 flex-wrap">
           {s && <Pill tone="accent">mode: {s.mode}</Pill>}
           {s && (

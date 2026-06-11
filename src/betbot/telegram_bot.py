@@ -72,7 +72,7 @@ def _authed(handler):
 async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     u = _register(update)
     await update.message.reply_text(
-        "⚽ *The Football Smart Manager*\n\n"
+        "⚽ *The Football Nutmeg Agent*\n\n"
         "I trade football prediction markets on Polymarket (Polygon) and "
         "Limitless (Base) using a probability model, and I only bet when my "
         "edge over the market price clears a threshold.\n\n"

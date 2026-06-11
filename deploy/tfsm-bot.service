@@ -1,5 +1,5 @@
 [Unit]
-Description=The Football Smart Manager - Telegram bot
+Description=The Football Nutmeg Agent - Telegram bot
 After=network-online.target
 Wants=network-online.target
 

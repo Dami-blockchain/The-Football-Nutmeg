@@ -1,4 +1,4 @@
-"""FastAPI backend for The Football Smart Manager.
+"""FastAPI backend for The Football Nutmeg Agent.
 
 Async endpoints that wrap the bot's own functions (never shelling out) plus a
 wallet/deposit layer for the Telegram bot and frontend. Auth: if
@@ -111,7 +111,7 @@ def create_app() -> FastAPI:
     if not settings.api_token:
         log.warning("api_no_token", note="TFSM_API_TOKEN unset — bind to localhost only")
 
-    app = FastAPI(title="The Football Smart Manager", version="0.1.0")
+    app = FastAPI(title="The Football Nutmeg Agent", version="0.1.0")
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],

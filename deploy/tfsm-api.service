@@ -1,5 +1,5 @@
 [Unit]
-Description=The Football Smart Manager - API (FastAPI/uvicorn)
+Description=The Football Nutmeg Agent - API (FastAPI/uvicorn)
 After=network-online.target
 Wants=network-online.target
 

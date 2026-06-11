@@ -1,8 +1,8 @@
-# The Football Smart Manager
+# The Football Nutmeg Agent
 
 Multi-exchange football prediction-market bot for Polymarket + Limitless.
 
-CLI: `tfsm` (alias: `betbot`). Python package: `betbot`.
+CLI: `nutmeg` (compatibility aliases: `tfsm`, `betbot`). Python package: `betbot`.
 
 ## Status
 

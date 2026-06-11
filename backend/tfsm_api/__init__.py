@@ -1,1 +1,1 @@
-"""The Football Smart Manager — FastAPI backend (Phase 7)."""
+"""The Football Nutmeg Agent — FastAPI backend (Phase 7)."""

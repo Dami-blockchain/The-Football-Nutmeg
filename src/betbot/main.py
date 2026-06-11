@@ -1,6 +1,6 @@
-"""The Football Smart Manager — CLI entrypoint.
+"""The Football Nutmeg Agent — CLI entrypoint.
 
-Commands (run as ``tfsm <command>`` or ``betbot <command>``):
+Commands (run as ``nutmeg <command>``, ``tfsm <command>`` or ``betbot <command>``):
     tfsm run-once      Score the next 48h of fixtures and log paper bets.
     tfsm run-daemon    Schedule run-once daily at 08:00 UTC.
     tfsm bets list     Print recent paper bets to stdout.
