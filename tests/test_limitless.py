@@ -128,6 +128,32 @@ async def test_find_market_no_match():
     assert await a.find_market("Arsenal", "Chelsea", KICKOFF) is None
 
 
+async def test_find_market_one_team_only_rejected():
+    # Only ONE of our fixture's teams matches the market's pair — reject (this
+    # is the kind of half-match that produced the Mexico/SA wrong pairing).
+    a = _adapter({"frnd-lie-cyp": _group()})
+    assert await a.find_market("Liechtenstein", "Arsenal", KICKOFF) is None
+    assert await a.find_market("Arsenal", "Cyprus", KICKOFF) is None
+
+
+async def test_find_market_prop_metadata_rejected():
+    # A market that carries homeTeam/awayTeam but is actually a PROP
+    # (goalsThreshold set, prop title) must NOT be routed as the fixture's 1X2.
+    group = _group()
+    group["metadata"]["goalsThreshold"] = 2.5
+    group["title"] = "Liechtenstein vs Cyprus — 3+ total goals"
+    a = _adapter({"frnd-lie-cyp": group})
+    assert await a.find_market("Liechtenstein", "Cyprus", KICKOFF) is None
+
+
+async def test_find_market_attaches_identity_metadata():
+    a = _adapter({"frnd-lie-cyp": _group()})
+    ref = await a.find_market("Liechtenstein", "Cyprus", KICKOFF)
+    assert ref.metadata["home_team"] == "Liechtenstein"
+    assert ref.metadata["away_team"] == "Cyprus"
+    assert ref.metadata["market_type"] == "match_result"
+
+
 # ---- DRAW is effectively Polymarket-only -----------------------------
 async def test_draw_absent_orderbook_none():
     a = _adapter({"frnd-lie-cyp": _group(with_draw=False)},

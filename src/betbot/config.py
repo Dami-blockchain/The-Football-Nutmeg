@@ -58,6 +58,19 @@ class Settings(BaseSettings):
     )
     edge_threshold: float = Field(default=0.05, alias="BETBOT_EDGE_THRESHOLD")
 
+    # ---- Market-match sanity guard (matcher hardening) ----------------
+    # A 1X2 outcome quoted outside this band is implausible (a 0.014 "edge"
+    # almost always means the fixture was paired to the WRONG market — a
+    # longshot prop or a different fixture). Reject such matches at the router
+    # so neither the favourite-edge path nor the market route logs a phantom
+    # edge. Bounds are inclusive.
+    min_plausible_price: float = Field(
+        default=0.02, alias="BETBOT_MIN_PLAUSIBLE_PRICE"
+    )
+    max_plausible_price: float = Field(
+        default=0.98, alias="BETBOT_MAX_PLAUSIBLE_PRICE"
+    )
+
     # ---- Settlement + drawdown kill switch (Phase 4) ------------------
     settle_grace_minutes: int = Field(
         default=150, alias="BETBOT_SETTLE_GRACE_MINUTES"

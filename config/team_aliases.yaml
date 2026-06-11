@@ -37,3 +37,21 @@ aliases:
   "Juventus FC": ["Juventus", "Juve"]
   "Olympique de Marseille": ["Marseille", "OM"]
   "Olympique Lyonnais": ["Lyon", "OL"]
+
+  # ---- National teams (World Cup 2026) -----------------------------------
+  # Markets and football-data.org disagree on national-team naming far more
+  # than on clubs (Korea Republic vs South Korea, Türkiye vs Turkey, …). These
+  # are NOT cosmetic — without them the matcher pairs the right fixture to the
+  # WRONG market or no market at all. Keep entries to genuine name variants of
+  # the SAME nation (never two different nations).
+  "Korea Republic": ["South Korea", "Korea", "KOR", "Republic of Korea"]
+  "Korea DPR": ["North Korea", "DPR Korea", "PRK"]
+  "Türkiye": ["Turkey", "Turkiye"]
+  "United States": ["USA", "US", "United States of America", "USMNT"]
+  "Czechia": ["Czech Republic", "Czechoslovakia", "CZE"]
+  "IR Iran": ["Iran", "Islamic Republic of Iran"]
+  "Côte d'Ivoire": ["Ivory Coast", "Cote d'Ivoire"]
+  "China PR": ["China"]
+  "Cabo Verde": ["Cape Verde"]
+  "South Africa": ["RSA", "Bafana Bafana"]
+  "Mexico": ["MEX", "El Tri"]

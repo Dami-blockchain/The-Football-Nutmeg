@@ -40,9 +40,51 @@ class RoutedQuote:
     quote: OrderbookQuote
 
 
+# Default plausible 1X2 price band (mirrors config BETBOT_MIN/MAX_PLAUSIBLE_PRICE).
+# A quote outside this band for a 1X2 outcome almost always means the fixture was
+# paired to the WRONG market (a longshot prop or a different fixture) — the bug
+# behind the Mexico/SA 0.014 phantom 38-point edge. Bounds are inclusive.
+DEFAULT_MIN_PLAUSIBLE_PRICE: float = 0.02
+DEFAULT_MAX_PLAUSIBLE_PRICE: float = 0.98
+
+
 class ExchangeRouter:
-    def __init__(self, adapters: Iterable[ExchangeAdapter]) -> None:
+    def __init__(
+        self,
+        adapters: Iterable[ExchangeAdapter],
+        *,
+        min_plausible_price: float = DEFAULT_MIN_PLAUSIBLE_PRICE,
+        max_plausible_price: float = DEFAULT_MAX_PLAUSIBLE_PRICE,
+    ) -> None:
         self._adapters = list(adapters)
+        self._min_plausible_price = min_plausible_price
+        self._max_plausible_price = max_plausible_price
+
+    def _price_is_plausible(
+        self, quote: OrderbookQuote, *, home_team: str, away_team: str
+    ) -> bool:
+        """Reject a 1X2 quote priced outside the plausible band.
+
+        This is the single chokepoint that covers BOTH the favourite-edge path
+        and the market route — every routed quote passes through here. A 1X2
+        outcome priced at e.g. 0.014 or 0.995 is implausible and is the signature
+        of a bad fixture→market pairing; we drop it (and log) rather than let it
+        produce a phantom edge or a false arb leg.
+        """
+        price = quote.yes_price
+        if self._min_plausible_price <= price <= self._max_plausible_price:
+            return True
+        log.warning(
+            "router_implausible_price_rejected",
+            exchange=str(getattr(quote.exchange, "value", quote.exchange)),
+            outcome=str(getattr(quote.outcome, "value", quote.outcome)),
+            yes_price=round(price, 4),
+            market_id=quote.market_id,
+            fixture=f"{home_team} vs {away_team}",
+            band=f"[{self._min_plausible_price:.3f}, {self._max_plausible_price:.3f}]",
+            note="quote outside plausible 1X2 band — likely a wrong market match",
+        )
+        return False
 
     @property
     def adapters(self) -> list[ExchangeAdapter]:
@@ -71,8 +113,13 @@ class ExchangeRouter:
             except Exception as e:  # noqa: BLE001
                 log.warning("router_orderbook_failed", exchange=str(name), error=str(e))
                 continue
-            if quote is not None:
-                routes.append(RoutedQuote(adapter=adapter, market=market, quote=quote))
+            if quote is None:
+                continue
+            if not self._price_is_plausible(
+                quote, home_team=home_team, away_team=away_team
+            ):
+                continue
+            routes.append(RoutedQuote(adapter=adapter, market=market, quote=quote))
 
         if not routes:
             return None

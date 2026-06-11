@@ -29,7 +29,11 @@ from betbot.exchanges.base import (
     OrderResult,
     Outcome,
 )
-from betbot.exchanges.matcher import TeamAliasResolver, classify_binary_outcome
+from betbot.exchanges.matcher import (
+    TeamAliasResolver,
+    classify_binary_outcome,
+    is_match_result_market,
+)
 from betbot.exchanges.polymarket_gamma import GammaClient
 from betbot.logging import get_logger
 
@@ -171,14 +175,36 @@ class PolymarketAdapter:
             mapping = self._classify_event(e, home_team, away_team)
             if mapping is None:
                 continue
+            # Market-identity guard: reject prop events (exact scoreline, spread,
+            # totals, BTTS, cards, "to win by N", first goal, …) so a longshot
+            # prop can't be routed as a fixture's HOME/AWAY/DRAW. Layout A carries
+            # its own market question; check both the event title and that.
+            title = e.get("title") or ""
+            markets = e.get("markets") or []
+            prop_titles = [title] + [
+                str((m.get("question") or m.get("groupItemTitle") or "")) for m in markets
+            ]
+            # The classifier sees no structured threshold metadata from Gamma,
+            # so it leans on the title patterns; pass each candidate string.
+            if not all(is_match_result_market(None, t) for t in prop_titles):
+                log.info(
+                    "polymarket_market_not_match_result",
+                    slug=e.get("slug") or e.get("id"), title=title,
+                )
+                continue
             market_id = e.get("slug") or e.get("id") or ""
             return MarketRef(
                 exchange=ExchangeName.POLYMARKET,
                 market_id=str(market_id),
-                title=e.get("title") or "",
+                title=title,
                 metadata={
                     "outcome_tokens": {o.value: t for o, t in mapping.items()},
-                    "layout": "A" if len(e.get("markets") or []) == 1 else "B",
+                    "layout": "A" if len(markets) == 1 else "B",
+                    # Identity fields for the cross-venue arb compat check.
+                    "home_team": home_team,
+                    "away_team": away_team,
+                    "fixture_id": e.get("fixtureId") or e.get("fixture_id"),
+                    "market_type": "match_result",
                 },
             )
         return None

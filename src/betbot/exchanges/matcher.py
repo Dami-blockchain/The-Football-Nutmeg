@@ -14,6 +14,7 @@ Everything here is pure (no network, no DB) so it is cheaply unit-testable.
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from collections.abc import Iterable, Mapping
 from pathlib import Path
@@ -142,6 +143,116 @@ class TeamAliasResolver:
     ) -> bool:
         """True if two names refer to the same team."""
         return self.match(a, [b], threshold=threshold) is not None
+
+
+# ----------------------------------------------------------------------
+# Market-identity verification (matcher hardening)
+# ----------------------------------------------------------------------
+# Prop / non-1X2 markets we must NEVER route as a fixture's HOME/AWAY/DRAW.
+# These are exact-scoreline, spread/handicap, totals, BTTS, cards, corners,
+# "to win by N", "first goal", substitutions, etc. A market whose title trips
+# any of these — OR whose structured metadata carries a non-zero prop threshold
+# — is excluded from 1X2 routing. (The Mexico/SA 0.014 "edge" was a longshot
+# prop the matcher paired to a 1X2 fixture.)
+_PROP_TITLE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\bwin by\b",
+        r"\bby\s+\d+\+?\s*(?:goal|point)",
+        r"\b\d+\s*\+?\s*(?:total\s+)?goals?\b",
+        r"\bover\b|\bunder\b",
+        r"\bo/?u\b",
+        r"\bbtts\b",
+        r"both\s+teams?\s+to\s+score",
+        r"\bhandicap\b",
+        r"\bspread\b",
+        r"[+-]\d+(?:\.\d+)?\s*(?:goal|handicap|spread)",  # +1.5 goals / -2 handicap
+        r"\bcards?\b",
+        r"\bcorners?\b",
+        r"\bbooking",
+        r"\bred\s+card\b|\byellow\s+card\b",
+        r"first\s+(?:goal|to\s+score|scorer)",
+        r"\banytime\b|\bscorer\b",
+        r"\bsubstitution",
+        r"\bclean\s+sheet\b",
+        r"\bcorrect\s+score\b|exact\s+score|\bscoreline\b",
+        r"\bhalf[\s-]?time\b|\bhalftime\b|\b1st\s+half\b|\b2nd\s+half\b",
+        r"\bto\s+qualify\b|\bto\s+advance\b|\bto\s+reach\b|\bto\s+lift\b|\bto\s+win\s+the\b",
+        r"\bpenalt",
+        r"\bextra\s+time\b",
+    )
+)
+
+# Limitless metadata keys that, when present and non-zero, mark a prop market.
+_PROP_THRESHOLD_KEYS: tuple[str, ...] = (
+    "goalsThreshold",
+    "spreadThreshold",
+    "cardsThreshold",
+    "cornersThreshold",
+)
+
+# Limitless metadata.marketType values that ARE 1X2 match-result markets.
+_MATCH_RESULT_TYPES: frozenset[str] = frozenset(
+    {"match_result", "matchresult", "1x2", "moneyline", "winner", "result", "outcome"}
+)
+
+
+def _title_is_prop(title: str) -> bool:
+    t = title or ""
+    return any(p.search(t) for p in _PROP_TITLE_PATTERNS)
+
+
+def is_match_result_market(
+    metadata: Mapping[str, object] | None,
+    title: str = "",
+) -> bool:
+    """True only if this market is a 1X2 / match-result market (not a prop).
+
+    Used to gate fixture→market routing so a longshot prop (exact scoreline,
+    spread, totals, BTTS, cards, corners, "to win by N", first goal, …) can
+    never be paired to a fixture as its HOME/AWAY/DRAW.
+
+    Decision order:
+      1. A non-zero prop threshold in metadata (Limitless ``goalsThreshold`` /
+         ``spreadThreshold`` / ``cardsThreshold`` / ``cornersThreshold``) → prop.
+      2. A ``marketType`` that is a known match-result type → match-result
+         (subject to title check); an explicit non-result ``marketType`` → prop.
+      3. A prop-shaped title → prop.
+      4. Otherwise assume match-result (the discovery layer already required
+         both team names and a 3-way/binary YES-NO structure).
+    """
+    md = metadata or {}
+
+    for key in _PROP_THRESHOLD_KEYS:
+        raw = md.get(key)
+        if raw in (None, "", 0, 0.0):
+            continue
+        try:
+            if float(raw) != 0.0:
+                return False
+        except (TypeError, ValueError):
+            # A non-numeric, non-empty threshold value is still a prop signal.
+            return False
+
+    market_type = str(md.get("marketType") or md.get("market_type") or "").strip().lower()
+    if market_type:
+        normalized_type = market_type.replace("-", "_").replace(" ", "_")
+        if normalized_type.replace("_", "") in _MATCH_RESULT_TYPES:
+            return not _title_is_prop(title)
+        # An explicit, recognised-but-non-result type is a prop.
+        return False
+
+    # No structured type signal: lean on the title.
+    return not _title_is_prop(title)
+
+
+def normalized_team_pair(home: str, away: str) -> frozenset[str]:
+    """Orientation-agnostic identity key for a fixture's two teams.
+
+    Returns the normalised team names as a frozenset so HOME/AWAY orientation
+    doesn't matter when comparing two venues' markets. Empty names are dropped.
+    """
+    return frozenset(n for n in (normalize(home), normalize(away)) if n)
 
 
 def classify_binary_outcome(

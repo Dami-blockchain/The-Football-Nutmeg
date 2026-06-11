@@ -34,7 +34,11 @@ from betbot.exchanges.limitless_client import (
     LimitlessError,
     LimitlessGeoBlockedError,
 )
-from betbot.exchanges.matcher import TeamAliasResolver, classify_binary_outcome
+from betbot.exchanges.matcher import (
+    TeamAliasResolver,
+    classify_binary_outcome,
+    is_match_result_market,
+)
 from betbot.logging import get_logger
 
 log = get_logger(__name__)
@@ -172,6 +176,17 @@ class LimitlessAdapter:
             m_home, m_away = md.get("homeTeam"), md.get("awayTeam")
             if not m_home or not m_away:
                 continue
+            # Market-identity guard: only a real 1X2 match-result market may be
+            # routed as a fixture. Exclude props (spreads/totals/cards/scoreline
+            # …) even when they carry homeTeam/awayTeam metadata.
+            title = detail.get("title") or f"{m_home} vs {m_away}"
+            if not is_match_result_market(md, title):
+                log.info(
+                    "limitless_market_not_match_result",
+                    slug=slug, title=title,
+                    market_type=md.get("marketType"),
+                )
+                continue
             if not self._teams_match(self._resolver, m_home, m_away, home_team, away_team):
                 continue
             mapping = self._classify_children(detail, home_team, away_team)
@@ -181,11 +196,16 @@ class LimitlessAdapter:
             return MarketRef(
                 exchange=ExchangeName.LIMITLESS,
                 market_id=str(slug),
-                title=detail.get("title") or f"{m_home} vs {m_away}",
+                title=title,
                 metadata={
                     "outcome_markets": {o.value: c for o, c in mapping.items()},
                     "venue_exchange": venue.get("exchange"),
                     "layout": "binary-group",
+                    # Identity fields for the cross-venue arb compat check.
+                    "home_team": m_home,
+                    "away_team": m_away,
+                    "fixture_id": md.get("fixtureId"),
+                    "market_type": "match_result",
                 },
             )
         return None
