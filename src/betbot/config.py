@@ -204,6 +204,14 @@ class Settings(BaseSettings):
         default=2.5, alias="BETBOT_ENSEMBLE_W_MARKET"
     )
 
+    # ---- Tournament simulator (outright/futures, scripts/simulate_wc.py)
+    # How random extra-time/penalties are when a knockout match draws:
+    # 1.0 = pure coin flip, 0.0 = fully decided by relative DC strength.
+    sim_penalty_randomness: float = Field(
+        default=0.5, alias="BETBOT_SIM_PENALTY_RANDOMNESS"
+    )
+    sim_runs: int = Field(default=20_000, alias="BETBOT_SIM_RUNS")
+
     # ---- Storage ------------------------------------------------------
     db_path: Path = Field(
         default=Path("./data/betbot.sqlite"), alias="BETBOT_DB_PATH"
