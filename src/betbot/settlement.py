@@ -26,6 +26,7 @@ from betbot.storage.repos import (
     is_kill_switch_tripped,
     list_unsettled_bets_due,
     record_settlement,
+    score_model_prediction,
     settled_pnl_window,
     trip_kill_switch,
 )
@@ -138,6 +139,13 @@ class SettlementWatcher:
                 log.info("glicko_period_applied", fixtures=len(wc_results), teams=n)
             except Exception as e:  # noqa: BLE001
                 log.error("glicko_period_failed", error=str(e))
+            # Score the dual-logged model race (Hedge) for these fixtures.
+            for fid, (_h, _a, result) in wc_results.items():
+                try:
+                    if score_model_prediction(fid, result):
+                        log.info("model_race_scored", fixture_id=fid, result=result)
+                except Exception as e:  # noqa: BLE001
+                    log.error("model_race_score_failed", fixture_id=fid, error=str(e))
 
         tripped, pnl_w, staked_w = self._evaluate_kill_switch()
         log.info(

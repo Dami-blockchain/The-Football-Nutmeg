@@ -276,6 +276,12 @@ class Settings(BaseSettings):
     ensemble_weight_market: float = Field(
         default=2.5, alias="BETBOT_ENSEMBLE_W_MARKET"
     )
+    # Online model selection (Hedge): dual-log pure-Glicko vs ensemble per
+    # WC fixture, score both at settlement, and weight the live prediction
+    # toward whichever is winning this tournament. Eta = learning rate
+    # (0 = ignore evidence; higher = converge faster).
+    model_select_enabled: bool = Field(default=True, alias="BETBOT_MODEL_SELECT")
+    model_select_eta: float = Field(default=2.0, alias="BETBOT_MODEL_SELECT_ETA")
 
     # ---- Tournament simulator (outright/futures, scripts/simulate_wc.py)
     # How random extra-time/penalties are when a knockout match draws:

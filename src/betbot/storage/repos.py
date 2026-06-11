@@ -14,6 +14,7 @@ from betbot.storage.models import (
     GasTopup,
     GlickoRating,
     KillSwitch,
+    ModelPrediction,
     PaperBet,
     PredictionRow,
     User,
@@ -678,3 +679,94 @@ def list_users() -> list[User]:
         )
         s.expunge_all()
         return rows
+
+
+# ---- Online model selection (Hedge) — see strategy/model_select.py ------
+
+_OUTCOME_INDEX = {"HOME": 0, "DRAW": 1, "AWAY": 2}
+
+
+def upsert_model_prediction(
+    fixture_id: int,
+    home_team: str,
+    away_team: str,
+    glicko: tuple[float, float, float],
+    ensemble: tuple[float, float, float],
+    weights: tuple[float, float],
+) -> None:
+    """Record both models' pre-match view. Re-predicting before kickoff
+    overwrites; once an outcome is scored the row is frozen."""
+    with session_scope() as s:
+        row = s.execute(
+            select(ModelPrediction).where(ModelPrediction.fixture_id == fixture_id)
+        ).scalar_one_or_none()
+        if row is not None and row.outcome is not None:
+            return  # already settled — never rewrite history
+        if row is None:
+            row = ModelPrediction(fixture_id=fixture_id,
+                                  home_team=home_team, away_team=away_team,
+                                  g_home=0, g_draw=0, g_away=0,
+                                  e_home=0, e_draw=0, e_away=0,
+                                  w_glicko=0, w_ensemble=0)
+            s.add(row)
+        row.home_team, row.away_team = home_team, away_team
+        row.g_home, row.g_draw, row.g_away = glicko
+        row.e_home, row.e_draw, row.e_away = ensemble
+        row.w_glicko, row.w_ensemble = weights
+
+
+def score_model_prediction(fixture_id: int, outcome: str) -> bool:
+    """Fill RPS for both models once the result is known. Idempotent —
+    returns False if there's no row or it was already scored."""
+    from betbot.strategy.ensemble import ranked_probability_score
+
+    oi = _OUTCOME_INDEX.get(outcome)
+    if oi is None:
+        return False
+    with session_scope() as s:
+        row = s.execute(
+            select(ModelPrediction).where(ModelPrediction.fixture_id == fixture_id)
+        ).scalar_one_or_none()
+        if row is None or row.outcome is not None:
+            return False
+        row.outcome = outcome
+        row.rps_glicko = ranked_probability_score(
+            (row.g_home, row.g_draw, row.g_away), oi
+        )
+        row.rps_ensemble = ranked_probability_score(
+            (row.e_home, row.e_draw, row.e_away), oi
+        )
+        return True
+
+
+def model_select_losses() -> tuple[float, float, int]:
+    """(cumulative RPS glicko, cumulative RPS ensemble, n scored matches)."""
+    with session_scope() as s:
+        rows = list(
+            s.execute(
+                select(ModelPrediction).where(ModelPrediction.outcome.is_not(None))
+            ).scalars()
+        )
+        return (
+            sum(r.rps_glicko or 0.0 for r in rows),
+            sum(r.rps_ensemble or 0.0 for r in rows),
+            len(rows),
+        )
+
+
+def model_select_summary(eta: float = 2.0) -> dict:
+    """Operator-facing snapshot: who's winning the live model race."""
+    from betbot.strategy.model_select import hedge_weights
+
+    lg, le, n = model_select_losses()
+    w_g, w_e = hedge_weights(lg, le, eta=eta)
+    return {
+        "scored_matches": n,
+        "cum_rps_glicko": round(lg, 4),
+        "cum_rps_ensemble": round(le, 4),
+        "avg_rps_glicko": round(lg / n, 4) if n else None,
+        "avg_rps_ensemble": round(le / n, 4) if n else None,
+        "weight_glicko": round(w_g, 3),
+        "weight_ensemble": round(w_e, 3),
+        "leader": ("glicko" if lg < le else "ensemble") if n else "no data yet",
+    }
