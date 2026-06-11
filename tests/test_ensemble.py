@@ -11,6 +11,7 @@ from betbot.strategy.ensemble import (
     calibrate,
     de_vig,
     log_pool,
+    ranked_probability_score,
 )
 
 
@@ -94,3 +95,20 @@ def test_calibrate_renormalises():
 
 def test_calibrate_none_is_identity():
     assert calibrate((0.5, 0.3, 0.2), None) == (0.5, 0.3, 0.2)
+
+
+def test_rps_perfect_prediction_is_zero():
+    assert ranked_probability_score((1.0, 0.0, 0.0), 0) == 0.0
+
+
+def test_rps_rewards_mass_near_truth():
+    # Home happened: predicting draw is closer than predicting away.
+    draw_heavy = ranked_probability_score((0.1, 0.8, 0.1), 0)
+    away_heavy = ranked_probability_score((0.1, 0.1, 0.8), 0)
+    assert draw_heavy < away_heavy
+
+
+def test_rps_uniform_beats_confident_wrong():
+    uniform = ranked_probability_score((1 / 3, 1 / 3, 1 / 3), 2)
+    wrong = ranked_probability_score((0.9, 0.05, 0.05), 2)
+    assert uniform < wrong

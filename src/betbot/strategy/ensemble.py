@@ -86,6 +86,18 @@ def blend(
     return log_pool(components)
 
 
+def ranked_probability_score(probs: Probs, outcome_index: int) -> float:
+    """RPS over the ordered 1X2 outcomes (0=home, 1=draw, 2=away). Lower is
+    better; unlike accuracy it rewards putting mass NEAR the truth, which is
+    the right yardstick for three-way football forecasts."""
+    cum_p = cum_o = total = 0.0
+    for i in range(2):
+        cum_p += probs[i]
+        cum_o += 1.0 if i == outcome_index else 0.0
+        total += (cum_p - cum_o) ** 2
+    return total / 2.0
+
+
 def anchor_to_market(
     p_model: float, p_market: float, w_model: float, w_market: float
 ) -> float:

@@ -194,7 +194,12 @@ class Settings(BaseSettings):
     ensemble_weight_glicko: float = Field(
         default=1.0, alias="BETBOT_ENSEMBLE_W_GLICKO"
     )
-    ensemble_weight_dc: float = Field(default=1.5, alias="BETBOT_ENSEMBLE_W_DC")
+    # Qatar-2022 walk-forward: DC monotonically improves RPS on 1k+ pre-WC
+    # competitive matches, but on the 64 WC-finals matches the ensemble was
+    # NOT distinguishable from pure Glicko (+0.021 ± 0.024 RPS). Default is
+    # therefore moderate, not the in-sample optimum (3.0). See
+    # scripts/backtest_ensemble.py.
+    ensemble_weight_dc: float = Field(default=1.0, alias="BETBOT_ENSEMBLE_W_DC")
     ensemble_weight_market: float = Field(
         default=2.5, alias="BETBOT_ENSEMBLE_W_MARKET"
     )
