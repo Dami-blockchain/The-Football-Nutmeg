@@ -9,6 +9,7 @@ from sqlalchemy import select
 from betbot.logging import get_logger
 from betbot.storage.db import session_scope
 from betbot.storage.models import (
+    Deposit,
     GlickoRating,
     KillSwitch,
     PaperBet,
@@ -364,6 +365,119 @@ def apply_rating_period(
     for t in teams:
         upsert_rating(t, update_rating(current[t], per_team[t], tau=tau, period=period))
     return len(teams)
+
+
+# ----------------------------------------------------------------------
+# Deposit pipeline (CCTP bridging — betbot/bridge.py)
+# ----------------------------------------------------------------------
+# Terminal status: a leg whose funds have been delivered AND venue approvals
+# have run. Everything else is "active" and (a) blocks re-detection on its
+# source chain and (b) gets resumed by every scan tick.
+DEPOSIT_DONE = "done"
+
+
+def create_deposit(
+    *,
+    user_id: int,
+    wallet_address: str,
+    source_chain: str,
+    dest_chain: str,
+    amount_usdc: float,
+    balance_snapshot: float,
+    status: str,
+) -> int:
+    with session_scope() as s:
+        row = Deposit(
+            user_id=user_id,
+            wallet_address=wallet_address,
+            source_chain=source_chain,
+            dest_chain=dest_chain,
+            amount_usdc=amount_usdc,
+            balance_snapshot=balance_snapshot,
+            status=status,
+        )
+        s.add(row)
+        s.flush()
+        return row.id
+
+
+def has_active_source_deposit(wallet_address: str, source_chain: str) -> bool:
+    """True while ANY leg sourced from this (wallet, chain) is unfinished.
+
+    This is the first idempotency guard: a balance seen twice while its
+    pipeline is in flight must not create a second deposit record.
+    """
+    with session_scope() as s:
+        row = s.execute(
+            select(Deposit.id)
+            .where(Deposit.wallet_address == wallet_address)
+            .where(Deposit.source_chain == source_chain)
+            .where(Deposit.status != DEPOSIT_DONE)
+            .limit(1)
+        ).scalar_one_or_none()
+        return row is not None
+
+
+def list_active_deposits() -> list[Deposit]:
+    """Unfinished legs, oldest first — the scan tick resumes each of these."""
+    with session_scope() as s:
+        rows = list(
+            s.execute(
+                select(Deposit)
+                .where(Deposit.status != DEPOSIT_DONE)
+                .order_by(Deposit.created_at.asc())
+            ).scalars()
+        )
+        s.expunge_all()
+        return rows
+
+
+def delivered_to_chain_usdc(wallet_address: str, dest_chain: str) -> float:
+    """USDC already delivered to ``dest_chain`` for this wallet by past legs.
+
+    Used as the detection baseline on TRADING chains (where delivered funds
+    stay in the wallet): a new deposit is only the balance ABOVE this number.
+    Local legs (source == dest) count from creation — the funds never left;
+    bridged legs count once minted. Trading spend pushes the real balance
+    below this baseline, which only makes detection more conservative (we
+    under-detect rather than ever double-bridge).
+    """
+    with session_scope() as s:
+        rows = list(
+            s.execute(
+                select(Deposit.amount_usdc, Deposit.source_chain, Deposit.status)
+                .where(Deposit.wallet_address == wallet_address)
+                .where(Deposit.dest_chain == dest_chain)
+            )
+        )
+    total = 0.0
+    for amount, source_chain, status in rows:
+        if source_chain == dest_chain or status in ("minted", DEPOSIT_DONE):
+            total += amount or 0.0
+    return total
+
+
+def update_deposit(
+    deposit_id: int,
+    *,
+    status: str | None = None,
+    burn_tx: str | None = None,
+    mint_tx: str | None = None,
+    error: str | None = None,
+) -> None:
+    with session_scope() as s:
+        row = s.get(Deposit, deposit_id)
+        if row is None:
+            return
+        if status is not None:
+            row.status = status
+            row.error = None  # a successful step clears the previous error
+        if burn_tx is not None:
+            row.burn_tx = burn_tx
+        if mint_tx is not None:
+            row.mint_tx = mint_tx
+        if error is not None:
+            row.error = error[:300]
 
 
 # ----------------------------------------------------------------------

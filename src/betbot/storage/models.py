@@ -141,6 +141,45 @@ class GlickoRating(Base):
     )
 
 
+class Deposit(Base):
+    """One leg of a processed user deposit (deposit pipeline, betbot/bridge.py).
+
+    A detected deposit is split into one row per DESTINATION chain (the
+    Polygon/Base allocation), each advancing through an explicit per-step
+    status (``detected → gas_topped_up → burned → minted → done``; local legs
+    where source == dest start at ``minted``). This table is the pipeline's
+    idempotency record: a leg is never burned or approved twice, and a
+    half-finished pipeline resumes from the last completed step.
+
+    No unique constraint on the balance snapshot ON PURPOSE: two deposits of
+    the same amount on the same chain are legitimate over time. Double
+    processing is prevented by (a) refusing to detect on a chain while any
+    non-terminal leg for that (wallet, source_chain) exists and (b) the
+    delivered-balance baseline in ``delivered_to_chain_usdc``.
+    """
+
+    __tablename__ = "deposits"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    wallet_address: Mapped[str] = mapped_column(String(64), index=True)
+    source_chain: Mapped[str] = mapped_column(String(16), index=True)
+    dest_chain: Mapped[str] = mapped_column(String(16))
+    amount_usdc: Mapped[float] = mapped_column(Float)
+    # USDC balance observed on source_chain at detection time (audit trail).
+    balance_snapshot: Mapped[float] = mapped_column(Float)
+    status: Mapped[str] = mapped_column(String(24), index=True)
+    burn_tx: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    mint_tx: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    error: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
 class User(Base):
     """A tenant of the multi-user bot. Each user has their OWN isolated wallet
     and funds — nothing is pooled. The bot trades each user's wallet

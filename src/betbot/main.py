@@ -758,6 +758,17 @@ def run_daemon(
         except Exception as e:  # noqa: BLE001 — never let the watcher crash the daemon
             get_logger(__name__).warning("arb_tick_failed", error=str(e))
 
+    async def _deposit_tick() -> None:
+        # Deposit pipeline: detect new user USDC, CCTP-bridge it to the
+        # trading chains, run venue approvals. Lazy import — betbot.bridge
+        # pulls in web3 (the `api` extra), which the base install lacks.
+        try:
+            from betbot.bridge import run_deposit_scan
+
+            await run_deposit_scan(get_settings())
+        except Exception as e:  # noqa: BLE001 — never let the scanner crash the daemon
+            get_logger(__name__).warning("deposit_tick_failed", error=str(e))
+
     async def _main() -> None:
         s = get_settings()
         scheduler = AsyncIOScheduler(timezone=timezone.utc)
@@ -767,8 +778,18 @@ def run_daemon(
             trigger=IntervalTrigger(minutes=s.arb_scan_interval_min),
             id="arb_watch",
         )
+        scheduler.add_job(
+            _deposit_tick,
+            trigger=IntervalTrigger(minutes=s.deposit_scan_minutes),
+            id="deposit_scan",
+        )
         scheduler.start()
-        log.info("daemon_started", cron=cron_expr, arb_scan_min=s.arb_scan_interval_min)
+        log.info(
+            "daemon_started",
+            cron=cron_expr,
+            arb_scan_min=s.arb_scan_interval_min,
+            deposit_scan_min=s.deposit_scan_minutes,
+        )
         await _tick()  # immediate first run
         try:
             await asyncio.Event().wait()
