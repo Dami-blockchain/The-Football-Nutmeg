@@ -10,6 +10,7 @@ from sqlalchemy import (
     ForeignKey,
     Integer,
     String,
+    Text,
     UniqueConstraint,
 )
 from sqlalchemy.orm import (
@@ -286,6 +287,37 @@ class ModelPrediction(Base):
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class ArbExecution(Base):
+    """One cross-venue arbitrage execution attempt (armed executor only).
+
+    ``legs_json`` is the opportunity snapshot plus per-leg execution state
+    (venue, quoted price, planned stake, status, fill price, order id).
+    ``status``: ``rejected_*`` (gated before any order — no money moved),
+    ``executing`` (orders in flight), ``aborted_no_exposure`` (first leg failed,
+    nothing filled), ``partial_exposure_open`` (a later leg failed AFTER fills —
+    operator must close manually), ``filled`` (all legs filled).
+    """
+
+    __tablename__ = "arb_executions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    home_team: Mapped[str] = mapped_column(String(80))
+    away_team: Mapped[str] = mapped_column(String(80))
+    margin: Mapped[float] = mapped_column(Float)
+    price_sum: Mapped[float] = mapped_column(Float)
+    stake_usd: Mapped[float] = mapped_column(Float)  # total planned across legs
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    legs_json: Mapped[str] = mapped_column(Text, default="{}")
+    net_expected_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, index=True
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow

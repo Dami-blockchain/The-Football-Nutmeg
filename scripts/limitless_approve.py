@@ -6,13 +6,15 @@ the Limitless CTF Exchange and sets the CTF (ERC-1155) operator approval.
 SAFETY: dry-run by default; pass --confirm to send real transactions (costs ETH
 on Base for gas).
 
-The Limitless exchange (verifyingContract) is PER-MARKET (``market.venue.exchange``),
-but in practice markets share a venue exchange contract. Pass the exchange
-address you'll trade against via --exchange or LIMITLESS_EXCHANGE; confirm the
-CTF address against the Limitless docs.
+The Limitless exchange (verifyingContract + approval spender) is PER-MARKET
+(``market.venue.exchange``). Pass the exchange address you'll trade against via
+--exchange / LIMITLESS_EXCHANGE, or pass --market <slug> and the script reads
+``venue.exchange`` from the live market payload (the same address order signing
+uses). Confirm the CTF address against the Limitless docs.
 
 Usage:
     python scripts/limitless_approve.py --exchange 0x...            # dry-run
+    python scripts/limitless_approve.py --market <slug>             # dry-run
     python scripts/limitless_approve.py --exchange 0x... --confirm  # send
 """
 
@@ -51,14 +53,31 @@ ERC1155_ABI = [
 ]
 
 
+def _exchange_for_market(slug: str) -> str:
+    """Read the PER-MARKET venue.exchange address from the live API."""
+    import httpx
+
+    resp = httpx.get(f"https://api.limitless.exchange/markets/{slug}", timeout=20.0)
+    resp.raise_for_status()
+    exchange = ((resp.json() or {}).get("venue") or {}).get("exchange") or ""
+    if not exchange:
+        raise SystemExit(f"market {slug!r} has no venue.exchange in its payload")
+    print(f"market {slug}: venue.exchange = {exchange}")
+    return exchange
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--exchange", default=os.environ.get("LIMITLESS_EXCHANGE", ""),
                     help="Limitless CTF Exchange address (market.venue.exchange)")
+    ap.add_argument("--market", default="",
+                    help="Market slug — resolves venue.exchange from the live API")
     ap.add_argument("--confirm", action="store_true")
     args = ap.parse_args()
+    if not args.exchange and args.market:
+        args.exchange = _exchange_for_market(args.market)
     if not args.exchange:
-        raise SystemExit("--exchange (or LIMITLESS_EXCHANGE) is required")
+        raise SystemExit("--exchange (or LIMITLESS_EXCHANGE, or --market <slug>) is required")
 
     s = get_settings()
     key = s.limitless_private_key

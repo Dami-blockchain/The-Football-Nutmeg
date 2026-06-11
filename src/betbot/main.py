@@ -114,6 +114,7 @@ def _build_router(settings) -> tuple[ExchangeRouter, list, object]:
         lm = LimitlessAdapter(
             limitless_client, resolver, enable_orders=enable, mode=settings.mode,
             private_key=signing_key, fee_rate_bps=settings.limitless_fee_rate_bps,
+            max_order_usd=settings.max_bet_usd,
         )
         return {ExchangeName.POLYMARKET: pm, ExchangeName.LIMITLESS: lm}
 
@@ -696,7 +697,8 @@ async def _arb_scan(settings, limit: int, min_margin: float) -> None:
 
 
 async def _arb_scan_and_notify(settings) -> int:
-    """Scan and push a Telegram alert for each real (margin>0) opportunity."""
+    """Scan and push a Telegram alert for each real (margin>0) opportunity,
+    then hand the opportunities to the (self-gating) executor."""
     from betbot.notify import send_telegram
 
     log = get_logger(__name__)
@@ -715,7 +717,37 @@ async def _arb_scan_and_notify(settings) -> int:
             sent += 1
     if found:
         log.info("arb_notified", opportunities=len(found), sent=sent)
+        await _maybe_execute_arbs(settings, found)
     return sent
+
+
+async def _maybe_execute_arbs(settings, opportunities: list) -> None:
+    """Hand scanned opportunities to the gated arb executor.
+
+    The executor self-gates (BETBOT_ARB_EXECUTE + live mode + kill switch +
+    margin/sizing/balance/daily-cap checks) and notifies Telegram on every
+    execution or abort. The flag check here just avoids building live adapters
+    on every tick while execution is off (the default).
+    """
+    if not opportunities or not settings.arb_execute:
+        return
+    from betbot.arb_executor import ArbExecutor
+
+    log = get_logger(__name__)
+    init_engine(settings.db_path)
+    router, clients, _make_adapters = _build_router(settings)
+    adapters = {a.name: a for a in router.adapters}
+    try:
+        executor = ArbExecutor(settings, adapters)
+        results = await executor.execute_all(opportunities)
+        log.info(
+            "arb_execute_tick_done",
+            considered=len(opportunities),
+            statuses=[r.status for r in results],
+        )
+    finally:
+        for c in clients:
+            await c.close()
 
 
 @arb_app.command("scan")
