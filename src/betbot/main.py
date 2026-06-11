@@ -122,7 +122,11 @@ def _build_router(settings) -> tuple[ExchangeRouter, list, object]:
         signing_key=settings.polymarket_private_key or agent_key,
         funder=settings.polymarket_funder or None,
     )
-    router = ExchangeRouter([base[ExchangeName.POLYMARKET], base[ExchangeName.LIMITLESS]])
+    router = ExchangeRouter(
+        [base[ExchangeName.POLYMARKET], base[ExchangeName.LIMITLESS]],
+        min_plausible_price=settings.min_plausible_price,
+        max_plausible_price=settings.max_plausible_price,
+    )
     return router, [gamma, limitless_client], make_signer_adapters
 
 

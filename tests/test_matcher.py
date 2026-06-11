@@ -6,7 +6,9 @@ from betbot.data.models import MatchOutcome
 from betbot.exchanges.matcher import (
     TeamAliasResolver,
     classify_binary_outcome,
+    is_match_result_market,
     normalize,
+    normalized_team_pair,
 )
 
 
@@ -92,3 +94,74 @@ def test_from_yaml_loads_aliases(tmp_path):
     p.write_text('aliases:\n  "Real Madrid CF": ["Real Madrid", "Madrid"]\n')
     r = TeamAliasResolver.from_yaml(p)
     assert r.match("Real Madrid CF", ["Madrid", "Barcelona"]) == "Madrid"
+
+
+# ----------------------------------------------------------------------
+# international name variants (must still match via the alias table)
+# ----------------------------------------------------------------------
+def test_international_name_variants_match_via_aliases():
+    r = TeamAliasResolver.from_yaml("config/team_aliases.yaml")
+    assert r.same_team("Korea Republic", "South Korea")
+    assert r.same_team("Türkiye", "Turkey")
+    assert r.same_team("Czechia", "Czech Republic")
+    assert r.same_team("United States", "USA")
+    assert r.same_team("Côte d'Ivoire", "Ivory Coast")
+    # ...without collapsing genuinely different nations.
+    assert not r.same_team("Korea Republic", "Korea DPR")
+    assert not r.same_team("Mexico", "South Africa")
+
+
+# ----------------------------------------------------------------------
+# is_match_result_market — props must NOT be 1X2 match-result markets
+# ----------------------------------------------------------------------
+def test_match_result_market_accepts_plain_1x2():
+    assert is_match_result_market(None, "Mexico vs. South Africa")
+    assert is_match_result_market({"marketType": "match_result"}, "Will Mexico win?")
+    assert is_match_result_market({}, "Arsenal vs. Chelsea")
+
+
+def test_prop_titles_are_not_match_result():
+    props = [
+        "Mexico to win by 2+ goals vs Czech Republic",
+        "3+ total goals",
+        "Over 2.5 goals",
+        "Both teams to score",
+        "BTTS",
+        "Mexico -1.5 handicap",
+        "Total cards over 4.5",
+        "Corners over 9.5",
+        "First goal scorer",
+        "Anytime goalscorer",
+        "Correct score 2-1",
+        "Mexico to qualify",
+        "Half-time result",
+    ]
+    for title in props:
+        assert not is_match_result_market(None, title), title
+
+
+def test_prop_threshold_metadata_marks_prop():
+    # Limitless-style structured metadata: a non-zero threshold => prop.
+    assert not is_match_result_market(
+        {"marketType": "match_result", "goalsThreshold": 2.5}, "Mexico vs South Africa"
+    )
+    assert not is_match_result_market({"spreadThreshold": -1.5}, "Mexico vs South Africa")
+    assert not is_match_result_market({"cardsThreshold": 4}, "Mexico vs South Africa")
+    # A zero threshold is the 1X2 case and must NOT be rejected.
+    assert is_match_result_market(
+        {"marketType": "match_result", "goalsThreshold": 0}, "Mexico vs South Africa"
+    )
+
+
+def test_explicit_non_result_market_type_is_prop():
+    assert not is_match_result_market({"marketType": "TOTALS"}, "Mexico vs South Africa")
+    assert not is_match_result_market({"marketType": "spread"}, "Mexico vs South Africa")
+
+
+def test_normalized_team_pair_is_orientation_agnostic():
+    assert normalized_team_pair("Mexico", "South Africa") == normalized_team_pair(
+        "South Africa", "Mexico"
+    )
+    assert normalized_team_pair("Mexico", "South Africa") != normalized_team_pair(
+        "Mexico", "Czech Republic"
+    )

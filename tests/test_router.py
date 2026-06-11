@@ -73,3 +73,39 @@ async def test_market_without_quote_skipped():
     a = FakeAdapter(ExchangeName.POLYMARKET, market=True, quote=None)
     r = ExchangeRouter([a])
     assert await r.find_best_quote("A", "B", KICKOFF, Outcome.HOME) is None
+
+
+# ----------------------------------------------------------------------
+# price-sanity guard (matcher hardening) — reject implausible 1X2 prices
+# ----------------------------------------------------------------------
+async def test_rejects_implausibly_low_price(capsys):
+    # The Mexico/SA 0.014 bug: a 1X2 outcome priced at 0.014 is a wrong-market
+    # match and must be rejected, not logged as a 38-point edge.
+    a = FakeAdapter(ExchangeName.POLYMARKET, quote=_quote(ExchangeName.POLYMARKET, 0.014, 100))
+    r = ExchangeRouter([a])
+    assert await r.find_best_quote("Mexico", "South Africa", KICKOFF, Outcome.HOME) is None
+    assert "router_implausible_price_rejected" in capsys.readouterr().out
+
+
+async def test_rejects_implausibly_high_price(capsys):
+    a = FakeAdapter(ExchangeName.POLYMARKET, quote=_quote(ExchangeName.POLYMARKET, 0.99, 100))
+    r = ExchangeRouter([a])
+    assert await r.find_best_quote("A", "B", KICKOFF, Outcome.HOME) is None
+    assert "router_implausible_price_rejected" in capsys.readouterr().out
+
+
+async def test_accepts_plausible_price():
+    a = FakeAdapter(ExchangeName.POLYMARKET, quote=_quote(ExchangeName.POLYMARKET, 0.45, 100))
+    r = ExchangeRouter([a])
+    best = await r.find_best_quote("A", "B", KICKOFF, Outcome.HOME)
+    assert best is not None and abs(best.yes_price - 0.45) < 1e-9
+
+
+async def test_implausible_leg_dropped_plausible_leg_kept():
+    # One venue mis-matched (0.014), the other priced sanely (0.50): the bad leg
+    # is dropped and the good one wins, instead of the bad leg producing a route.
+    bad = FakeAdapter(ExchangeName.LIMITLESS, quote=_quote(ExchangeName.LIMITLESS, 0.014, 100))
+    good = FakeAdapter(ExchangeName.POLYMARKET, quote=_quote(ExchangeName.POLYMARKET, 0.50, 100))
+    r = ExchangeRouter([bad, good])
+    best = await r.find_best_quote("A", "B", KICKOFF, Outcome.HOME)
+    assert best is not None and best.exchange is ExchangeName.POLYMARKET

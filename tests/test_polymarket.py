@@ -102,6 +102,41 @@ async def test_find_market_no_match_returns_none():
     assert await a.find_market("Liverpool FC", "Everton FC", KICKOFF) is None
 
 
+async def test_find_market_one_team_only_rejected():
+    # Only HOME matches (Arsenal); AWAY is a stranger -> no HOME+AWAY mapping.
+    a = _adapter([_layout_b_event()])
+    assert await a.find_market("Arsenal FC", "Liverpool FC", KICKOFF) is None
+
+
+def _prop_event():
+    # A scoreline/win-by prop event that still names the two teams — must be
+    # excluded from 1X2 routing.
+    return {
+        "slug": "arsenal-chelsea-winby2",
+        "id": "evtprop",
+        "title": "Arsenal to win by 2+ goals vs. Chelsea",
+        "markets": [
+            {"question": "Will Arsenal win by 2+ goals?",
+             "outcomes": ["Yes", "No"], "clobTokenIds": ["P_YES", "P_NO"]},
+            {"question": "Will Chelsea win by 2+ goals?",
+             "outcomes": ["Yes", "No"], "clobTokenIds": ["Q_YES", "Q_NO"]},
+        ],
+    }
+
+
+async def test_find_market_prop_event_rejected():
+    a = _adapter([_prop_event()])
+    assert await a.find_market("Arsenal FC", "Chelsea FC", KICKOFF) is None
+
+
+async def test_find_market_attaches_identity_metadata():
+    a = _adapter([_layout_b_event()])
+    ref = await a.find_market("Arsenal FC", "Chelsea FC", KICKOFF)
+    assert ref.metadata["home_team"] == "Arsenal FC"
+    assert ref.metadata["away_team"] == "Chelsea FC"
+    assert ref.metadata["market_type"] == "match_result"
+
+
 # ---- orderbook -------------------------------------------------------
 async def test_get_orderbook_returns_best_ask_dict_shape():
     # The live CLOB get_order_book returns a DICT with string price/size.
