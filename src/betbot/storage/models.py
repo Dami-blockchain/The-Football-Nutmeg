@@ -206,6 +206,43 @@ class Deposit(Base):
     )
 
 
+class TreasuryBridge(Base):
+    """One in-flight AGENT-treasury rebalance leg (betbot/bridge.py).
+
+    Separate from ``deposits`` ON PURPOSE: deposit legs belong to a registered
+    user (NOT-NULL ``user_id`` FK) and end in venue approvals; a treasury leg
+    is the operator's own seed float repositioned between trading chains by the
+    agent wallet itself (both burner AND mint-relayer), with no user and no
+    venue setup. Overloading the deposits table would mean a sentinel user and
+    special-casing every deposit guard. A small dedicated table keeps the
+    user-deposit invariants untouched.
+
+    Crash-safety mirrors the deposit pipeline exactly: the signed burn's tx
+    hash is persisted (status ``burn_submitted``) BEFORE the broadcast, so a
+    receipt timeout or daemon death can never lose the hash and re-burn —
+    recovery verifies that tx on-chain. At most ONE non-``done`` row exists at
+    a time (the single-in-flight invariant), so a query for an active row is
+    the rebalancer's idempotency lock.
+    """
+
+    __tablename__ = "treasury_bridges"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_chain: Mapped[str] = mapped_column(String(16), index=True)
+    dest_chain: Mapped[str] = mapped_column(String(16))
+    amount_usdc: Mapped[float] = mapped_column(Float)
+    status: Mapped[str] = mapped_column(String(24), index=True)
+    burn_tx: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    mint_tx: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    error: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
 class GasTopup(Base):
     """One agent-funded native-gas top-up sent to a user wallet.
 

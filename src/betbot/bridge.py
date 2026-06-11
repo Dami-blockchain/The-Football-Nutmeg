@@ -62,8 +62,10 @@ from typing import Any
 from betbot.logging import get_logger
 from betbot.storage.repos import (
     DEPOSIT_DONE,
+    active_treasury_bridge,
     count_gas_topups_since,
     create_deposit,
+    create_treasury_bridge,
     delivered_to_chain_usdc,
     has_active_dest_deposit,
     has_active_source_deposit,
@@ -71,6 +73,7 @@ from betbot.storage.repos import (
     list_users,
     record_gas_topup,
     update_deposit,
+    update_treasury_bridge,
 )
 
 log = get_logger(__name__)
@@ -906,6 +909,349 @@ class DepositPipeline:
         log.info("limitless_usdc_approved", wallet=acct.address, tx=tx)
 
 
+class TreasuryRebalancer(DepositPipeline):
+    """Positions the AGENT treasury's own USDC AHEAD of trades.
+
+    The deposit pipeline covers every registered USER wallet, but the
+    operator's own seed float (the agent wallet — same address on Polygon and
+    Base, key at ``settings.wallet_keyfile``) was not covered, forcing a manual
+    ``scripts/bridge_agent_funds.py`` run to position trading funds. This keeps
+    target balances on both trading chains topped up in the background so no
+    manual bridge is ever needed.
+
+    Why a background job and not a bridge-at-trade-time: CCTP standard-transfer
+    attestation takes ~15 minutes, and a trade can't wait that long. Funds are
+    moved AHEAD of demand, toward configured per-chain targets.
+
+    It reuses ``DepositPipeline``'s chain primitives (``_usdc_balance``,
+    ``_sign_deposit_for_burn``, ``_broadcast_signed``, ``_tx_status``,
+    ``_fetch_attestation``, ``_message_nonce_consumed``, ``_receive_message``,
+    ``_ensure_gas``, ``_agent_account``, ``CCTP_CHAINS``) — the agent wallet is
+    BOTH the burner and the mint relayer (it pays its own gas). Crash-safety
+    mirrors the deposit burn exactly (hash persisted before broadcast, verified
+    on resume; mint verified via the on-chain nonce registry).
+
+    Idempotency: at most ONE in-flight treasury bridge at a time, enforced by a
+    single non-``done`` row in the ``treasury_bridges`` table. A second tick
+    while a bridge is active resumes that leg rather than starting another.
+    """
+
+    # Only the two trading chains are rebalanced. (Polygon = Polymarket live;
+    # Base = Limitless once un-parked.)
+    _TRADING_CHAINS = ("polygon", "base")
+
+    def rebalance_agent_treasury(self) -> None:
+        """One rebalance tick: resume an in-flight leg, else open one if needed.
+
+        Master gates: ``treasury_auto_rebalance`` AND ``auto_bridge`` (the
+        on-chain master kill). Either being false disables ALL action here,
+        including resuming a leg that was already in flight when the gate
+        flipped — same freeze semantics as the deposit pipeline.
+        """
+        if not self.settings.auto_bridge:
+            log.info(
+                "treasury_rebalance_disabled", note="BETBOT_AUTO_BRIDGE=false"
+            )
+            return
+        if not self.settings.treasury_auto_rebalance:
+            log.info(
+                "treasury_rebalance_disabled",
+                note="BETBOT_TREASURY_AUTO_REBALANCE=false",
+            )
+            return
+
+        active = active_treasury_bridge()
+        if active is not None:
+            # One in flight already — resume it, never start a second.
+            self._process_treasury_leg(active)
+            return
+
+        plan = self._plan_rebalance()
+        if plan is None:
+            return  # balanced (or unreadable) — _plan_rebalance logged why
+        source, dest, amount = plan
+        bridge_id = create_treasury_bridge(
+            source_chain=source,
+            dest_chain=dest,
+            amount_usdc=amount,
+            status=BURNED if source == dest else DETECTED,
+        )
+        log.info(
+            "treasury_rebalance_started",
+            bridge_id=bridge_id,
+            source_chain=source,
+            dest_chain=dest,
+            amount_usdc=amount,
+        )
+        self._process_treasury_leg(active_treasury_bridge())
+
+    def _plan_rebalance(self) -> tuple[str, str, float] | None:
+        """Decide the single bridge to run this tick, or None if balanced.
+
+        Reads agent USDC on both trading chains, compares to targets, and — if
+        one chain is short by MORE than the threshold while the other holds a
+        surplus above its own target — returns
+        ``(source, dest, amount)`` with the amount = the deficit, capped at the
+        surplus. Dust (deficit <= threshold) is ignored. Never bridges more
+        than the surplus, and never below the threshold.
+        """
+        agent = self._agent_account().address
+        targets = {
+            "polygon": self.settings.treasury_target_polygon_usd,
+            "base": self.settings.treasury_target_base_usd,
+        }
+        threshold = self.settings.treasury_rebalance_threshold_usd
+        balances: dict[str, float] = {}
+        for chain in self._TRADING_CHAINS:
+            bal = self._usdc_balance(chain, agent)
+            if bal is None:
+                log.warning(
+                    "treasury_balance_read_failed",
+                    chain=chain,
+                    note="skipping rebalance this tick",
+                )
+                return None
+            balances[chain] = bal
+
+        deficits = {c: round(targets[c] - balances[c], _USDC_DECIMALS) for c in balances}
+        surpluses = {c: round(balances[c] - targets[c], _USDC_DECIMALS) for c in balances}
+
+        # The most-underfunded chain that is short by MORE than the threshold.
+        dest = max(deficits, key=lambda c: deficits[c])
+        if deficits[dest] <= threshold:
+            log.info(
+                "treasury_balanced",
+                polygon_usd=round(balances["polygon"], _USDC_DECIMALS),
+                base_usd=round(balances["base"], _USDC_DECIMALS),
+                target_polygon=targets["polygon"],
+                target_base=targets["base"],
+                threshold=threshold,
+                note="nothing to do",
+            )
+            return None
+
+        # Pull from the chain with the largest surplus above its own target.
+        source = max(surpluses, key=lambda c: surpluses[c])
+        if source == dest or surpluses[source] <= 0:
+            log.info(
+                "treasury_deficit_without_surplus",
+                deficit_chain=dest,
+                deficit_usd=deficits[dest],
+                note="no surplus chain to fund it — fund the agent wallet",
+            )
+            return None
+
+        amount = round(min(deficits[dest], surpluses[source]), _USDC_DECIMALS)
+        if amount < threshold:
+            # The surplus can only cover dust — not worth a bridge.
+            log.info(
+                "treasury_surplus_below_threshold",
+                source_chain=source,
+                dest_chain=dest,
+                fundable_usd=amount,
+                threshold=threshold,
+                note="surplus too small to bridge — nothing to do",
+            )
+            return None
+        log.info(
+            "treasury_rebalance_planned",
+            source_chain=source,
+            dest_chain=dest,
+            amount_usdc=amount,
+            deficit_usd=deficits[dest],
+            surplus_usd=surpluses[source],
+        )
+        return source, dest, amount
+
+    def _process_treasury_leg(self, leg) -> None:
+        """Advance one treasury leg as far as it can this tick.
+
+        Mirrors :meth:`DepositPipeline.process_deposit` but with NO user gas
+        top-up (the agent funds its own source-chain gas) and NO venue setup
+        (the treasury isn't a tradeable user wallet). A failed step records the
+        error and leaves the status put — retried next tick.
+        """
+        if leg is None:
+            return
+        try:
+            if leg.status == DETECTED:
+                self._treasury_step_gas(leg)
+            if leg.status == BURN_SUBMITTED:
+                self._treasury_resume_submitted_burn(leg)
+            if leg.status == GAS_TOPPED_UP:
+                self._treasury_step_burn(leg)
+            if leg.status == BURNED:
+                if not self._treasury_step_mint(leg):
+                    return  # attestation not ready — resume next tick
+            if leg.status == MINTED:
+                update_treasury_bridge(leg.id, status=DONE)
+                leg.status = DONE
+                log.info(
+                    "treasury_rebalance_done",
+                    bridge_id=leg.id,
+                    source_chain=leg.source_chain,
+                    dest_chain=leg.dest_chain,
+                    amount_usdc=leg.amount_usdc,
+                )
+        except Exception as e:  # noqa: BLE001 — one bad leg must not kill the scan
+            log.error(
+                "treasury_step_failed",
+                bridge_id=leg.id,
+                status=leg.status,
+                source_chain=leg.source_chain,
+                dest_chain=leg.dest_chain,
+                error=str(e),
+            )
+            update_treasury_bridge(leg.id, error=str(e))
+
+    def _treasury_step_gas(self, leg) -> None:
+        """Fund the agent wallet's own source-chain gas for approve+burn."""
+        agent = self._agent_account().address
+        self._ensure_gas(leg.source_chain, agent)
+        update_treasury_bridge(leg.id, status=GAS_TOPPED_UP)
+        leg.status = GAS_TOPPED_UP
+
+    def _treasury_step_burn(self, leg) -> None:
+        """Approve + burn the agent's USDC toward the deficit chain.
+
+        Same crash-safety ordering as the deposit burn: sign, persist the hash
+        (``burn_submitted``), THEN broadcast — so a receipt timeout or crash in
+        the broadcast window never loses the hash and re-burns. Defense in
+        depth: never burn unless the agent demonstrably still holds the amount
+        (a lower balance means an earlier unrecorded burn already consumed it).
+        """
+        cfg = CCTP_CHAINS[leg.source_chain]
+        agent = self._agent_account()
+        units = int(round(leg.amount_usdc * 10**_USDC_DECIMALS))
+        balance = self._usdc_balance(leg.source_chain, agent.address)
+        if balance is None:
+            raise BridgeError(
+                f"treasury burn aborted for bridge {leg.id}: balance read failed"
+            )
+        if int(round(balance * 10**_USDC_DECIMALS)) < units:
+            raise BridgeError(
+                f"treasury burn aborted for bridge {leg.id}: source balance"
+                f" {balance} below leg amount {leg.amount_usdc} —"
+                " possible unrecorded burn"
+            )
+        if self._allowance(
+            leg.source_chain, cfg["usdc"], agent.address, cfg["token_messenger"]
+        ) < units:
+            tx = self._approve_erc20(
+                leg.source_chain, agent, cfg["usdc"], cfg["token_messenger"], units
+            )
+            log.info(
+                "treasury_usdc_approved",
+                bridge_id=leg.id,
+                chain=leg.source_chain,
+                tx=tx,
+            )
+        signed = self._sign_deposit_for_burn(
+            leg.source_chain,
+            agent,
+            amount_units=units,
+            dest_domain=CCTP_CHAINS[leg.dest_chain]["domain"],
+            mint_recipient=agent.address,  # agent -> agent, cross-chain
+        )
+        update_treasury_bridge(leg.id, status=BURN_SUBMITTED, burn_tx=signed.tx_hash)
+        leg.status, leg.burn_tx = BURN_SUBMITTED, signed.tx_hash
+        log.info(
+            "treasury_burn_submitted",
+            bridge_id=leg.id,
+            source_chain=leg.source_chain,
+            tx=signed.tx_hash,
+        )
+        self._broadcast_signed(leg.source_chain, signed)
+        update_treasury_bridge(leg.id, status=BURNED)
+        leg.status = BURNED
+        log.info(
+            "treasury_burned",
+            bridge_id=leg.id,
+            source_chain=leg.source_chain,
+            dest_chain=leg.dest_chain,
+            amount_usdc=leg.amount_usdc,
+            tx=signed.tx_hash,
+        )
+
+    def _treasury_resume_submitted_burn(self, leg) -> None:
+        """Resolve a treasury leg stranded at ``burn_submitted``.
+
+        Identical reasoning to :meth:`DepositPipeline._resume_submitted_burn`:
+        the persisted hash is the source of truth (mined+ok -> BURNED;
+        reverted -> retry; no receipt -> disambiguate via the agent's USDC
+        balance, never re-burning when the funds already left the wallet).
+        """
+        agent = self._agent_account().address
+        status = self._tx_status(leg.source_chain, leg.burn_tx)
+        if status is True:
+            update_treasury_bridge(leg.id, status=BURNED)
+            leg.status = BURNED
+            log.info("treasury_burn_confirmed", bridge_id=leg.id, tx=leg.burn_tx)
+            return
+        if status is False:
+            update_treasury_bridge(leg.id, status=GAS_TOPPED_UP)
+            leg.status = GAS_TOPPED_UP
+            log.warning(
+                "treasury_burn_reverted_retrying", bridge_id=leg.id, tx=leg.burn_tx
+            )
+            return
+        units = int(round(leg.amount_usdc * 10**_USDC_DECIMALS))
+        balance = self._usdc_balance(leg.source_chain, agent)
+        if balance is not None and int(round(balance * 10**_USDC_DECIMALS)) >= units:
+            update_treasury_bridge(leg.id, status=GAS_TOPPED_UP)
+            leg.status = GAS_TOPPED_UP
+            log.warning(
+                "treasury_burn_not_found_retrying",
+                bridge_id=leg.id,
+                tx=leg.burn_tx,
+                note="funds still in wallet — broadcast never landed",
+            )
+        else:
+            log.info(
+                "treasury_burn_receipt_pending",
+                bridge_id=leg.id,
+                tx=leg.burn_tx,
+                note="funds left the wallet — waiting for the receipt, not re-burning",
+            )
+
+    def _treasury_step_mint(self, leg) -> bool:
+        """Relay the attested mint on the destination. False = not ready yet.
+
+        The AGENT wallet relays ``receiveMessage`` (it's both burner and
+        relayer). A replay revert is verified against the on-chain nonce
+        registry before advancing — never trusted from error text.
+        """
+        att = self._fetch_attestation(leg.source_chain, leg.burn_tx)
+        if att is None:
+            log.info(
+                "treasury_attestation_pending",
+                bridge_id=leg.id,
+                burn_tx=leg.burn_tx,
+                note="Circle standard-transfer attestation takes minutes; retrying next tick",
+            )
+            return False
+        try:
+            mint_tx = self._receive_message(leg.dest_chain, att)
+        except Exception as e:  # noqa: BLE001 — replays revert with "Nonce already used"
+            if self._message_nonce_consumed(leg.dest_chain, att):
+                log.warning(
+                    "treasury_mint_already_relayed", bridge_id=leg.id, error=str(e)
+                )
+                mint_tx = None
+            else:
+                raise
+        update_treasury_bridge(leg.id, status=MINTED, mint_tx=mint_tx)
+        leg.status, leg.mint_tx = MINTED, mint_tx
+        log.info(
+            "treasury_minted",
+            bridge_id=leg.id,
+            dest_chain=leg.dest_chain,
+            amount_usdc=leg.amount_usdc,
+            tx=mint_tx,
+        )
+        return True
+
+
 def _load_script(name: str):
     """Import a module from scripts/ (not a package) by file path."""
     import importlib.util
@@ -919,11 +1265,29 @@ def _load_script(name: str):
     return mod
 
 
+def _deposit_scan_sync(settings) -> int:
+    """One tick: user deposit scan, THEN agent treasury rebalance.
+
+    Both share the deposit-scan interval and the same worker thread. The
+    treasury rebalance runs AFTER the user scan so one daemon job handles
+    both; its own gates (``treasury_auto_rebalance`` + ``auto_bridge``) decide
+    whether it does anything, and any failure inside it must not affect the
+    user-scan result already returned.
+    """
+    created = DepositPipeline(settings).run_once()
+    try:
+        TreasuryRebalancer(settings).rebalance_agent_treasury()
+    except Exception as e:  # noqa: BLE001 — treasury rebalance must not break the user scan
+        log.error("treasury_rebalance_failed", error=str(e))
+    return created
+
+
 async def run_deposit_scan(settings) -> int:
     """Daemon entrypoint: one deposit-scan tick (see main.py wiring).
 
     The pipeline is synchronous web3 code, so it runs in a worker thread to
-    keep the daemon's event loop responsive.
+    keep the daemon's event loop responsive. The agent-treasury rebalance
+    rides the same tick, AFTER the user deposit scan.
     """
     from betbot.storage.db import init_engine
 
@@ -931,5 +1295,4 @@ async def run_deposit_scan(settings) -> int:
     if not settings.auto_bridge:
         log.info("deposit_scan_disabled", note="BETBOT_AUTO_BRIDGE=false")
         return 0
-    pipeline = DepositPipeline(settings)
-    return await asyncio.to_thread(pipeline.run_once)
+    return await asyncio.to_thread(_deposit_scan_sync, settings)

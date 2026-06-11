@@ -232,6 +232,34 @@ class Settings(BaseSettings):
     # with a logged warning (see scripts/limitless_approve.py).
     limitless_exchange: str = Field(default="", alias="LIMITLESS_EXCHANGE")
 
+    # ---- Treasury rebalancer (agent-owned float; bridge.TreasuryRebalancer) --
+    # The agent treasury wallet self-maintains target USDC balances on both
+    # trading chains in the background, so the operator never has to manually
+    # bridge trading funds. Runs on the deposit-scan tick AFTER the user scan.
+    #
+    # Master switch for the rebalancer. Even when true it ALSO respects
+    # auto_bridge (the on-chain master kill): if auto_bridge is false the
+    # rebalancer is off too. False = positions nothing automatically (the
+    # manual scripts/bridge_agent_funds.py override still works).
+    treasury_auto_rebalance: bool = Field(
+        default=True, alias="BETBOT_TREASURY_AUTO_REBALANCE"
+    )
+    # Target USDC the agent wallet keeps on each trading chain. Funds are
+    # positioned AHEAD of trades (CCTP attestation takes ~15 min — a trade
+    # can't wait for a bridge).
+    treasury_target_polygon_usd: float = Field(
+        default=50.0, alias="BETBOT_TREASURY_TARGET_POLYGON_USD"
+    )
+    treasury_target_base_usd: float = Field(
+        default=50.0, alias="BETBOT_TREASURY_TARGET_BASE_USD"
+    )
+    # A chain is only rebalanced once it is below its target by MORE than this
+    # — bridging dust costs more gas than it's worth, and avoids thrashing on
+    # tiny fluctuations.
+    treasury_rebalance_threshold_usd: float = Field(
+        default=10.0, alias="BETBOT_TREASURY_REBALANCE_THRESHOLD_USD"
+    )
+
     # ---- Arbitrage watch (Telegram alerts) ---------------------------
     arb_notify_min_margin: float = Field(
         default=0.01, alias="BETBOT_ARB_NOTIFY_MIN_MARGIN"

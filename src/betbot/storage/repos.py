@@ -18,6 +18,7 @@ from betbot.storage.models import (
     ModelPrediction,
     PaperBet,
     PredictionRow,
+    TreasuryBridge,
     User,
 )
 from betbot.strategy.engine import BetDecision, Outcome, Prediction
@@ -583,6 +584,66 @@ def update_deposit(
 ) -> None:
     with session_scope() as s:
         row = s.get(Deposit, deposit_id)
+        if row is None:
+            return
+        if status is not None:
+            row.status = status
+            row.error = None  # a successful step clears the previous error
+        if burn_tx is not None:
+            row.burn_tx = burn_tx
+        if mint_tx is not None:
+            row.mint_tx = mint_tx
+        if error is not None:
+            row.error = error[:300]
+
+
+# ----------------------------------------------------------------------
+# Treasury rebalancer (agent-owned float; betbot/bridge.py TreasuryRebalancer)
+# ----------------------------------------------------------------------
+def create_treasury_bridge(
+    *, source_chain: str, dest_chain: str, amount_usdc: float, status: str
+) -> int:
+    with session_scope() as s:
+        row = TreasuryBridge(
+            source_chain=source_chain,
+            dest_chain=dest_chain,
+            amount_usdc=amount_usdc,
+            status=status,
+        )
+        s.add(row)
+        s.flush()
+        return row.id
+
+
+def active_treasury_bridge() -> TreasuryBridge | None:
+    """The single in-flight treasury leg, if any (oldest non-``done`` row).
+
+    This IS the rebalancer's idempotency lock: a non-None result means a
+    bridge is already mid-flight, so no new one may start. Detached for use
+    after the session closes.
+    """
+    with session_scope() as s:
+        row = s.execute(
+            select(TreasuryBridge)
+            .where(TreasuryBridge.status != DEPOSIT_DONE)
+            .order_by(TreasuryBridge.created_at.asc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if row is not None:
+            s.expunge_all()
+        return row
+
+
+def update_treasury_bridge(
+    bridge_id: int,
+    *,
+    status: str | None = None,
+    burn_tx: str | None = None,
+    mint_tx: str | None = None,
+    error: str | None = None,
+) -> None:
+    with session_scope() as s:
+        row = s.get(TreasuryBridge, bridge_id)
         if row is None:
             return
         if status is not None:
