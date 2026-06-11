@@ -648,12 +648,20 @@ class DepositPipeline:
     def _w3(self, chain: str):
         if chain not in self._w3_cache:
             from web3 import Web3
+            from web3.middleware import ExtraDataToPOAMiddleware
 
-            self._w3_cache[chain] = Web3(
+            w3 = Web3(
                 Web3.HTTPProvider(
                     _rpc_for(chain, self.settings), request_kwargs={"timeout": 30}
                 )
             )
+            # Polygon PoS puts >32 bytes in each block's extraData, which web3's
+            # default block formatter rejects — fatal when waiting for a
+            # receiveMessage receipt (the mint leg). This middleware trims it;
+            # it's a no-op on chains whose extraData is already 32 bytes, so
+            # injecting it on every chain is safe.
+            w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+            self._w3_cache[chain] = w3
         return self._w3_cache[chain]
 
     def _agent_account(self):
