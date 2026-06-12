@@ -233,6 +233,25 @@ def _model_race_line(settings) -> str | None:
         return None
 
 
+def _calibration_block(settings) -> str | None:
+    """The full WC model-calibration report (operator-only). Returns None when
+    nothing has settled yet (no point sending an empty report every day) or on
+    any error — telemetry must not break the daily report."""
+    if not getattr(settings, "model_select_enabled", False):
+        return None
+    try:
+        from betbot.calibration import build_report
+        from betbot.reports import format_calibration_report
+        from betbot.storage.repos import scored_model_predictions
+
+        report = build_report(scored_model_predictions())
+        if report.ensemble.n == 0:
+            return None
+        return format_calibration_report(report)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 async def run_daily_report(
     settings,
     *,
@@ -257,6 +276,11 @@ async def run_daily_report(
     operator_id = settings.telegram_allowed_user_id
     if operator_id:
         if await send(settings, operator_id, format_daily_report(report)):
+            sent += 1
+        # Operator-only: the full WC model calibration report. Never raises —
+        # telemetry must not break the daily report.
+        cal = _calibration_block(settings)
+        if cal and await send(settings, operator_id, cal):
             sent += 1
     else:
         log.warning(

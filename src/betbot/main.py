@@ -672,6 +672,22 @@ def backtest_cmd(
         )
 
 
+@app.command("calibration")
+def calibration_cmd() -> None:
+    """Show WC model calibration — RPS/Brier + reliability over settled matches."""
+    settings = get_settings()
+    configure_logging(settings.log_level)
+    init_engine(settings.db_path)
+    from betbot.calibration import build_report
+    from betbot.reports import format_calibration_report
+    from betbot.storage.repos import scored_model_predictions
+
+    report = build_report(scored_model_predictions())
+    # Strip Telegram Markdown for the terminal.
+    text = format_calibration_report(report).replace("```", "").replace("*", "")
+    typer.echo(text)
+
+
 @app.command("gate")
 def gate_cmd() -> None:
     """Check whether the paper record clears the live-trading gate."""

@@ -916,6 +916,30 @@ def model_select_losses() -> tuple[float, float, int]:
         )
 
 
+def scored_model_predictions() -> list[tuple]:
+    """Settled model_predictions as ``[(glicko_triple, ensemble_triple, oi)]``
+    for the calibration report. Newest data last (insertion order)."""
+    with session_scope() as s:
+        rows = list(
+            s.execute(
+                select(ModelPrediction)
+                .where(ModelPrediction.outcome.is_not(None))
+                .order_by(ModelPrediction.id.asc())
+            ).scalars()
+        )
+        out = []
+        for r in rows:
+            oi = _OUTCOME_INDEX.get(r.outcome)
+            if oi is None:
+                continue
+            out.append((
+                (r.g_home, r.g_draw, r.g_away),
+                (r.e_home, r.e_draw, r.e_away),
+                oi,
+            ))
+        return out
+
+
 def model_select_summary(eta: float = 2.0) -> dict:
     """Operator-facing snapshot: who's winning the live model race."""
     from betbot.strategy.model_select import hedge_weights

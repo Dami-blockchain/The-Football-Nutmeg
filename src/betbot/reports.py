@@ -160,6 +160,52 @@ def format_user_daily_report(
     return "\n".join(parts)
 
 
+def format_calibration_report(report) -> str:
+    """Calibration of the WC model race — RPS/Brier/hit-rate + a reliability
+    table (predicted favourite confidence vs how often it actually won).
+
+    ``report`` is a betbot.calibration.CalibrationReport. Lower RPS/Brier is
+    better; a well-calibrated model's 'pred' and 'won' columns track each
+    other. A persistent positive gap (pred > won) = over-confidence.
+    """
+    e, g = report.ensemble, report.glicko
+    if e.n == 0:
+        return ("*Model calibration*\nNo settled WC matches yet — calibration "
+                "needs results to score. Check back after the next matchday.")
+    parts = [
+        f"*Model calibration* (after {e.n} settled match"
+        f"{'es' if e.n != 1 else ''})", "",
+        "*Scores* (lower = better; favourite hit-rate higher = better)",
+        _mono(_table(
+            ("model", "RPS", "Brier", "logloss", "hit%"),
+            [
+                (m.name, f"{m.rps:.3f}", f"{m.brier:.3f}",
+                 f"{m.log_loss:.3f}", f"{m.favourite_hit_rate*100:.0f}%")
+                for m in (e, g)
+            ],
+            right=frozenset({1, 2, 3, 4}),
+        )),
+    ]
+    if e.bins:
+        parts += [
+            "*Reliability* (ensemble — is its confidence honest?)",
+            _mono(_table(
+                ("confidence", "n", "pred", "won", "gap"),
+                [
+                    (f"{b.lo*100:.0f}-{min(b.hi,1.0)*100:.0f}%", str(b.n),
+                     f"{b.mean_predicted*100:.0f}%", f"{b.hit_rate*100:.0f}%",
+                     f"{b.gap*100:+.0f}")
+                    for b in e.bins
+                ],
+                right=frozenset({1, 2, 3, 4}),
+            )),
+            "_'gap' = predicted − actual; persistently positive = "
+            "over-confident. One matchday is far too few to judge — watch the "
+            "trend over the group stage._",
+        ]
+    return "\n".join(parts)
+
+
 def _mono(text: str) -> str:
     return f"```\n{text}\n```"
 
