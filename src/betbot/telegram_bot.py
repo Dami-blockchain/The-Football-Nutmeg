@@ -294,10 +294,26 @@ async def linklimitless_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     api_key, api_secret = args[0], args[1]
     # Stored under the user's own secrets dir; values are NEVER logged or echoed.
     store_limitless_creds(s.secrets_dir, u.telegram_user_id, api_key, api_secret)
-    await update.message.reply_text(
-        "✅ Limitless API key linked (stored securely). You're in the "
-        "arbitrage pool once you deposit."
+    # The user's message contains their live API secret — scrub it from the
+    # Telegram chat history so it doesn't linger in scrollback or on Telegram's
+    # servers. Best-effort: requires no special admin right in a private chat,
+    # but never fail the link if deletion is refused.
+    deleted = False
+    try:
+        await update.message.delete()
+        deleted = True
+    except Exception as e:  # noqa: BLE001 — deletion is a nicety, not the contract
+        log.info("linklimitless_msg_delete_failed", error=str(e))
+    confirm = (
+        "✅ Limitless API key linked. It's stored in your own isolated "
+        "profile (file-locked, never shown again)"
+        + (" and I deleted your message with the key." if deleted
+           else ". Tip: delete your message above so the key isn't left in "
+                "the chat.")
+        + " You're in the arbitrage pool once you deposit."
     )
+    # Send to the chat directly — update.message may be gone after delete().
+    await ctx.bot.send_message(chat_id=update.effective_chat.id, text=confirm)
 
 
 # Lazily constructed so importing this module never needs settings; tests

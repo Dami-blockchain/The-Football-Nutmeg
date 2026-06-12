@@ -30,10 +30,19 @@ class _FakeTGMessage:
         self.chat_id = chat_id
         self.replies: list[str] = []
         self.markups: list[object] = []
+        self.deleted = False
 
     async def reply_text(self, text: str, **kwargs) -> None:
         self.replies.append(text)
         self.markups.append(kwargs.get("reply_markup"))
+
+    async def delete(self) -> None:
+        self.deleted = True
+
+
+class _FakeChat:
+    def __init__(self, chat_id: int = 999):
+        self.id = chat_id
 
 
 class _FakeCallbackQuery:
@@ -67,9 +76,10 @@ class _FakeContext:
 
 
 class _FakeUpdateMsg:
-    def __init__(self, user_id: int, text: str = ""):
+    def __init__(self, user_id: int, text: str = "", chat_id: int = 999):
         self.effective_user = _FakeTGUser(user_id)
-        self.message = _FakeTGMessage(text)
+        self.message = _FakeTGMessage(text, chat_id=chat_id)
+        self.effective_chat = _FakeChat(chat_id)
         self.callback_query = None
 
 
@@ -189,8 +199,11 @@ async def test_linklimitless_stores_creds_securely(tg_env):
     # Contents correct
     data = json.loads(creds.read_text())
     assert data == {"api_key": "MYKEY", "api_secret": "MYSECRET"}
-    # Reply does NOT contain the secret or key
-    [reply] = update.message.replies
+    # The secret-bearing message is scrubbed from the chat.
+    assert update.message.deleted is True
+    # Confirmation goes to the chat (message is gone), NOT as a reply, and
+    # never echoes the key or secret.
+    [(_chat_id, reply)] = ctx.bot.messages
     assert "MYSECRET" not in reply
     assert "MYKEY" not in reply
     assert "linked" in reply.lower()
