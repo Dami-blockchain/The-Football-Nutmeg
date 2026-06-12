@@ -101,12 +101,22 @@ class PolymarketAdapter:
             # CLOB/web3 stack unless an adapter actually talks to the CLOB.
             from py_clob_client_v2.client import ClobClient
 
-            self._clob = ClobClient(
+            clob = ClobClient(
                 host=self._clob_host,
                 chain_id=self._chain_id,
                 key=self._private_key,
                 funder=self._funder,
             )
+            # CLOB v2 needs L2 API credentials derived from the wallet
+            # signature before any order endpoint will accept a request —
+            # without this every order fails with "API Credentials are needed
+            # to interact with this endpoint!". Derive (or create) them once
+            # per client and attach. create_or_derive returns the existing
+            # creds for this key if they exist, else mints new ones — safe and
+            # idempotent per wallet.
+            creds = clob.create_or_derive_api_key()
+            clob.set_api_creds(creds)
+            self._clob = clob
         return self._clob
 
     # ------------------------------------------------------------------

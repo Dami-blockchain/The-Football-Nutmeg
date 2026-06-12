@@ -35,6 +35,13 @@ class FakeClob:
         self.order_calls.append(order_args)
         return self._order_resp
 
+    def create_or_derive_api_key(self):
+        self.derived = True
+        return {"api_key": "k", "secret": "s", "passphrase": "p"}
+
+    def set_api_creds(self, creds):
+        self.creds_set = creds
+
 
 def _layout_b_event():
     return {
@@ -203,3 +210,39 @@ async def test_place_order_posts_when_double_gated_open():
     assert result.order_id == "0xabc"
     assert result.status == "matched"
     assert result.exchange is ExchangeName.POLYMARKET
+
+
+async def test_get_clob_derives_and_sets_api_creds(monkeypatch):
+    """CLOB v2 rejects every order endpoint until L2 API creds are derived
+    from the wallet and attached. _get_clob must do that on construction —
+    otherwise live orders fail with 'API Credentials are needed'."""
+    import sys
+    import types
+
+    calls: dict = {}
+
+    class _FakeClobClient:
+        def __init__(self, **kw):
+            calls["init_kwargs"] = kw
+
+        def create_or_derive_api_key(self):
+            calls["derived"] = True
+            return {"api_key": "k", "secret": "s", "passphrase": "p"}
+
+        def set_api_creds(self, creds):
+            calls["creds_set"] = creds
+
+    fake_mod = types.ModuleType("py_clob_client_v2.client")
+    fake_mod.ClobClient = _FakeClobClient
+    monkeypatch.setitem(sys.modules, "py_clob_client_v2.client", fake_mod)
+
+    # No clob injected → _get_clob constructs a real (here faked) client.
+    a = _adapter([], enable_orders=True, mode="live")
+    clob = a._get_clob()
+
+    assert calls.get("derived") is True, "must derive API creds on construction"
+    assert calls.get("creds_set") == {"api_key": "k", "secret": "s", "passphrase": "p"}
+    # Cached — a second call must not re-derive.
+    calls.clear()
+    assert a._get_clob() is clob
+    assert "derived" not in calls
