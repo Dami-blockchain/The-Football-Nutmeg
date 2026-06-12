@@ -53,5 +53,10 @@ aliases:
   "Côte d'Ivoire": ["Ivory Coast", "Cote d'Ivoire"]
   "China PR": ["China"]
   "Cabo Verde": ["Cape Verde"]
+  # football-data.org names these differently from the results dataset; the
+  # canonical key here is the football-data spelling the engine queries by.
+  "Cape Verde Islands": ["Cape Verde", "Cabo Verde", "CPV"]
+  "Congo DR": ["DR Congo", "Democratic Republic of the Congo", "DR Congo", "Congo-Kinshasa", "COD"]
+  "Bosnia-Herzegovina": ["Bosnia and Herzegovina", "Bosnia", "BIH"]
   "South Africa": ["RSA", "Bafana Bafana"]
   "Mexico": ["MEX", "El Tri"]

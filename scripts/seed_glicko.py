@@ -73,7 +73,42 @@ def _seed_from_csv(path: Path, settings) -> int:
 
     for name, r in ratings.items():
         upsert_rating(name, r)
-    return len(ratings)
+
+    # The results dataset and football-data.org spell some nations differently
+    # (e.g. dataset "Czech Republic" vs WC "Czechia", "DR Congo" vs "Congo DR").
+    # The engine looks up ratings by the WC fixture's football-data name, so
+    # also store each WC team's rating under THAT canonical name — resolved via
+    # the same alias table the market matcher uses (exact/alias first, fuzzy
+    # fallback). Without this, mis-spelled teams silently fall back to default.
+    aliased = _alias_wc_teams(ratings)
+    return len(ratings) + aliased
+
+
+def _alias_wc_teams(ratings: dict[str, "Glicko2Rating"]) -> int:
+    """Copy each WC team's history rating to its football-data name."""
+    from betbot.exchanges.matcher import TeamAliasResolver, normalize
+
+    fund_csv = Path("data/fundamentals_2026.csv")
+    if not fund_csv.exists():
+        return 0
+    wc_names = [row["team"] for row in csv.DictReader(fund_csv.open())]
+    resolver = TeamAliasResolver.from_yaml("config/team_aliases.yaml")
+    dataset_names = list(ratings)
+    norm_existing = {normalize(n) for n in dataset_names}
+
+    n = 0
+    for wc in wc_names:
+        if normalize(wc) in norm_existing:
+            continue  # the dataset already uses this exact spelling
+        match = resolver.match(wc, dataset_names)
+        if match is not None:
+            upsert_rating(wc, ratings[match])
+            log.info("glicko_alias_seeded", wc_team=wc, dataset_team=match,
+                     rating=round(ratings[match].rating))
+            n += 1
+        else:
+            log.warning("glicko_alias_unresolved", wc_team=wc)
+    return n
 
 
 async def _seed_wc_teams(settings) -> int:
