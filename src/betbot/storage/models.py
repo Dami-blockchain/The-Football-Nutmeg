@@ -281,6 +281,9 @@ class User(Base):
     wallet_address: Mapped[str] = mapped_column(String(64))
     wallet_keyfile: Mapped[str] = mapped_column(String(255))
     active: Mapped[bool] = mapped_column(default=True)
+    # Set True once the user taps the cross-venue arbitrage "tell me more"
+    # button on /start. Drives the Limitless-onboarding follow-up.
+    arb_interest: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )

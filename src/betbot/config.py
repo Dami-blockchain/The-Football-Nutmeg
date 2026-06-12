@@ -268,6 +268,13 @@ class Settings(BaseSettings):
         default=10, alias="BETBOT_ARB_SCAN_INTERVAL_MIN"
     )
     arb_scan_limit: int = Field(default=80, alias="BETBOT_ARB_SCAN_LIMIT")
+    # Optional how-to video shown when a user signals arbitrage interest on
+    # /start. Either a public URL or a Telegram file_id works with send_video.
+    # Empty = the bot sends a graceful "video coming" note; the written guide
+    # below it covers everything regardless.
+    arb_guide_video_url: str = Field(
+        default="", alias="BETBOT_ARB_GUIDE_VIDEO_URL"
+    )
 
     # ---- Arbitrage EXECUTION (heavily gated; OFF by default) ----------
     # Master switch. Even when true, execution also requires mode=live, a clear

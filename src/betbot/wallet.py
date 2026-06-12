@@ -13,6 +13,7 @@ double-checked live-order path (Phase 5).
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -84,6 +85,38 @@ def get_or_create_address(keyfile: str | Path) -> str:
         note="BACK UP THIS KEYFILE — it controls real funds",
     )
     return acct.address
+
+
+def limitless_creds_path(secrets_dir: str | Path, telegram_user_id: int) -> Path:
+    """Path to a user's own Limitless API creds file.
+
+    Mirrors the per-user wallet key layout — ``<secrets_dir>/users/<id>.key``
+    — with a sibling ``<id>.limitless.json`` so each user's Limitless key lives
+    in their isolated profile, never pooled, never in git (``.secrets/`` is
+    gitignored).
+    """
+    return Path(secrets_dir) / "users" / f"{telegram_user_id}.limitless.json"
+
+
+def store_limitless_creds(
+    secrets_dir: str | Path, telegram_user_id: int, api_key: str, api_secret: str
+) -> Path:
+    """Write a user's Limitless API key/secret to their 0600 creds file.
+
+    NEVER logs or returns the key/secret. Follows the wallet keyfile pattern:
+    a per-user file under ``.secrets/users/`` written mode 0600.
+
+    NOTE: this CAPTURES + STORES the per-user Limitless key only. WIRING it into
+    live order placement (e.g. make_signer_adapters) is a deliberate follow-up —
+    nothing here yet uses these creds to trade.
+    """
+    p = limitless_creds_path(secrets_dir, telegram_user_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"api_key": api_key, "api_secret": api_secret}))
+    p.chmod(0o600)
+    # Deliberately log only the FACT, never the values.
+    log.info("limitless_creds_stored", telegram_user_id=telegram_user_id)
+    return p
 
 
 def get_private_key(keyfile: str | Path) -> str | None:

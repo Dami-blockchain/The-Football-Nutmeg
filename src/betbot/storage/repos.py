@@ -820,6 +820,19 @@ def get_user(telegram_user_id: int) -> User | None:
         return u
 
 
+def set_arb_interest(telegram_user_id: int, value: bool) -> bool:
+    """Persist whether a user opted into cross-venue arbitrage. Returns False
+    if the user doesn't exist (caller should register first)."""
+    with session_scope() as s:
+        u = s.execute(
+            select(User).where(User.telegram_user_id == telegram_user_id)
+        ).scalar_one_or_none()
+        if u is None:
+            return False
+        u.arb_interest = value
+        return True
+
+
 def list_users() -> list[User]:
     with session_scope() as s:
         rows = list(

@@ -12,10 +12,11 @@ set:  python -m betbot.telegram_bot
 
 from __future__ import annotations
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -28,10 +29,69 @@ from betbot.gate import evaluate_gate
 from betbot.llm_agent import LLMAgent
 from betbot.logging import configure_logging, get_logger
 from betbot.storage.db import init_engine
-from betbot.storage.repos import get_or_create_user, get_user, list_recent_paper_bets
-from betbot.wallet import all_balances
+from betbot.storage.repos import (
+    get_or_create_user,
+    get_user,
+    list_recent_paper_bets,
+    set_arb_interest,
+)
+from betbot.wallet import all_balances, store_limitless_creds
 
 log = get_logger(__name__)
+
+# Callback data for the /start cross-venue-arbitrage opt-in button.
+ARB_INTEREST_CB = "arb_interest"
+
+# Cross-venue arbitrage explainer, sent when a user opts in.
+ARB_EXPLAINER = (
+    "🔁 *Cross-venue arbitrage*\n\n"
+    "Sometimes the same match is priced differently on Polymarket and "
+    "Limitless. When the gap is big enough, I can buy *both* sides — one on "
+    "each venue — so you lock a profit no matter who wins. I only fire when "
+    "the locked margin clears *2%*, size within strict caps, and never chase "
+    "a half-filled trade.\n\n"
+    "To include you, I trade the Polymarket leg from your wallet "
+    "automatically. The *Limitless* leg needs you to open a Limitless account "
+    "once and link an API key — here's how. 👇"
+)
+
+# Step-by-step Limitless onboarding, sent after the explainer (+ optional video).
+LIMITLESS_GUIDE = (
+    "📋 *Open Limitless + get your API key* (about 3 minutes)\n\n"
+    "1. Go to *app.limitless.exchange* and connect your wallet (it uses Privy "
+    "— email or wallet sign-in both work).\n"
+    "2. Fund your Limitless account with *USDC on Base* — this is the chain "
+    "Limitless settles on.\n"
+    "3. Open *Settings → API / Developer*, and *Create an API key* with the "
+    "*trading* scope.\n"
+    "4. Copy your *API key* and *secret* immediately — Limitless shows the "
+    "secret *only once*, and creating a new key revokes the old one.\n"
+    "5. Send them to me here with:\n"
+    "`/linklimitless <api_key> <api_secret>`\n\n"
+    "🔒 Your key is stored encrypted-at-rest on your own isolated profile, "
+    "never shown again, and only used to place *your* Limitless arbitrage "
+    "orders. Send it in this direct chat only."
+)
+
+# Sent in place of the video when arb_guide_video_url is unset.
+ARB_VIDEO_FALLBACK = (
+    "🎬 A short video walkthrough is on the way — the written guide below "
+    "covers every step in the meantime."
+)
+
+# Operator: record ~90s screen capture covering:
+#   (0-12s)  What arb is: same match, two venues, different prices → buy both
+#            sides → profit locked regardless of result.
+#   (12-28s) How the bot does it: scans Polymarket + Limitless every cycle,
+#            only fires at >=2% locked margin, sizes within caps,
+#            both-legs-or-abort.
+#   (28-42s) What you need: deposit >=10 USDC; the Polymarket leg is automatic;
+#            the Limitless leg needs your own Limitless account + API key.
+#   (42-80s) Open Limitless: app.limitless.exchange → connect wallet (Privy) →
+#            fund with USDC on Base → Settings/API → Create key (trading scope)
+#            → copy key + secret (shown once).
+#   (80-90s) Link it: send /linklimitless <key> <secret> to the bot. Done —
+#            you're in the arb pool.
 
 
 def _allowed(update: Update) -> bool:
@@ -102,6 +162,16 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "future results. This is not financial advice — only deposit what "
         "you can afford to lose.",
         parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "🔁 Cross-venue arbitrage — tell me more",
+                        callback_data=ARB_INTEREST_CB,
+                    )
+                ]
+            ]
+        ),
     )
 
 
@@ -162,6 +232,74 @@ async def bets_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("*Recent bets*\n" + "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
+@_authed
+async def arb_interest_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """User tapped the cross-venue-arbitrage opt-in button on /start.
+
+    Persists arb_interest=True, answers the callback, then sends three things
+    in order: the explainer, a how-to video (or a graceful fallback note), and
+    the Limitless onboarding guide.
+    """
+    s = get_settings()
+    query = update.callback_query
+    user = update.effective_user
+    # Make sure the user exists (and so the flag has somewhere to live) — a
+    # callback can in principle arrive before any other handler registered them.
+    _register(update)
+    set_arb_interest(user.id, True)
+    await query.answer()
+
+    chat_id = query.message.chat_id
+    # (a) explainer
+    await ctx.bot.send_message(
+        chat_id, ARB_EXPLAINER, parse_mode=ParseMode.MARKDOWN
+    )
+    # (b) video, or graceful fallback. A bad URL/file_id must never break the
+    # flow — fall back to the text note.
+    if s.arb_guide_video_url:
+        try:
+            await ctx.bot.send_video(chat_id, video=s.arb_guide_video_url)
+        except Exception as e:  # noqa: BLE001 — a bad URL can't break onboarding
+            log.warning("arb_guide_video_failed", error=str(e))
+            await ctx.bot.send_message(chat_id, ARB_VIDEO_FALLBACK)
+    else:
+        await ctx.bot.send_message(chat_id, ARB_VIDEO_FALLBACK)
+    # (c) Limitless onboarding guide + the /linklimitless instruction.
+    await ctx.bot.send_message(
+        chat_id, LIMITLESS_GUIDE, parse_mode=ParseMode.MARKDOWN
+    )
+
+
+@_authed
+async def linklimitless_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Capture + store a user's OWN Limitless API key/secret, 0600, never echoed.
+
+    Usage: ``/linklimitless <api_key> <api_secret>``.
+
+    NOTE: this CAPTURES + STORES the per-user Limitless key only. WIRING it into
+    live order placement (make_signer_adapters) is a deliberate follow-up — the
+    stored key is not yet used to place any order. Do not claim it trades yet.
+    """
+    s = get_settings()
+    u = _register(update)
+    args = ctx.args if ctx is not None else None
+    if not args or len(args) < 2:
+        await update.message.reply_text(
+            "Usage: `/linklimitless <api_key> <api_secret>`\n\n"
+            "🔒 Send this in a direct message only; the key is stored "
+            "encrypted-at-rest on your isolated profile and never shown again.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    api_key, api_secret = args[0], args[1]
+    # Stored under the user's own secrets dir; values are NEVER logged or echoed.
+    store_limitless_creds(s.secrets_dir, u.telegram_user_id, api_key, api_secret)
+    await update.message.reply_text(
+        "✅ Limitless API key linked (stored securely). You're in the "
+        "arbitrage pool once you deposit."
+    )
+
+
 # Lazily constructed so importing this module never needs settings; tests
 # inject their own agent by assigning to ``_llm_agent``.
 _llm_agent: LLMAgent | None = None
@@ -198,6 +336,10 @@ def build_application(settings) -> Application:
     app.add_handler(CommandHandler("balance", balance_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("bets", bets_cmd))
+    app.add_handler(CommandHandler("linklimitless", linklimitless_cmd))
+    # Inline-button opt-in for cross-venue arbitrage. Registered before the
+    # catch-all MessageHandler so it's never shadowed.
+    app.add_handler(CallbackQueryHandler(arb_interest_cb, pattern=f"^{ARB_INTEREST_CB}$"))
     # Free-text → LLM assistant. Added LAST so commands keep priority.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_handler))
     return app
