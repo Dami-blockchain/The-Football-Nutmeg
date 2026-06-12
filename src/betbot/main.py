@@ -74,6 +74,28 @@ app.add_typer(arb_app, name="arb")
 # ----------------------------------------------------------------------
 # Exchange routing
 # ----------------------------------------------------------------------
+class _ClientGroup:
+    """A closeable bag of HTTP clients created lazily during a run.
+
+    Lets ``_build_router`` hand the caller ONE entry in its close list that, on
+    ``close()``, closes every per-user client built after the router was made.
+    Closing is best-effort: one client's failure doesn't block the rest.
+    """
+
+    def __init__(self) -> None:
+        self._clients: list = []
+
+    def add(self, client) -> None:
+        self._clients.append(client)
+
+    async def close(self) -> None:
+        for c in self._clients:
+            try:
+                await c.close()
+            except Exception as e:  # noqa: BLE001 — cleanup must not raise
+                get_logger(__name__).warning("client_close_failed", error=str(e))
+
+
 def _build_router(settings) -> tuple[ExchangeRouter, list, object]:
     """Construct the exchange router for a run.
 
@@ -105,29 +127,74 @@ def _build_router(settings) -> tuple[ExchangeRouter, list, object]:
         api_secret=settings.limitless_api_secret,
     )
 
-    def make_signer_adapters(*, signing_key: str | None, funder: str | None = None) -> dict:
-        """Venue adapters bound to one signing key (shares the HTTP clients)."""
+    # Per-user LimitlessClients (one per linked key) are created lazily as
+    # funded users are processed, and live for the run. They're gathered in a
+    # _ClientGroup so the caller's uniform ``await client.close()`` cleanup loop
+    # closes all of them without knowing they exist.
+    user_clients = _ClientGroup()
+
+    def make_signer_adapters(
+        *,
+        signing_key: str | None,
+        funder: str | None = None,
+        limitless_creds: dict | None = None,
+        agent_fallback: bool = False,
+    ) -> dict:
+        """Venue adapters bound to one signing key.
+
+        Polymarket is always present. Limitless is per-account:
+
+        * ``limitless_creds`` given → build a dedicated ``LimitlessClient`` with
+          THAT user's api_key/secret and a ``LimitlessAdapter`` signing with
+          THAT user's wallet key, so the order authenticates AND signs as the
+          key owner (Limitless keys are scoped to their own wallet/profile).
+        * ``agent_fallback=True`` → reuse the shared agent client built from
+          ``settings.limitless_api_key/secret`` (the no-user / global path,
+          unchanged from before).
+        * otherwise (a real user with no linked key) → OMIT Limitless entirely,
+          so the user's Polymarket leg still trades but no Limitless order is
+          ever attempted under the wrong (shared/agent) credentials.
+
+        Shares the Polymarket HTTP client (``gamma``) across all adapters.
+        """
         pm = PolymarketAdapter(
             gamma, resolver, enable_orders=enable, mode=settings.mode,
             private_key=signing_key, funder=funder,
         )
-        lm = LimitlessAdapter(
-            limitless_client, resolver, enable_orders=enable, mode=settings.mode,
-            private_key=signing_key, fee_rate_bps=settings.limitless_fee_rate_bps,
-            max_order_usd=settings.max_bet_usd,
-        )
-        return {ExchangeName.POLYMARKET: pm, ExchangeName.LIMITLESS: lm}
+        adapters: dict = {ExchangeName.POLYMARKET: pm}
+
+        lm_client: LimitlessClient | None = None
+        if limitless_creds is not None:
+            lm_client = LimitlessClient(
+                api_key=limitless_creds.get("api_key", ""),
+                api_secret=limitless_creds.get("api_secret", ""),
+            )
+            user_clients.add(lm_client)
+        elif agent_fallback:
+            lm_client = limitless_client
+
+        if lm_client is not None:
+            adapters[ExchangeName.LIMITLESS] = LimitlessAdapter(
+                lm_client, resolver, enable_orders=enable, mode=settings.mode,
+                private_key=signing_key, fee_rate_bps=settings.limitless_fee_rate_bps,
+                max_order_usd=settings.max_bet_usd,
+            )
+        return adapters
 
     base = make_signer_adapters(
         signing_key=settings.polymarket_private_key or agent_key,
         funder=settings.polymarket_funder or None,
+        agent_fallback=True,
     )
     router = ExchangeRouter(
         [base[ExchangeName.POLYMARKET], base[ExchangeName.LIMITLESS]],
         min_plausible_price=settings.min_plausible_price,
         max_plausible_price=settings.max_plausible_price,
     )
-    return router, [gamma, limitless_client], make_signer_adapters
+    # ``user_clients`` is a single closeable that fans out to every per-user
+    # Limitless client built mid-run, so the caller's uniform close loop reaches
+    # them all.
+    return router, [gamma, limitless_client, user_clients], make_signer_adapters
 
 
 # ----------------------------------------------------------------------
@@ -472,34 +539,68 @@ async def _place_live_for_users(
 
     # Per-user path: size each order against that user's balance on the venue's
     # chain. betbot.wallet pulls in web3, so import it only here.
-    from betbot.wallet import get_private_key, usdc_balance
+    from betbot.wallet import get_private_key, load_limitless_creds, usdc_balance
 
     chain = "polygon" if venue == ExchangeName.POLYMARKET else "base"
     rpc = settings.polygon_rpc_url if chain == "polygon" else settings.base_rpc_url
 
     for u in users:
         who = f"user:{u.telegram_user_id}"
-        key = get_private_key(Path(u.wallet_keyfile))
-        if not key:
-            log.warning("user_key_missing", who=who, keyfile=u.wallet_keyfile)
-            continue
-        bal = usdc_balance(u.wallet_address, chain, rpc)
-        stake = min(decision.stake_usd, bal.usdc) if bal.ok else 0.0
-        if stake < settings.min_user_stake_usd:
-            log.info(
-                "user_bet_skipped_low_balance",
-                who=who, chain=chain,
-                balance=round(bal.usdc, 2) if bal.ok else None,
-                need=settings.min_user_stake_usd,
+        # Per-user isolation: one user's bad key / RPC blip / adapter build error
+        # must not abort placement for everyone else (or the next fixture). The
+        # decided paper bet is already persisted regardless.
+        try:
+            key = get_private_key(Path(u.wallet_keyfile))
+            if not key:
+                log.warning("user_key_missing", who=who, keyfile=u.wallet_keyfile)
+                continue
+            bal = usdc_balance(u.wallet_address, chain, rpc)
+            stake = min(decision.stake_usd, bal.usdc) if bal.ok else 0.0
+            if stake < settings.min_user_stake_usd:
+                log.info(
+                    "user_bet_skipped_low_balance",
+                    who=who, chain=chain,
+                    balance=round(bal.usdc, 2) if bal.ok else None,
+                    need=settings.min_user_stake_usd,
+                )
+                continue
+            adapters = user_adapter_cache.get(u.wallet_keyfile)
+            if adapters is None:
+                # Each user trades their OWN Limitless account: pass THEIR linked
+                # api_key/secret (or None → no Limitless leg for them). Polymarket
+                # is always built and unaffected.
+                creds = load_limitless_creds(
+                    settings.secrets_dir, u.telegram_user_id
+                )
+                adapters = make_signer_adapters(
+                    signing_key=key,
+                    funder=u.wallet_address,
+                    limitless_creds=creds,
+                )
+                user_adapter_cache[u.wallet_keyfile] = adapters
+            adapter = adapters.get(venue)
+            if adapter is None:
+                # Venue is Limitless but this user hasn't linked a Limitless key.
+                # Skip their Limitless leg only — their Polymarket leg (a separate
+                # fixture/route) still trades. Logged once per (user, fixture).
+                log.info(
+                    "user_limitless_unlinked_skipped",
+                    who=who,
+                    fixture_id=prediction.fixture_id,
+                    venue=str(getattr(venue, "value", venue)),
+                    note="no linked Limitless key — skipping this user's Limitless leg",
+                )
+                continue
+            await _place_one(
+                adapter, route, prediction, decision, stake, max_price, who=who,
             )
-            continue
-        adapters = user_adapter_cache.get(u.wallet_keyfile)
-        if adapters is None:
-            adapters = make_signer_adapters(signing_key=key, funder=u.wallet_address)
-            user_adapter_cache[u.wallet_keyfile] = adapters
-        await _place_one(
-            adapters[venue], route, prediction, decision, stake, max_price, who=who,
-        )
+        except Exception as e:  # noqa: BLE001 — isolate per-user placement failures
+            log.error(
+                "user_placement_failed",
+                who=who,
+                fixture_id=prediction.fixture_id,
+                error=str(e),
+            )
 
 
 # ----------------------------------------------------------------------

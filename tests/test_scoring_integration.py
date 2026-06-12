@@ -218,7 +218,7 @@ async def test_multi_user_places_on_each_funded_wallet(fresh_db, settings, tmp_p
 
     built = []
 
-    def fake_make(*, signing_key, funder=None):
+    def fake_make(*, signing_key, funder=None, limitless_creds=None):
         adapters = {ExchangeName.POLYMARKET: FakeAdapter(),
                     ExchangeName.LIMITLESS: FakeAdapter()}
         built.append((funder, adapters))
@@ -259,7 +259,7 @@ async def test_multi_user_sizes_down_to_balance(fresh_db, settings, tmp_path, mo
 
     built = []
 
-    def fake_make(*, signing_key, funder=None):
+    def fake_make(*, signing_key, funder=None, limitless_creds=None):
         d = {ExchangeName.POLYMARKET: FakeAdapter(), ExchangeName.LIMITLESS: FakeAdapter()}
         built.append(d)
         return d
@@ -292,7 +292,7 @@ async def test_multi_user_wc_guard_blocks_all(fresh_db, settings, tmp_path, monk
 
     built = []
 
-    def fake_make(*, signing_key, funder=None):
+    def fake_make(*, signing_key, funder=None, limitless_creds=None):
         d = {ExchangeName.POLYMARKET: FakeAdapter(), ExchangeName.LIMITLESS: FakeAdapter()}
         built.append(d)
         return d

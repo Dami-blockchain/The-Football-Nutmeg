@@ -119,6 +119,42 @@ def store_limitless_creds(
     return p
 
 
+def load_limitless_creds(
+    secrets_dir: str | Path, telegram_user_id: int
+) -> dict | None:
+    """Load a user's own Limitless API creds, or ``None`` if unavailable.
+
+    Returns ``{"api_key", "api_secret"}`` read from the user's
+    ``.secrets/users/<id>.limitless.json`` (written by
+    :func:`store_limitless_creds` when they run ``/linklimitless``), or ``None``
+    if the file is absent, unreadable, corrupt, or missing either field. A user
+    without linked creds simply doesn't trade their Limitless leg — the caller
+    skips it rather than falling back to the shared agent key (wrong account).
+
+    NEVER logs the key/secret values.
+    """
+    p = limitless_creds_path(secrets_dir, telegram_user_id)
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text())
+    except (OSError, ValueError) as e:  # unreadable or corrupt JSON
+        # Log the FACT + reason, never the contents.
+        log.warning(
+            "limitless_creds_unreadable",
+            telegram_user_id=telegram_user_id,
+            error=str(e),
+        )
+        return None
+    if not isinstance(data, dict):
+        return None
+    api_key = data.get("api_key")
+    api_secret = data.get("api_secret")
+    if not api_key or not api_secret:
+        return None
+    return {"api_key": api_key, "api_secret": api_secret}
+
+
 def get_private_key(keyfile: str | Path) -> str | None:
     """Return the agent wallet's private key (hex) from the keyfile, or None.
 
