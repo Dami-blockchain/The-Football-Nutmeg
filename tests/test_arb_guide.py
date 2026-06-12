@@ -122,8 +122,9 @@ async def test_start_shows_arb_inline_button(tg_env):
 # ----------------------------------------------------------------------
 # arb_interest callback: flag + explainer + video/fallback + guide
 # ----------------------------------------------------------------------
-async def test_arb_interest_sets_flag_and_sends_three_with_fallback(tg_env):
-    # No video URL configured → graceful fallback note, no send_video.
+async def test_arb_interest_sets_flag_and_sends_full_written_guide(tg_env):
+    # No video URL configured → the detailed written walkthrough IS the guide;
+    # no "coming soon" placeholder, no send_video call.
     update = _FakeUpdateCallback(user_id=20)
     bot = _FakeBot()
     ctx = _FakeContext(bot)
@@ -134,14 +135,16 @@ async def test_arb_interest_sets_flag_and_sends_three_with_fallback(tg_env):
     assert get_user(20).arb_interest is True
 
     texts = [t for _, t in bot.messages]
-    assert len(texts) == 3
-    assert texts[0] == tb.ARB_EXPLAINER
-    assert texts[1] == tb.ARB_VIDEO_FALLBACK
-    assert texts[2] == tb.LIMITLESS_GUIDE
+    # explainer + every walkthrough part, in order.
+    assert texts == [tb.ARB_EXPLAINER, *tb.LIMITLESS_GUIDE_PARTS]
     assert bot.videos == []  # no URL → never tries send_video
+    # The final part carries the /linklimitless call-to-action.
+    assert "/linklimitless" in texts[-1]
+    # The walkthrough is genuinely detailed (multi-step).
+    assert len(tb.LIMITLESS_GUIDE_PARTS) >= 4
 
 
-async def test_arb_interest_sends_video_when_url_set(tmp_path, monkeypatch):
+async def test_arb_interest_sends_video_then_full_guide_when_url_set(tmp_path, monkeypatch):
     init_engine(tmp_path / "bot.sqlite")
     s = _settings(
         BETBOT_WALLET_KEYFILE=str(tmp_path / "secrets" / "agent.key"),
@@ -157,11 +160,11 @@ async def test_arb_interest_sends_video_when_url_set(tmp_path, monkeypatch):
 
     assert bot.videos == [(update.callback_query.message.chat_id, "https://example.com/arb.mp4")]
     texts = [t for _, t in bot.messages]
-    # explainer + guide (the video took the middle slot, not the fallback)
-    assert texts == [tb.ARB_EXPLAINER, tb.LIMITLESS_GUIDE]
+    # explainer + the full written walkthrough (video is an extra, not a swap).
+    assert texts == [tb.ARB_EXPLAINER, *tb.LIMITLESS_GUIDE_PARTS]
 
 
-async def test_arb_interest_bad_video_falls_back_without_breaking(tmp_path, monkeypatch):
+async def test_arb_interest_bad_video_still_sends_full_guide(tmp_path, monkeypatch):
     init_engine(tmp_path / "bot.sqlite")
     s = _settings(
         BETBOT_WALLET_KEYFILE=str(tmp_path / "secrets" / "agent.key"),
@@ -176,7 +179,8 @@ async def test_arb_interest_bad_video_falls_back_without_breaking(tmp_path, monk
     await tb.arb_interest_cb(update, ctx)  # must not raise
 
     texts = [t for _, t in bot.messages]
-    assert texts == [tb.ARB_EXPLAINER, tb.ARB_VIDEO_FALLBACK, tb.LIMITLESS_GUIDE]
+    # A broken video URL is swallowed; the written walkthrough still arrives.
+    assert texts == [tb.ARB_EXPLAINER, *tb.LIMITLESS_GUIDE_PARTS]
     assert get_user(22).arb_interest is True
 
 

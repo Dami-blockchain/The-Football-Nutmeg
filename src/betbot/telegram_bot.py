@@ -55,30 +55,72 @@ ARB_EXPLAINER = (
     "once and link an API key — here's how. 👇"
 )
 
-# Step-by-step Limitless onboarding, sent after the explainer (+ optional video).
-LIMITLESS_GUIDE = (
-    "📋 *Open Limitless + get your API key* (about 3 minutes)\n\n"
-    "1. Go to *app.limitless.exchange* and connect your wallet (it uses Privy "
-    "— email or wallet sign-in both work).\n"
-    "2. Fund your Limitless account with *USDC on Base* — this is the chain "
-    "Limitless settles on.\n"
-    "3. Open *Settings → API / Developer*, and *Create an API key* with the "
-    "*trading* scope.\n"
-    "4. Copy your *API key* and *secret* immediately — Limitless shows the "
-    "secret *only once*, and creating a new key revokes the old one.\n"
-    "5. Send them to me here with:\n"
-    "`/linklimitless <api_key> <api_secret>`\n\n"
-    "🔒 Your key is stored encrypted-at-rest on your own isolated profile, "
-    "never shown again, and only used to place *your* Limitless arbitrage "
-    "orders. Send it in this direct chat only."
+# Very detailed step-by-step Limitless onboarding, sent after the explainer
+# (and after the optional video). Split into a few Telegram messages so each
+# step is easy to read on a phone and the whole thing isn't one wall of text.
+# These are sent in order; LIMITLESS_GUIDE_PARTS[-1] carries the /linklimitless
+# call-to-action.
+LIMITLESS_GUIDE_PARTS = (
+    # Part 1 — what you're about to do + the one prerequisite.
+    "📋 *Set up Limitless — full walkthrough*\n"
+    "_About 5 minutes. Follow it with app.limitless.exchange open beside this "
+    "chat. You only ever do this once._\n\n"
+    "*What you'll end up with:* a Limitless account funded with USDC on the "
+    "Base network, and an API key you paste to me so I can place the Limitless "
+    "side of an arbitrage for you.\n\n"
+    "*Before you start, you need:* a crypto wallet (e.g. MetaMask, Rabby, or "
+    "any wallet app) — OR just an email address, since Limitless lets you sign "
+    "in with email and creates a wallet for you.",
+    # Part 2 — open the account.
+    "*Step 1 — Open your Limitless account*\n"
+    "1. On your phone or computer, go to *app.limitless.exchange*\n"
+    "2. Tap *Connect* (or *Sign in*) in the top corner.\n"
+    "3. Choose how to sign in:\n"
+    "   • *Email* — type your email, then the code they send you. Limitless "
+    "makes a wallet for you automatically.\n"
+    "   • *Wallet* — pick your wallet app (MetaMask etc.) and approve the "
+    "connection.\n"
+    "4. You're in when you can see your account/balance in the corner. ✅",
+    # Part 3 — fund it (the part people get wrong).
+    "*Step 2 — Add money (USDC on Base)*\n"
+    "Limitless runs on the *Base* network and trades in *USDC*. Your money "
+    "must be USDC *on Base* specifically — not Ethereum, not Polygon.\n\n"
+    "• If you bought USDC on an exchange (Coinbase, Binance…), withdraw it and "
+    "choose the *Base* network when asked, sending to your Limitless wallet "
+    "address.\n"
+    "• If your USDC is on another network, use any bridge (e.g. *bridge.base.org*) "
+    "to move it to Base first.\n"
+    "• Start small — even *10–20 USDC* is enough to take part.\n\n"
+    "⚠️ Picking the wrong network is the #1 mistake — double-check it says "
+    "*Base* before you confirm.",
+    # Part 4 — create the API key.
+    "*Step 3 — Create your API key*\n"
+    "1. In Limitless, open *Settings* (often a gear icon or your profile menu).\n"
+    "2. Find *API* (sometimes labelled *Developer* or *API keys*).\n"
+    "3. Tap *Create API key*. If it asks for a *scope* or *permission*, choose "
+    "*trading*.\n"
+    "4. Limitless now shows you an *API key* and an *API secret*.\n\n"
+    "🔑 *Copy BOTH immediately* — the *secret is shown only once*. If you lose "
+    "it you just make a new key (which replaces the old one). Paste them "
+    "somewhere safe for the next step.",
+    # Part 5 — hand it to the bot (CTA + security).
+    "*Step 4 — Link it to me*\n"
+    "Send me this message, pasting in your two values:\n\n"
+    "`/linklimitless YOUR_API_KEY YOUR_API_SECRET`\n\n"
+    "_Example:_ `/linklimitless lmts_ab12... sk_9f8e...`\n\n"
+    "🔒 *Your safety:* your key is saved only in your own isolated profile, "
+    "file-locked, never shown again, and used solely to place *your* Limitless "
+    "arbitrage orders. The moment you send it, I *delete your message* so the "
+    "key isn't left sitting in this chat. Only ever send it here, in this "
+    "direct chat — never in a group.\n\n"
+    "That's it — once you've also deposited, you're in the arbitrage pool. 🎉",
 )
 
-# Sent in place of the video when arb_guide_video_url is unset.
-ARB_VIDEO_FALLBACK = (
-    "🎬 A short video walkthrough is on the way — the written guide below "
-    "covers every step in the meantime."
-)
-
+# OPTIONAL extra: an operator can record the ~90s screen-capture (script below)
+# and set BETBOT_ARB_GUIDE_VIDEO_URL. The written walkthrough above is the
+# primary, self-sufficient guide — the video is a nice-to-have, never a missing
+# piece, so there is no "coming soon" placeholder when it's unset.
+#
 # Operator: record ~90s screen capture covering:
 #   (0-12s)  What arb is: same match, two venues, different prices → buy both
 #            sides → profit locked regardless of result.
@@ -254,20 +296,18 @@ async def arb_interest_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     await ctx.bot.send_message(
         chat_id, ARB_EXPLAINER, parse_mode=ParseMode.MARKDOWN
     )
-    # (b) video, or graceful fallback. A bad URL/file_id must never break the
-    # flow — fall back to the text note.
+    # (b) OPTIONAL video — only when the operator configured one. The written
+    # walkthrough below is the primary, complete guide, so there is no
+    # "coming soon" placeholder when no video is set. A bad URL/file_id must
+    # never break onboarding.
     if s.arb_guide_video_url:
         try:
             await ctx.bot.send_video(chat_id, video=s.arb_guide_video_url)
         except Exception as e:  # noqa: BLE001 — a bad URL can't break onboarding
             log.warning("arb_guide_video_failed", error=str(e))
-            await ctx.bot.send_message(chat_id, ARB_VIDEO_FALLBACK)
-    else:
-        await ctx.bot.send_message(chat_id, ARB_VIDEO_FALLBACK)
-    # (c) Limitless onboarding guide + the /linklimitless instruction.
-    await ctx.bot.send_message(
-        chat_id, LIMITLESS_GUIDE, parse_mode=ParseMode.MARKDOWN
-    )
+    # (c) the detailed Limitless walkthrough, one message per step.
+    for part in LIMITLESS_GUIDE_PARTS:
+        await ctx.bot.send_message(chat_id, part, parse_mode=ParseMode.MARKDOWN)
 
 
 @_authed
