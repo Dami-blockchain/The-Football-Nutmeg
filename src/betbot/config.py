@@ -159,6 +159,14 @@ class Settings(BaseSettings):
     # ---- Live-trading secrets (Phase 5; only used in live mode) -------
     polymarket_private_key: str = Field(default="", alias="POLYMARKET_PRIVATE_KEY")
     polymarket_funder: str = Field(default="", alias="POLYMARKET_FUNDER")
+    # CLOB signature type: 0=EOA, 1=POLY_PROXY (email/Magic deposit wallet),
+    # 2=POLY_GNOSIS_SAFE. A bare EOA is rejected on Polymarket v2 ("maker
+    # address not allowed, use the deposit wallet flow"); the working route
+    # for an automated wallet is a Magic/proxy wallet with type=1 + funder set
+    # to that proxy address. Default 0 keeps existing behaviour.
+    polymarket_signature_type: int = Field(
+        default=0, alias="POLYMARKET_SIGNATURE_TYPE"
+    )
     limitless_private_key: str = Field(default="", alias="LIMITLESS_PRIVATE_KEY")
     # Limitless API auth (create in the Limitless app: connect the agent wallet,
     # then derive a scoped API token). Without these, live orders can't post.

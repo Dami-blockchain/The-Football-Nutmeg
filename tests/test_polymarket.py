@@ -246,3 +246,38 @@ async def test_get_clob_derives_and_sets_api_creds(monkeypatch):
     calls.clear()
     assert a._get_clob() is clob
     assert "derived" not in calls
+
+
+async def test_get_clob_passes_signature_type_and_funder(monkeypatch):
+    """The Magic/proxy deposit-wallet route needs signature_type + funder
+    threaded into the CLOB client; a bare EOA (type 0) is rejected by
+    Polymarket v2 with 'maker address not allowed'."""
+    import sys
+    import types
+
+    calls: dict = {}
+
+    class _FakeClobClient:
+        def __init__(self, **kw):
+            calls["init_kwargs"] = kw
+
+        def create_or_derive_api_key(self):
+            return {"api_key": "k"}
+
+        def set_api_creds(self, creds):
+            pass
+
+    fake_mod = types.ModuleType("py_clob_client_v2.client")
+    fake_mod.ClobClient = _FakeClobClient
+    monkeypatch.setitem(sys.modules, "py_clob_client_v2.client", fake_mod)
+
+    a = PolymarketAdapter(
+        FakeGamma([]), TeamAliasResolver(),
+        enable_orders=True, mode="live",
+        private_key="0xabc", funder="0xPROXY", signature_type=1,
+    )
+    a._get_clob()
+    kw = calls["init_kwargs"]
+    assert kw["signature_type"] == 1
+    assert kw["funder"] == "0xPROXY"
+    assert kw["key"] == "0xabc"

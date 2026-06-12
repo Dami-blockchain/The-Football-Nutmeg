@@ -76,6 +76,7 @@ class PolymarketAdapter:
         chain_id: int = POLYGON_CHAIN_ID,
         private_key: str | None = None,
         funder: str | None = None,
+        signature_type: int = 0,
         clob_client: Any | None = None,
     ) -> None:
         self._gamma = gamma
@@ -86,6 +87,14 @@ class PolymarketAdapter:
         self._chain_id = chain_id
         self._private_key = private_key
         self._funder = funder
+        # CLOB signature type: 0=EOA (default), 1=POLY_PROXY (email/Magic
+        # deposit wallet), 2=POLY_GNOSIS_SAFE (browser proxy). A bare EOA on
+        # Polymarket v2 is rejected with "maker address not allowed, please
+        # use the deposit wallet flow"; the working route for an automated
+        # wallet is a Magic/proxy wallet with signature_type=1 and funder set
+        # to that proxy address (the EOA-deposit-wallet SDK path is bugged
+        # upstream — Polymarket/py-clob-client-v2#70).
+        self._signature_type = signature_type
         self._clob = clob_client  # injectable for tests; otherwise lazy-built
         self._events_cache: list[dict[str, Any]] | None = None
 
@@ -106,6 +115,7 @@ class PolymarketAdapter:
                 chain_id=self._chain_id,
                 key=self._private_key,
                 funder=self._funder,
+                signature_type=self._signature_type,
             )
             # CLOB v2 needs L2 API credentials derived from the wallet
             # signature before any order endpoint will accept a request —

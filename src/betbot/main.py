@@ -160,6 +160,7 @@ def _build_router(settings) -> tuple[ExchangeRouter, list, object]:
         pm = PolymarketAdapter(
             gamma, resolver, enable_orders=enable, mode=settings.mode,
             private_key=signing_key, funder=funder,
+            signature_type=settings.polymarket_signature_type,
         )
         adapters: dict = {ExchangeName.POLYMARKET: pm}
 
