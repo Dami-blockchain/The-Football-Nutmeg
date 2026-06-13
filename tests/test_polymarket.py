@@ -82,7 +82,39 @@ def _adapter(events, clob=None, *, enable_orders=False, mode="paper"):
     )
 
 
+def _outright_winner_event():
+    """The tournament-winner outright: a per-team winner market for many
+    teams. Both queried teams appear, so it classifies — but it is NOT the
+    fixture, and its title names neither team and it has no draw."""
+    return {
+        "slug": "world-cup-winner",
+        "id": "wcw",
+        "title": "World Cup Winner",
+        "markets": [
+            {"question": "Will Arsenal win the World Cup?",
+             "outcomes": ["Yes", "No"], "clobTokenIds": ["ARS_OUT_Y", "ARS_OUT_N"]},
+            {"question": "Will Chelsea win the World Cup?",
+             "outcomes": ["Yes", "No"], "clobTokenIds": ["CHE_OUT_Y", "CHE_OUT_N"]},
+        ],
+    }
+
+
 # ---- discovery / classification --------------------------------------
+async def test_find_market_prefers_h2h_over_outright():
+    # Outright listed FIRST (as in the live feed), real fixture second.
+    a = _adapter([_outright_winner_event(), _layout_b_event()])
+    ref = await a.find_market("Arsenal FC", "Chelsea FC", KICKOFF)
+    assert ref is not None
+    assert ref.market_id == "arsenal-vs-chelsea-2026-01-20"  # the fixture, not outright
+    assert ref.metadata["outcome_tokens"]["DRAW"] == "DRAW_YES"
+
+
+async def test_find_market_rejects_outright_only():
+    # No real fixture available — must NOT route to the outright.
+    a = _adapter([_outright_winner_event()])
+    assert await a.find_market("Arsenal FC", "Chelsea FC", KICKOFF) is None
+
+
 async def test_find_market_layout_b():
     a = _adapter([_layout_b_event()])
     ref = await a.find_market("Arsenal FC", "Chelsea FC", KICKOFF)

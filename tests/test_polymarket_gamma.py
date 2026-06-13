@@ -62,6 +62,48 @@ async def test_list_events_decodes_nested_markets():
 
 
 @pytest.mark.asyncio
+async def test_list_events_by_slug_queries_tag_slug():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["tag_slug"] = request.url.params.get("tag_slug")
+        return httpx.Response(200, json=[
+            {"slug": "fifwc-bra-mar-2026-06-13", "title": "Brazil vs. Morocco",
+             "markets": [{"question": "Will Brazil win?", "outcomes": '["Yes","No"]'}]},
+        ])
+
+    async with GammaClient(client=_mock_client(handler)) as g:
+        evs = await g.list_events_by_slug("fifa-world-cup")
+    assert seen["tag_slug"] == "fifa-world-cup"
+    assert evs[0]["slug"] == "fifwc-bra-mar-2026-06-13"
+    assert evs[0]["markets"][0]["outcomes"] == ["Yes", "No"]
+
+
+@pytest.mark.asyncio
+async def test_list_soccer_events_merges_wc_match_events():
+    """The numeric soccer tag misses per-match WC events; they must be merged
+    in via the WC tag slug, deduped by slug."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        slug = request.url.params.get("tag_slug")
+        if slug == "fifa-world-cup":
+            return httpx.Response(200, json=[
+                {"slug": "fifwc-bra-mar-2026-06-13", "title": "Brazil vs. Morocco",
+                 "markets": []},
+                {"slug": "club-dup", "title": "Dup", "markets": []},
+            ])
+        # numeric tag_id listing (no tag_slug param)
+        return httpx.Response(200, json=[
+            {"slug": "club-dup", "title": "Dup", "markets": []},
+        ])
+
+    async with GammaClient(client=_mock_client(handler)) as g:
+        evs = await g.list_soccer_events(tag_id=100350)
+    slugs = [e["slug"] for e in evs]
+    assert "fifwc-bra-mar-2026-06-13" in slugs   # WC match event merged in
+    assert slugs.count("club-dup") == 1          # deduped, not doubled
+
+
+@pytest.mark.asyncio
 async def test_discover_soccer_tag_intersects_league_tags():
     def handler(request: httpx.Request) -> httpx.Response:
         # epl and lal share tags 1 and 100350; 100350 is the soccer tag.

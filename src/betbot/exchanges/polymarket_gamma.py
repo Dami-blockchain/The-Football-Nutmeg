@@ -33,6 +33,15 @@ GAMMA_BASE = "https://gamma-api.polymarket.com"
 # /sports refines this when possible.
 SOCCER_TAG_ID = 100350
 
+# Per-match WC events (slug pattern ``fifwc-<home>-<away>-<date>``, Layout B
+# with 3 binary HOME/DRAW/AWAY markets) are NOT returned by the auto-discovered
+# numeric soccer tag — they live under this tag SLUG. Verified live 2026-06:
+# tag_slug=fifa-world-cup returns the fifwc-* match events. We merge these into
+# the soccer-events feed so per-match WC markets are actually discoverable
+# (otherwise the matcher falls back to the tournament-winner outright and the
+# price-sanity guard rejects every WC fixture).
+WC_TAG_SLUG = "fifa-world-cup"
+
 # football-data competition_code -> Gamma `sport` slug, used to intersect tag
 # sets during auto-discovery of the soccer tag.
 _FOOTBALL_SPORT_SLUGS = frozenset({"epl", "lal", "sa", "bundesliga", "ligue1", "ucl", "wc"})
@@ -164,10 +173,44 @@ class GammaClient:
             e["markets"] = [_decode_market(m) for m in (e.get("markets") or [])]
         return events
 
+    async def list_events_by_slug(
+        self, tag_slug: str, *, closed: bool = False, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        """Open events for a tag SLUG (e.g. ``fifa-world-cup``), markets decoded.
+
+        The numeric-tag listing misses per-match WC events; querying by the
+        tag slug returns them. Pages up to ``limit``."""
+        collected: list[dict[str, Any]] = []
+        page = 100
+        offset = 0
+        while len(collected) < limit:
+            events = await self._get(
+                "/events",
+                params={
+                    "tag_slug": tag_slug,
+                    "closed": "true" if closed else "false",
+                    "limit": page,
+                    "offset": offset,
+                    "order": "startDate",
+                    "ascending": "true",
+                },
+            )
+            if not isinstance(events, list) or not events:
+                break
+            for e in events:
+                e["markets"] = [_decode_market(m) for m in (e.get("markets") or [])]
+            collected.extend(events)
+            if len(events) < page:
+                break
+            offset += page
+        return collected[:limit]
+
     async def list_soccer_events(
         self, *, tag_id: int | None = None, limit: int = 200
     ) -> list[dict[str, Any]]:
-        """Open football events. Pages through results up to ``limit``."""
+        """Open football events. Pages through the numeric soccer tag, then
+        merges in per-match WC events (which that tag misses), deduped by
+        event slug/id."""
         resolved_tag = tag_id if tag_id is not None else await self.discover_soccer_tag()
         collected: list[dict[str, Any]] = []
         page = 100
@@ -182,4 +225,16 @@ class GammaClient:
             if len(batch) < page:
                 break
             offset += page
-        return collected[:limit]
+
+        # Merge in WC match events (slug tag), which the numeric tag omits.
+        try:
+            wc = await self.list_events_by_slug(WC_TAG_SLUG, limit=limit)
+        except GammaError:
+            wc = []  # never let the WC supplement break club discovery
+        seen = {e.get("slug") or e.get("id") for e in collected}
+        for e in wc:
+            key = e.get("slug") or e.get("id")
+            if key not in seen:
+                seen.add(key)
+                collected.append(e)
+        return collected[: limit * 2]

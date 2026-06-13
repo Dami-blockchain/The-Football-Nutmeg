@@ -33,6 +33,7 @@ from betbot.exchanges.matcher import (
     TeamAliasResolver,
     classify_binary_outcome,
     is_match_result_market,
+    normalize,
 )
 from betbot.exchanges.polymarket_gamma import GammaClient
 from betbot.logging import get_logger
@@ -191,6 +192,8 @@ class PolymarketAdapter:
         self, home_team: str, away_team: str, kickoff: datetime
     ) -> MarketRef | None:
         events = await self._soccer_events()
+        nh, na = normalize(home_team), normalize(away_team)
+        candidates: list[tuple[int, MarketRef]] = []
         for e in events:
             mapping = self._classify_event(e, home_team, away_team)
             if mapping is None:
@@ -212,10 +215,9 @@ class PolymarketAdapter:
                     slug=e.get("slug") or e.get("id"), title=title,
                 )
                 continue
-            market_id = e.get("slug") or e.get("id") or ""
-            return MarketRef(
+            ref = MarketRef(
                 exchange=ExchangeName.POLYMARKET,
-                market_id=str(market_id),
+                market_id=str(e.get("slug") or e.get("id") or ""),
                 title=title,
                 metadata={
                     "outcome_tokens": {o.value: t for o, t in mapping.items()},
@@ -227,7 +229,31 @@ class PolymarketAdapter:
                     "market_type": "match_result",
                 },
             )
-        return None
+            # Prefer the genuine head-to-head over the tournament-winner
+            # outright (which carries a per-team winner market for BOTH teams,
+            # so it classifies even though it isn't this fixture). A real
+            # fixture names both teams in its title ("Brazil vs. Morocco") and
+            # carries a DRAW outcome; the outright does neither.
+            ntitle = normalize(title)
+            score = 0
+            if nh and nh in ntitle and na and na in ntitle:
+                score += 10                      # both teams in the title = H2H
+            if Outcome.DRAW in mapping:
+                score += 1                       # a real 1X2 has a draw
+            candidates.append((score, ref))
+
+        if not candidates:
+            return None
+        # Highest score wins; ties keep discovery order (stable).
+        best_score = max(s for s, _ in candidates)
+        if best_score == 0:
+            log.info(
+                "polymarket_no_h2h_match",
+                home=home_team, away=away_team,
+                note="only non-H2H (likely outright) candidates — not routing",
+            )
+            return None
+        return next(ref for s, ref in candidates if s == best_score)
 
     # ------------------------------------------------------------------
     # Orderbook
