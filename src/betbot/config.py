@@ -39,6 +39,35 @@ class Settings(BaseSettings):
         default=10, alias="FOOTBALL_DATA_RATE_LIMIT_PER_MIN"
     )
 
+    # ---- API-Football (API-SPORTS) — player availability (injuries) ----
+    # OPTIONAL. Empty key = graceful NO-OP (no injury adjustment), like the
+    # other optional integrations. Free tier is 100 req/day, so team-id
+    # lookups are cached; injuries are fetched per WC fixture.
+    api_football_key: str = Field(default="", alias="API_FOOTBALL_KEY")
+    api_football_base_url: str = Field(
+        default="https://v3.football.api-sports.io", alias="API_FOOTBALL_BASE_URL"
+    )
+    api_football_rate_limit_per_min: int = Field(
+        default=10, alias="API_FOOTBALL_RATE_LIMIT_PER_MIN"
+    )
+    api_football_season: int = Field(default=2026, alias="API_FOOTBALL_SEASON")
+
+    # ---- Lineup / availability adjustment (WC only; OFF until validated) ----
+    # When enabled AND an API-Football key is set, the WC scoring loop fetches
+    # each team's injury list and shifts that team's Glicko rating DOWN by a
+    # small, capped amount before pricing. v1 is a COARSE absence-count signal
+    # (NOT weighted by player importance) and is OFF by default until validated
+    # on the calibration report. Glicko points are small (SCALE ~173.7), so
+    # these defaults move probabilities only a few points even for a depleted
+    # side — conservative by design.
+    lineup_adjust_enabled: bool = Field(default=False, alias="BETBOT_LINEUP_ADJUST")
+    injury_penalty_per_player: float = Field(
+        default=8.0, alias="BETBOT_INJURY_PENALTY_PER_PLAYER"
+    )
+    injury_penalty_cap: float = Field(
+        default=40.0, alias="BETBOT_INJURY_PENALTY_CAP"
+    )
+
     # League scope (immutable for v1).
     leagues: tuple[str, ...] = LEAGUE_CODES
 

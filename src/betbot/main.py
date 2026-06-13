@@ -20,6 +20,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from betbot.config import INTERNATIONAL_COMPETITIONS, get_settings
+from betbot.data.api_football import ApiFootballClient
 from betbot.data.football_data import FootballDataClient, FootballDataError
 from betbot.data.form import FormService, _parse_kickoff, _parse_team
 from betbot.exchanges.base import ExchangeName
@@ -51,6 +52,7 @@ from betbot.storage.repos import (
     reset_kill_switch,
     upsert_prediction,
 )
+from betbot.strategy.availability import availability_penalty
 from betbot.strategy.engine import StrategyEngine
 from betbot.strategy.international_engine import InternationalStrategyEngine
 # NOTE: betbot.wallet pulls in web3 (the `api` extra) at import time, so it's
@@ -199,6 +201,62 @@ def _build_router(settings) -> tuple[ExchangeRouter, list, object]:
 
 
 # ----------------------------------------------------------------------
+# Player-availability (injury) adjustment — WC only, OFF by default
+# ----------------------------------------------------------------------
+async def _availability_adjustments(
+    af_client: ApiFootballClient | None,
+    settings,
+    home_name: str,
+    away_name: str,
+) -> tuple[float, float]:
+    """Return ``(home_rating_adj, away_rating_adj)`` Glicko-point shifts.
+
+    A COARSE absence-count signal: count each team's unavailable players and
+    map that to a small, capped NEGATIVE Glicko adjustment. v1 does NOT weight
+    by player importance and is OFF by default until validated on the
+    calibration report.
+
+    GRACEFUL by contract: any error, a missing key, or the feature being
+    disabled returns ``(0.0, 0.0)`` — this must NEVER break or skip a
+    prediction. Logged once per failure, not raised.
+    """
+    if af_client is None or not af_client.has_key:
+        return 0.0, 0.0
+    log = get_logger(__name__)
+    try:
+        home_id = await af_client.resolve_team_id(home_name)
+        away_id = await af_client.resolve_team_id(away_name)
+        season = settings.api_football_season
+
+        async def _adj(team_id: int | None) -> float:
+            if team_id is None:
+                return 0.0
+            injuries = await af_client.get_injuries(team_id, season)
+            return availability_penalty(
+                len(injuries),
+                per_player=settings.injury_penalty_per_player,
+                cap=settings.injury_penalty_cap,
+            )
+
+        home_adj = await _adj(home_id)
+        away_adj = await _adj(away_id)
+        if home_adj or away_adj:
+            log.info(
+                "availability_adjustment",
+                home=home_name, away=away_name,
+                home_adj=round(home_adj, 1), away_adj=round(away_adj, 1),
+            )
+        return home_adj, away_adj
+    except Exception as e:  # noqa: BLE001 — availability must never break scoring
+        log.warning(
+            "availability_fetch_failed",
+            home=home_name, away=away_name, error=str(e),
+            note="falling back to no adjustment (0/0)",
+        )
+        return 0.0, 0.0
+
+
+# ----------------------------------------------------------------------
 # Scoring run
 # ----------------------------------------------------------------------
 async def _score_once() -> int:
@@ -251,6 +309,18 @@ async def _score_once() -> int:
     # build one ClobClient per user, not one per bet.
     user_adapter_cache: dict[str, dict] = {}
 
+    # Optional player-availability (injury) client — built only when the WC
+    # adjustment is enabled AND a key is configured. Closed in the finally
+    # below. When absent, _availability_adjustments returns (0, 0) — a NO-OP.
+    af_client: ApiFootballClient | None = None
+    if settings.lineup_adjust_enabled and settings.api_football_key:
+        af_client = ApiFootballClient(
+            api_key=settings.api_football_key,
+            base_url=settings.api_football_base_url,
+            rate_limit_per_min=settings.api_football_rate_limit_per_min,
+        )
+        log.info("availability_adjustment_enabled", season=settings.api_football_season)
+
     async with FootballDataClient(
         api_key=settings.football_data_api_key,
         base_url=settings.football_data_base_url,
@@ -278,13 +348,17 @@ async def _score_once() -> int:
                 )
                 # International competitions (World Cup) use the Glicko engine;
                 # club leagues use the form-based StrategyEngine.
-                eng = intl_engine if league in INTERNATIONAL_COMPETITIONS else engine
+                is_intl = league in INTERNATIONAL_COMPETITIONS
+                eng = intl_engine if is_intl else engine
                 for m in matches:
                     try:
                         bets = await _score_and_log_one(
                             m, league, form_service, eng, router,
                             settings, kill_tripped, live_orders,
                             make_signer_adapters, user_adapter_cache,
+                            # Injury adjustment is WC-only: pass the client only
+                            # for international competitions (None elsewhere).
+                            af_client=af_client if is_intl else None,
                         )
                         paper_bets_logged += bets
                     except FootballDataError as e:
@@ -304,6 +378,8 @@ async def _score_once() -> int:
         finally:
             for client in _http_clients:
                 await client.close()
+            if af_client is not None:
+                await af_client.close()
 
     log.info(
         "scoring_run_done",
@@ -324,6 +400,7 @@ async def _score_and_log_one(
     live_orders: bool = False,
     make_signer_adapters=None,
     user_adapter_cache: dict | None = None,
+    af_client: ApiFootballClient | None = None,
 ) -> int:
     """Score one fixture and log a paper bet.
 
@@ -349,7 +426,23 @@ async def _score_and_log_one(
         away_team=away,
     )
 
-    prediction = engine.predict(fixture_form)
+    # WC-only player-availability (injury) adjustment. Graceful: returns (0, 0)
+    # when disabled, keyless, or on any fetch error — never breaks the
+    # prediction. Only the InternationalStrategyEngine accepts the rating-shift
+    # kwargs, so we pass them ONLY when there's a non-zero shift to apply; the
+    # zero case calls predict(fixture_form) exactly as before, preserving
+    # compatibility with the club engine (and any mock engine in tests).
+    home_adj = away_adj = 0.0
+    if league in INTERNATIONAL_COMPETITIONS:
+        home_adj, away_adj = await _availability_adjustments(
+            af_client, settings, home.name, away.name
+        )
+    if home_adj or away_adj:
+        prediction = engine.predict(
+            fixture_form, home_rating_adj=home_adj, away_rating_adj=away_adj
+        )
+    else:
+        prediction = engine.predict(fixture_form)
     log.info(
         "prediction",
         fixture_id=fixture_id,

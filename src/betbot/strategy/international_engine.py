@@ -131,12 +131,34 @@ class InternationalStrategyEngine:
         else:
             self._record_model_prediction = _safe_record_model_prediction
 
-    def predict(self, fixture_form: FixtureForm) -> Prediction:
+    def predict(
+        self,
+        fixture_form: FixtureForm,
+        *,
+        home_rating_adj: float = 0.0,
+        away_rating_adj: float = 0.0,
+    ) -> Prediction:
+        """Price a WC fixture from the Glicko/DC ensemble.
+
+        ``home_rating_adj`` / ``away_rating_adj`` shift each team's Glicko
+        rating by that many points BEFORE ``match_probabilities``. They are how
+        the optional injury/availability signal feeds in: a negative value for
+        the depleted side lowers its win probability (and lifts draw/opponent).
+        Default ``0.0`` reproduces the prior behaviour EXACTLY (no branch taken,
+        identical ratings used). The stored ``home_score``/``away_score``
+        reflect the ADJUSTED ratings so the adjustment is transparent in the
+        logged prediction row. The DC component is rating-independent and is
+        left untouched.
+        """
         s = self._settings
         fx = fixture_form.fixture
         home_name, away_name = fx.home_team.name, fx.away_team.name
         rh = self._get_rating(home_name)
         ra = self._get_rating(away_name)
+        if home_rating_adj:
+            rh = dataclasses.replace(rh, rating=rh.rating + home_rating_adj)
+        if away_rating_adj:
+            ra = dataclasses.replace(ra, rating=ra.rating + away_rating_adj)
         home_field = s.glicko_host_home_mu if _is_host(home_name) else 0.0
         glicko_probs = match_probabilities(
             rh, ra, home_field_mu=home_field, draw_rho=s.glicko_draw_rho
