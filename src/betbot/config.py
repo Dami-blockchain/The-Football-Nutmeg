@@ -316,7 +316,7 @@ class Settings(BaseSettings):
     glicko_default_rating: float = Field(default=1500.0, alias="BETBOT_GLICKO_DEFAULT_RATING")
     glicko_default_rd: float = Field(default=200.0, alias="BETBOT_GLICKO_DEFAULT_RD")
     glicko_default_vol: float = Field(default=0.06, alias="BETBOT_GLICKO_DEFAULT_VOL")
-    glicko_draw_rho: float = Field(default=0.28, alias="BETBOT_GLICKO_DRAW_RHO")
+    glicko_draw_rho: float = Field(default=0.30, alias="BETBOT_GLICKO_DRAW_RHO")
     glicko_host_home_mu: float = Field(default=0.2, alias="BETBOT_GLICKO_HOST_HOME_MU")
     glicko_results_csv: str = Field(default="", alias="BETBOT_GLICKO_RESULTS_CSV")
 

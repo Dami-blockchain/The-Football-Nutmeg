@@ -45,7 +45,17 @@ def test_probabilities_sum_to_one_and_order():
 def test_draw_probability_clamped():
     even = Glicko2Rating(rating=1500, rd=50)
     _, p_draw, _ = match_probabilities(even, even, draw_rho=0.9)
-    assert 0.05 <= p_draw <= 0.40         # clamp respected even with high rho
+    assert 0.12 <= p_draw <= 0.40         # clamp respected even with high rho
+
+
+def test_lopsided_match_keeps_realistic_draw_floor():
+    # A big favourite vs a minnow must still carry a realistic draw chance
+    # (>=12%): international underdogs park the bus and nick points. This is
+    # the Canada-host-draws-Bosnia miss the floor addresses.
+    fav = Glicko2Rating(rating=1850, rd=50)
+    dog = Glicko2Rating(rating=1350, rd=50)
+    _, p_draw, _ = match_probabilities(fav, dog)
+    assert p_draw >= 0.12
 
 
 def test_home_field_helps_home():
