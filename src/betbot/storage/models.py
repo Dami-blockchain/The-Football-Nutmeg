@@ -320,10 +320,16 @@ class ModelPrediction(Base):
     w_glicko: Mapped[float] = mapped_column(Float)     # Hedge weights used
     w_ensemble: Mapped[float] = mapped_column(Float)
 
+    # Dispersion challenger triple (flag-gated experiment, dual-logged always).
+    c_home: Mapped[float | None] = mapped_column(Float, nullable=True)
+    c_draw: Mapped[float | None] = mapped_column(Float, nullable=True)
+    c_away: Mapped[float | None] = mapped_column(Float, nullable=True)
+
     # Filled at settlement.
     outcome: Mapped[str | None] = mapped_column(String(4), nullable=True)
     rps_glicko: Mapped[float | None] = mapped_column(Float, nullable=True)
     rps_ensemble: Mapped[float | None] = mapped_column(Float, nullable=True)
+    rps_challenger: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow

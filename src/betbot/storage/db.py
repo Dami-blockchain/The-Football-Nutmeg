@@ -27,6 +27,10 @@ _SessionLocal: sessionmaker[Session] | None = None
 # is absent, so this is safe to run on every startup.
 _ADDITIVE_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("users", "arb_interest", "BOOLEAN NOT NULL DEFAULT 0"),
+    ("model_predictions", "c_home", "FLOAT"),
+    ("model_predictions", "c_draw", "FLOAT"),
+    ("model_predictions", "c_away", "FLOAT"),
+    ("model_predictions", "rps_challenger", "FLOAT"),
 )
 
 

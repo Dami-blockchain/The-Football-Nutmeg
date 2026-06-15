@@ -382,6 +382,15 @@ class Settings(BaseSettings):
     model_select_enabled: bool = Field(default=True, alias="BETBOT_MODEL_SELECT")
     model_select_eta: float = Field(default=2.0, alias="BETBOT_MODEL_SELECT_ETA")
 
+    # ---- Dispersion challenger (flag-gated, default OFF) --------------------
+    # When DISABLED (default) the live prediction is byte-identical to before;
+    # the challenger is still computed and dual-logged (c_* columns) so its RPS
+    # can be compared head-to-head before anyone flips the switch. When ENABLED,
+    # the live prediction uses the dispersion-sharpened triple. ``kappa`` widens
+    # only the home/away split (draw untouched); 1.0 = exact no-op.
+    dispersion_fix_enabled: bool = Field(default=False, alias="BETBOT_DISPERSION_FIX")
+    dispersion_kappa: float = Field(default=1.30, alias="BETBOT_DISPERSION_KAPPA")
+
     # ---- Tournament simulator (outright/futures, scripts/simulate_wc.py)
     # How random extra-time/penalties are when a knockout match draws:
     # 1.0 = pure coin flip, 0.0 = fully decided by relative DC strength.

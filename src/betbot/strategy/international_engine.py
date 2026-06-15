@@ -39,6 +39,7 @@ from betbot.strategy.ensemble import (
     log_pool,
     EnsembleWeights,
 )
+from betbot.strategy.dispersion import apply_dispersion
 from betbot.strategy.glicko import Glicko2Rating, match_probabilities
 from betbot.strategy.model_select import hedge_weights
 
@@ -163,6 +164,8 @@ class InternationalStrategyEngine:
         glicko_probs = match_probabilities(
             rh, ra, home_field_mu=home_field, draw_rho=s.glicko_draw_rho
         )
+        recorded: tuple[tuple[float, float, float], tuple[float, float, float],
+                         tuple[float, float]] | None = None
         if self._dc_params is not None:
             dc_probs = dc.match_probabilities(
                 self._dc_params,
@@ -178,14 +181,21 @@ class InternationalStrategyEngine:
                 loss_g, loss_e, _n = self._get_model_losses()
                 w_g, w_e = hedge_weights(loss_g, loss_e, eta=s.model_select_eta)
                 probs = log_pool([(w_g, glicko_probs), (w_e, ens_probs)])
-                self._record_model_prediction(
-                    fx.id, home_name, away_name, glicko_probs, ens_probs, (w_g, w_e)
-                )
+                recorded = (glicko_probs, ens_probs, (w_g, w_e))
             else:
                 probs = ens_probs
         else:
             probs = glicko_probs  # pure-Glicko fallback (no DC artifact)
-        p_home, p_draw, p_away = calibrate(probs, self._calibrators)
+        # Dispersion challenger: sharpen the home/away split (draw untouched).
+        # Always computed and dual-logged; only USED live when the flag is on,
+        # so flag-off behaviour is byte-identical to before.
+        disp = apply_dispersion(probs, s.dispersion_kappa)
+        if recorded is not None:
+            self._record_model_prediction(
+                fx.id, home_name, away_name, recorded[0], recorded[1], recorded[2], disp
+            )
+        chosen = disp if s.dispersion_fix_enabled else probs
+        p_home, p_draw, p_away = calibrate(chosen, self._calibrators)
         return Prediction(
             fixture_id=fx.id,
             competition_code=fx.competition_code,

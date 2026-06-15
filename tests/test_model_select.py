@@ -140,11 +140,15 @@ def test_predict_records_both_views(settings):
     _engine(settings, (0.0, 0.0, 0), recorded).predict(
         _fixture_form("Japan", "Senegal"))
     assert len(recorded) == 1
-    fid, home, away, glicko, ens, weights = recorded[0]
+    # The recorder now also receives the dispersion challenger triple (c_*),
+    # dual-logged on every prediction regardless of the live flag.
+    fid, home, away, glicko, ens, weights, challenger = recorded[0]
     assert fid == 950 and home == "Japan"
     assert sum(glicko) == pytest.approx(1.0)
     assert sum(ens) == pytest.approx(1.0)
     assert weights == pytest.approx((0.5, 0.5))  # no evidence yet
+    assert sum(challenger) == pytest.approx(1.0)   # well-formed distribution
+    assert all(0.0 <= x <= 1.0 for x in challenger)
 
 
 def test_model_select_disabled_reverts_to_blend(settings):
