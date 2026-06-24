@@ -31,6 +31,10 @@ _ADDITIVE_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("model_predictions", "c_draw", "FLOAT"),
     ("model_predictions", "c_away", "FLOAT"),
     ("model_predictions", "rps_challenger", "FLOAT"),
+    ("model_predictions", "m_home", "FLOAT"),
+    ("model_predictions", "m_draw", "FLOAT"),
+    ("model_predictions", "m_away", "FLOAT"),
+    ("model_predictions", "rps_mov", "FLOAT"),
 )
 
 

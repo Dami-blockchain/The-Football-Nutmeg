@@ -856,12 +856,14 @@ def upsert_model_prediction(
     ensemble: tuple[float, float, float],
     weights: tuple[float, float],
     challenger: tuple[float, float, float] | None = None,
+    mov: tuple[float, float, float] | None = None,
 ) -> None:
     """Record both models' pre-match view. Re-predicting before kickoff
     overwrites; once an outcome is scored the row is frozen.
 
-    ``challenger`` is the dispersion-sharpened triple, dual-logged into the c_*
-    columns regardless of whether the live flag is on; ``None`` leaves it unset.
+    ``challenger`` is the dispersion-sharpened triple (c_* columns); ``mov`` is
+    the margin-of-victory challenger triple (m_* columns). Both are dual-logged
+    regardless of whether their live flag is on; ``None`` leaves them unset.
     """
     with session_scope() as s:
         row = s.execute(
@@ -882,6 +884,8 @@ def upsert_model_prediction(
         row.w_glicko, row.w_ensemble = weights
         if challenger is not None:
             row.c_home, row.c_draw, row.c_away = challenger
+        if mov is not None:
+            row.m_home, row.m_draw, row.m_away = mov
 
 
 def score_model_prediction(fixture_id: int, outcome: str) -> bool:
@@ -908,6 +912,10 @@ def score_model_prediction(fixture_id: int, outcome: str) -> bool:
         if row.c_home is not None:
             row.rps_challenger = ranked_probability_score(
                 (row.c_home, row.c_draw, row.c_away), oi
+            )
+        if row.m_home is not None:
+            row.rps_mov = ranked_probability_score(
+                (row.m_home, row.m_draw, row.m_away), oi
             )
         return True
 

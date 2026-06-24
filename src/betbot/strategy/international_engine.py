@@ -69,6 +69,23 @@ def _load_calibrators(path: Path) -> tuple[IsotonicCalibrator, ...] | None:
         return None
 
 
+def _load_mov_ratings(path: Path) -> dict[str, Glicko2Rating] | None:
+    """Load margin-of-victory ratings (data/glicko_mov.json), keyed by
+    normalized team name. Returns None when absent so the MOV challenger is
+    simply skipped (live behaviour unchanged)."""
+    try:
+        d = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    out: dict[str, Glicko2Rating] = {}
+    for name, v in d.items():
+        try:
+            out[normalize(name)] = Glicko2Rating(float(v[0]), float(v[1]), float(v[2]))
+        except (TypeError, ValueError, IndexError, KeyError):
+            continue
+    return out or None
+
+
 def _safe_model_losses() -> tuple[float, float, int]:
     """Default loss source: the model_predictions table. Degrades to
     no-evidence (50/50 Hedge) rather than crashing when the DB isn't up."""
@@ -112,6 +129,7 @@ class InternationalStrategyEngine:
             dixon_coles=settings.ensemble_weight_dc,
             market=settings.ensemble_weight_market,
         )
+        self._mov_ratings = _load_mov_ratings(Path(settings.glicko_mov_path))
         if get_rating is not None:
             self._get_rating = get_rating
         else:
@@ -164,8 +182,24 @@ class InternationalStrategyEngine:
         glicko_probs = match_probabilities(
             rh, ra, home_field_mu=home_field, draw_rho=s.glicko_draw_rho
         )
-        recorded: tuple[tuple[float, float, float], tuple[float, float, float],
-                         tuple[float, float]] | None = None
+        # MOV challenger glicko: same match-probability call with margin-of-
+        # victory ratings swapped in. Computed only when MOV ratings exist for
+        # BOTH teams (else the challenger is skipped for this match).
+        glicko_mov = None
+        if self._mov_ratings is not None:
+            mrh = self._mov_ratings.get(normalize(home_name))
+            mra = self._mov_ratings.get(normalize(away_name))
+            if mrh is not None and mra is not None:
+                if home_rating_adj:
+                    mrh = dataclasses.replace(mrh, rating=mrh.rating + home_rating_adj)
+                if away_rating_adj:
+                    mra = dataclasses.replace(mra, rating=mra.rating + away_rating_adj)
+                glicko_mov = match_probabilities(
+                    mrh, mra, home_field_mu=home_field, draw_rho=s.glicko_draw_rho
+                )
+
+        recorded = None
+        mov_ens = None
         if self._dc_params is not None:
             dc_probs = dc.match_probabilities(
                 self._dc_params,
@@ -174,6 +208,8 @@ class InternationalStrategyEngine:
                 home_field=_is_host(home_name),
             )
             ens_probs = blend(glicko_probs, dc_probs, weights=self._weights)
+            if glicko_mov is not None:
+                mov_ens = blend(glicko_mov, dc_probs, weights=self._weights)
             if s.model_select_enabled:
                 # Online selection: weight glicko vs ensemble by Hedge over
                 # their settled-match RPS this tournament, and dual-log both
@@ -186,15 +222,23 @@ class InternationalStrategyEngine:
                 probs = ens_probs
         else:
             probs = glicko_probs  # pure-Glicko fallback (no DC artifact)
+            mov_ens = glicko_mov
         # Dispersion challenger: sharpen the home/away split (draw untouched).
         # Always computed and dual-logged; only USED live when the flag is on,
         # so flag-off behaviour is byte-identical to before.
         disp = apply_dispersion(probs, s.dispersion_kappa)
         if recorded is not None:
             self._record_model_prediction(
-                fx.id, home_name, away_name, recorded[0], recorded[1], recorded[2], disp
+                fx.id, home_name, away_name, recorded[0], recorded[1],
+                recorded[2], disp, mov_ens
             )
-        chosen = disp if s.dispersion_fix_enabled else probs
+        # Live selection: flags are independent and default OFF. MOV (rating-
+        # level) takes precedence over dispersion (output-level) if both are on.
+        chosen = probs
+        if s.dispersion_fix_enabled:
+            chosen = disp
+        if s.mov_fix_enabled and mov_ens is not None:
+            chosen = mov_ens
         p_home, p_draw, p_away = calibrate(chosen, self._calibrators)
         return Prediction(
             fixture_id=fx.id,

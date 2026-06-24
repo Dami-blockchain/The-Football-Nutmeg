@@ -391,6 +391,13 @@ class Settings(BaseSettings):
     dispersion_fix_enabled: bool = Field(default=False, alias="BETBOT_DISPERSION_FIX")
     dispersion_kappa: float = Field(default=1.30, alias="BETBOT_DISPERSION_KAPPA")
 
+    # ---- Margin-of-victory rating challenger (flag-gated, default OFF) -------
+    # When DISABLED (default) the live prediction is byte-identical; the MOV
+    # challenger is computed from data/glicko_mov.json and dual-logged (m_*
+    # columns). When ENABLED, the live glicko component uses MOV ratings.
+    mov_fix_enabled: bool = Field(default=False, alias="BETBOT_MOV_FIX")
+    glicko_mov_path: str = Field(default="data/glicko_mov.json", alias="BETBOT_GLICKO_MOV_PATH")
+
     # ---- Tournament simulator (outright/futures, scripts/simulate_wc.py)
     # How random extra-time/penalties are when a knockout match draws:
     # 1.0 = pure coin flip, 0.0 = fully decided by relative DC strength.

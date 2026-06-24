@@ -32,6 +32,7 @@ def settings() -> Settings:
         # deterministic regardless of what's in the working tree's data/.
         BETBOT_DC_PARAMS_PATH="./tests/_no_such_dc_params.json",
         BETBOT_ENSEMBLE_CALIBRATION_PATH="./tests/_no_such_calibration.json",
+        BETBOT_GLICKO_MOV_PATH="./tests/_no_such_mov.json",
         # Pin live-trading flags to their safe defaults EXPLICITLY (init kwargs
         # outrank both .env and exported env vars), so a deployment box with
         # live config set can't flip tests that assert default-OFF behaviour.
