@@ -76,6 +76,23 @@ scripts/backtest_club_r1.py once 2026-27 season data accumulates.
   attack/defence, which transfer since they're goal rates) + market anchor.
 * Gate: walk-forward on the last 2 CL seasons (football-data.org history).
 
+### R2 — RESULT (2026-08-05): GATE PASSED, SHIPPED (default ON, paper)
+ClubElo cross-league Elo engine (EuropeanStrategyEngine) now prices CL.
+Walk-forward gate (scripts/backtest_cl.py): tuned HA=65, draw_rho=0.26 on
+seasons 2023+2024; Elo+DC blend (dc_weight=1.0) beat pure Elo on train.
+Held-out CL season 2025 (n=173 scorable): naive RPS 0.2566 (acc 26.6%%) ->
+Elo+DC 0.2001 (acc 59.5%%); bootstrap 95%% CI on per-match RPS improvement
+[+0.032, +0.081], excludes 0. Wired in main.py (CL route), config
+cl_* fields, 5 tests. Data: data/cl_results.csv (football-data.org),
+data/clubelo/*.csv monthly + data/clubelo_latest.csv (fetch_clubelo.py).
+
+OPEN follow-ups: (1) schedule `python scripts/fetch_clubelo.py --latest`
+daily (daemon/cron) before CL season — the live engine reads that file;
+(2) ClubElo summer snapshots transiently omit some clubs (e.g. Bayern
+absent from the 2026-07 snapshot) -> those ties fall back to naive; in-season
+snapshots are complete (187/189 resolved in backtest), and CL starts mid-Sep;
+(3) 2 name bridges added (Athletic Club->Bilbao, Union SG->St Gillis).
+
 ### R3 — xG layer
 * Pull Understat shot/xG history, big-5 leagues 2014→now (no official API;
   scrape respectfully + cache; FBref/StatsBomb open data as fallback).

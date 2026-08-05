@@ -56,6 +56,7 @@ from betbot.strategy.availability import availability_penalty
 from betbot.strategy.engine import StrategyEngine
 from betbot.strategy.international_engine import InternationalStrategyEngine
 from betbot.strategy.club_engine import ClubStrategyEngine
+from betbot.strategy.cl_engine import EuropeanStrategyEngine
 # NOTE: betbot.wallet pulls in web3 (the `api` extra) at import time, so it's
 # imported lazily inside the functions that need it — keeping `betbot.main`
 # importable (and testable) on the base install.
@@ -335,6 +336,11 @@ async def _score_once() -> int:
             if settings.club_ensemble_enabled
             else engine
         )
+        cl_engine = (
+            EuropeanStrategyEngine(settings)
+            if settings.cl_elo_enabled
+            else engine
+        )
 
         try:
             for league in settings.leagues:
@@ -354,15 +360,16 @@ async def _score_once() -> int:
                 )
                 # Engine routing: World Cup -> Glicko/DC intl ensemble;
                 # domestic top-5 leagues -> club Glicko/DC ensemble;
-                # Champions League -> naive form engine (cross-league club
-                # ratings aren't calibrated against each other yet).
+                # Champions League -> cross-league ClubElo engine (R2), which
+                # falls back to naive internally on unresolved teams / a stale
+                # snapshot, and is `engine` outright when BETBOT_CL_ELO=false.
                 is_intl = league in INTERNATIONAL_COMPETITIONS
                 if is_intl:
                     eng = intl_engine
                 elif league != "CL":
                     eng = club_engine
                 else:
-                    eng = engine
+                    eng = cl_engine
                 for m in matches:
                     try:
                         bets = await _score_and_log_one(

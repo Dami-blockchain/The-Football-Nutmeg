@@ -11,6 +11,7 @@
 # Keep this list conservative: a bad alias silently mis-routes a bet.
 
 aliases:
+  "Royale Union Saint-Gilloise": ["St Gillis", "Union SG", "Union Saint-Gilloise", "USG"]
   "Paris Saint-Germain FC": ["PSG", "Paris SG", "Paris Saint Germain"]
   "FC Bayern München": ["Bayern Munich", "Bayern", "Bayern Munchen"]
   "Borussia Dortmund": ["Dortmund", "BVB"]
@@ -27,7 +28,7 @@ aliases:
   "Real Madrid CF": ["Real Madrid", "Madrid"]
   "FC Barcelona": ["Barcelona", "Barca"]
   "Real Sociedad de Fútbol": ["Real Sociedad", "La Real"]
-  "Athletic Club": ["Athletic Bilbao", "Athletic"]
+  "Athletic Club": ["Athletic Bilbao", "Athletic", "Bilbao"]
   "Real Betis Balompié": ["Real Betis", "Betis"]
   "RC Celta de Vigo": ["Celta Vigo", "Celta"]
   "Internazionale Milano FC": ["Inter Milan", "Inter", "Internazionale"]

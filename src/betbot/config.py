@@ -426,6 +426,26 @@ class Settings(BaseSettings):
     club_weight_form: float = Field(default=0.5, alias="BETBOT_CLUB_W_FORM")
     club_weight_market: float = Field(default=1.0, alias="BETBOT_CLUB_W_MARKET")
 
+    # ---- Cross-league Elo engine (Champions League only, R2) -----------
+    # The club Glicko/DC ratings are calibrated WITHIN a domestic league, so
+    # they can't price a CL tie that mixes leagues. ClubElo is a single
+    # Europe-wide Elo scale, so elo_home - elo_away is comparable across
+    # leagues — that is what unlocks CL predictions. Disable to fall back to
+    # the naive form engine for the CL. HA/rho are the values tuned by
+    # scripts/backtest_cl.py on seasons 2023+2024 (walk-forward, gate CI>0:
+    # +0.056 RPS/match vs naive on the held-out 2025 season). The DC blend
+    # beat pure Elo on train, so cl_weight_dc ships non-zero.
+    cl_elo_enabled: bool = Field(default=True, alias="BETBOT_CL_ELO")
+    clubelo_latest_path: Path = Field(
+        default=Path("./data/clubelo_latest.csv"), alias="BETBOT_CLUBELO_LATEST_PATH"
+    )
+    cl_elo_home_adv: float = Field(default=65.0, alias="BETBOT_CL_ELO_HOME_ADV")
+    cl_elo_draw_rho: float = Field(default=0.26, alias="BETBOT_CL_ELO_DRAW_RHO")
+    # Log-pool weights for the CL Elo ensemble components + market anchoring.
+    cl_weight_elo: float = Field(default=1.0, alias="BETBOT_CL_W_ELO")
+    cl_weight_dc: float = Field(default=1.0, alias="BETBOT_CL_W_DC")
+    cl_weight_market: float = Field(default=1.0, alias="BETBOT_CL_W_MARKET")
+
     # ---- Tournament simulator (outright/futures, scripts/simulate_wc.py)
     # How random extra-time/penalties are when a knockout match draws:
     # 1.0 = pure coin flip, 0.0 = fully decided by relative DC strength.
