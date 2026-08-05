@@ -863,3 +863,59 @@ When you finish this phase, tell the operator, in plain language:
 
 One commit for the phase, or split math/storage from wiring if it's large.
 Pause for operator review before and after.
+
+---
+
+# HANDOVER — Current state (2026-06-11)
+
+Live status overlay on top of the locked 9-phase plan above. **Read this first** —
+it reflects what's actually built/deployed since the original plan. When you finish
+meaningful work, update THIS section (date it) so the next session inherits accurate
+state.
+
+## Done & on `main` (droplet + GitHub, head 8b2778d)
+- Phases 1–9 + 5.5 Glicko + FastAPI backend + React frontend + Telegram bot
+  (@FootballNutmegbot, operator = TG user 1533981578).
+- Agent EVM wallet `0x608F1144C409E7de0d8164F5e942A390d3a53c0a` (same address on
+  Polygon + Base; key at `.secrets/agent_wallet.key`, 0600, gitignored). Funded
+  ~100 USDC on Base + a little gas.
+- Cross-venue arb scanner (Polymarket + Limitless + SX Bet) with Telegram alerts.
+- **Multi-tenant, NON-CUSTODIAL per-user trading** (commit 8b2778d): each registered
+  user gets an isolated wallet (`.secrets/users/<id>.key`); the bot places each
+  decided bet on EVERY active user's own wallet, sized to that user's balance
+  (`main._place_live_for_users`), skipping users below `min_user_stake_usd`. Funds
+  are never pooled. Falls back to the single agent wallet when no users registered.
+- 120 tests pass on the droplet (`python -m pytest`), ruff clean.
+
+## Take a user live on Polymarket (runbook)
+1. User does `/start` on the bot → gets their own wallet address.
+2. User funds it with USDC on **Polygon** (Polymarket's chain).
+3. Operator: `python scripts/polymarket_approve_users.py` (dry-run), then
+   `... --confirm` (sends txs; each user wallet needs a little MATIC for gas).
+4. Set `BETBOT_MODE=live` and clear/skip the gate. The daemon then trades each
+   funded+approved user wallet automatically. Currently `mode=paper`.
+
+## Limitless live orders — PARKED behind 2 blockers
+Plumbing proven (API auth via `LIMITLESS_API_KEY/SECRET`, on-chain USDC approval,
+EIP-712 signing, validated FOK schema — all in `limitless.py`). Blocked by:
+- `feeRateBps=0` rejected ("out of user's band"); required value not exposed by the
+  API → get it from Limitless docs/support, set `LIMITLESS_FEE_RATE_BPS`.
+- `minSize` = 100 USDC on WC group markets → no sub-$100 test possible.
+Also Limitless has NO per-match 1X2 WC markets (futures/props only), so the match
+strategy has nothing to trade there. **Polymarket is the live venue.**
+
+## Still open
+- **#30**: install systemd units (`deploy/install-systemd.sh`) for reboot survival —
+  needs operator sudo. Until then the bot runs under setsid/tmux and does NOT
+  survive a droplet reboot.
+- Onboard users: add TG ids to `TELEGRAM_ALLOWED_USER_IDS` or enable
+  `TELEGRAM_OPEN_REGISTRATION`.
+
+## Workflow notes
+- Droplet is source of truth; edit on Mac, scp to droplet, run there over SSH.
+- Pushing the default branch / scp-overwriting droplet code / destructive git are
+  harness-gated — do them only with explicit operator say-so; branch + PR for code.
+- No `gh` and no API token on the droplet (SSH deploy key only) → merge via git on
+  the droplet, not the GitHub API.
+- **Strategy honesty:** the Qatar-2022 backtest favourite-hit rate (54.7%) is
+  accuracy, NOT a proven edge over market prices. Don't claim the strategy is ±EV.

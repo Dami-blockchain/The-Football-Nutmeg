@@ -398,6 +398,34 @@ class Settings(BaseSettings):
     mov_fix_enabled: bool = Field(default=False, alias="BETBOT_MOV_FIX")
     glicko_mov_path: str = Field(default="data/glicko_mov.json", alias="BETBOT_GLICKO_MOV_PATH")
 
+    # ---- Club ensemble engine (domestic leagues: PL/PD/BL1/SA/FL1) -----
+    # The same Glicko+Dixon-Coles machinery the WC engine uses, wired to club
+    # fixtures. Ratings/params are seeded by scripts/seed_glicko_club.py +
+    # scripts/fit_dixon_coles_club.py. Disable to fall back to the naive
+    # form-only StrategyEngine for clubs. Scoped to domestic leagues only —
+    # cross-league ratings (CL) aren't calibrated, so CL keeps its old path.
+    club_ensemble_enabled: bool = Field(default=True, alias="BETBOT_CLUB_ENSEMBLE")
+    dc_params_club_path: Path = Field(
+        default=Path("./data/dc_params_club.json"), alias="BETBOT_DC_PARAMS_CLUB_PATH"
+    )
+    club_name_map_path: Path = Field(
+        default=Path("./data/club_name_map.json"), alias="BETBOT_CLUB_NAME_MAP_PATH"
+    )
+    ensemble_calibration_club_path: Path = Field(
+        default=Path("./data/ensemble_calibration_club.json"),
+        alias="BETBOT_CLUB_CALIBRATION_PATH",
+    )
+    # Clubs have a real, always-on home advantage (unlike neutral-venue WC).
+    # home_mu is the Glicko logit boost for the home side; draw_rho targets the
+    # ~25% domestic draw rate.
+    glicko_club_home_mu: float = Field(default=0.30, alias="BETBOT_GLICKO_CLUB_HOME_MU")
+    glicko_club_draw_rho: float = Field(default=0.28, alias="BETBOT_GLICKO_CLUB_DRAW_RHO")
+    # Log-pool weights for the club ensemble components + market anchoring.
+    club_weight_glicko: float = Field(default=1.0, alias="BETBOT_CLUB_W_GLICKO")
+    club_weight_dc: float = Field(default=1.0, alias="BETBOT_CLUB_W_DC")
+    club_weight_form: float = Field(default=0.5, alias="BETBOT_CLUB_W_FORM")
+    club_weight_market: float = Field(default=1.0, alias="BETBOT_CLUB_W_MARKET")
+
     # ---- Tournament simulator (outright/futures, scripts/simulate_wc.py)
     # How random extra-time/penalties are when a knockout match draws:
     # 1.0 = pure coin flip, 0.0 = fully decided by relative DC strength.

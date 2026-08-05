@@ -37,6 +37,8 @@ aliases:
   "Juventus FC": ["Juventus", "Juve"]
   "Olympique de Marseille": ["Marseille", "OM"]
   "Olympique Lyonnais": ["Lyon", "OL"]
+  "Stade Brestois 29": ["Brest", "Stade Brestois"]
+  "Stade Rennais FC 1901": ["Rennes", "Stade Rennais", "Rennais"]
 
   # ---- National teams (World Cup 2026) -----------------------------------
   # Markets and football-data.org disagree on national-team naming far more
