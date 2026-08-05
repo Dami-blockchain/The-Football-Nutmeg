@@ -1023,6 +1023,18 @@ def run_daemon(
     trigger = CronTrigger.from_crontab(cron_expr, timezone=timezone.utc)
 
     async def _tick() -> None:
+        # Refresh the cross-league Elo snapshot the CL engine reads, so a
+        # fixture is priced off today's ratings. Non-fatal + off the event
+        # loop; on failure the engine keeps the last snapshot.
+        _s = get_settings()
+        if _s.cl_elo_enabled:
+            try:
+                from betbot.data.clubelo import refresh_latest
+                await asyncio.to_thread(
+                    refresh_latest, Path(_s.clubelo_latest_path)
+                )
+            except Exception as e:  # noqa: BLE001 — never crash the tick
+                get_logger(__name__).warning("clubelo_refresh_tick_failed", error=str(e))
         # Settle finished bets first (updates the kill switch), then score —
         # so a freshly-tripped kill switch suppresses this tick's new bets.
         await _settle_once()
