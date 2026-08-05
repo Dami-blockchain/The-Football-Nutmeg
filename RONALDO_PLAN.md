@@ -101,6 +101,29 @@ snapshots are complete (187/189 resolved in backtest), and CL starts mid-Sep;
   ensemble component.
 * Gate + also track the home-win subset specifically (Wilkens effect).
 
+### R3 — RESULT (2026-08-06): real xG fetched; does NOT beat goals (gate not passed)
+Bought real Understat match xG via Apify (constructive_calm actor), 5 seasons
+2021/22-2024/25 complete for all big-5 (~8k matches, ~$27 of $29; partial
+2025/26 for PL/PD/SA — truncated at cost cap, immaterial to the gate).
+scripts/fetch_understat_xg.py + data/club_xg.csv.
+
+Gate (scripts/backtest_club_xg.py, held-out 2024/25, n=1752): swapping the
+Dixon-Coles input goals->xG, or blending both, did NOT beat the goals baseline:
+baseline RPS 0.2030 (acc 52.9%), xG 0.2031, blend 0.2028; bootstrap CIs on the
+per-match improvement include 0 (not distinguishable). At one season (n=1752)
+the effect is below detection; not shipped into the probability model (same
+gate discipline as R1). Re-test as seasons accumulate.
+
+TRAP FOUND: Understat's built-in match `forecast` looked market-beating (RPS
+0.163, acc 61%) but is POST-HOC — computed from the shots taken IN that match,
+so it has lookahead. NOT a usable pre-match predictor; excluded. Kept only as a
+labelled reference.
+
+STILL TO DELIVER (operator asked for it): surface predicted expected-goals
+(xG-DC lambda) on predictions as a DISPLAY readout (e.g. "Man City 2.07 - 1.23
+Liverpool"). This is information, not a probability change, so it needs no gate.
+Needs an Understat->football-data.org name bridge + a Prediction xG field.
+
 ### R4 — Player & lineup layer (the "EA-style" part)
 * Squad strength: aggregate player ratings (Sofascore/FotMob public
   ratings; EA FC ratings dataset as seasonal prior) weighted by expected
