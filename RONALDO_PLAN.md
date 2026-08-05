@@ -56,6 +56,16 @@ not across the board. So the objective function is:
 * Fit per-league isotonic calibration from walk-forward preds
   (`ensemble_calibration_club.json` — file supported, not yet fit).
 
+### R1 — RESULT (2026-08-05): GATE FAILED, incumbent stands
+1944-config sweep (MOV-Glicko, home_mu, draw_rho, DC half-life, weights,
+isotonic calibration) on an inner val season (2024-25), final gate ONCE on
+2025-26 test: best-on-val config improved test RPS by only +0.00046,
+CI95 [-0.00129, +0.00218] includes 0 -> val-season noise, not signal.
+Shipped config unchanged. Directional notes for later re-sweeps: ALL top-10
+val configs used the MOV variant and home_mu 0.20 (vs shipped 0.30), form
+weight 0.25 (vs 0.5); DC half-life was flat 390-720. Re-run
+scripts/backtest_club_r1.py once 2026-27 season data accumulates.
+
 ### R2 — Cross-league Elo → unlock Champions League
 * Ingest European results (CL/EL/ECL) from football-data.org (already a
   venue we poll) + our domestic CSV into one result stream.
