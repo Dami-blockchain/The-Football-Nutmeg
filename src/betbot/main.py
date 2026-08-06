@@ -10,27 +10,29 @@ Commands (run as ``nutmeg <command>``, ``tfsm <command>`` or ``betbot <command>`
 from __future__ import annotations
 
 import asyncio
-from datetime import date, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated
 
 import typer
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.date import DateTrigger
 
 from betbot.config import get_settings
 from betbot.data.football_data import FootballDataClient, FootballDataError
 from betbot.data.form import FormService, _parse_kickoff, _parse_team
-from betbot.exchanges.base import ExchangeName
-from betbot.exchanges.limitless import LimitlessAdapter
-from betbot.exchanges.limitless_client import LimitlessClient
 from betbot.exchanges.matcher import TeamAliasResolver
 from betbot.exchanges.polymarket import PolymarketAdapter
 from betbot.exchanges.polymarket_gamma import GammaClient
 from betbot.exchanges.router import ExchangeRouter
 from betbot.backtest import backtest_mock, backtest_stored
-from betbot.daily_jobs import register_daily_jobs, run_daily_report
+from betbot.daily_jobs import (
+    nairobi_day_bounds,
+    register_daily_jobs,
+    run_matchday_alert,
+    send_fixture_alert,
+)
 from betbot.gate import evaluate_gate
 from betbot.logging import configure_logging, get_logger
 from betbot.settlement import SettlementWatcher
@@ -40,18 +42,14 @@ from betbot.storage.repos import (
     get_kill_switch,
     insert_paper_bet,
     insert_paper_bet_no_market,
-    is_kill_switch_tripped,
     list_recent_paper_bets,
-    list_users,
+    predictions_for_kickoff_range,
     reset_kill_switch,
     upsert_prediction,
 )
 from betbot.strategy.engine import StrategyEngine
 from betbot.strategy.club_engine import ClubStrategyEngine
 from betbot.strategy.cl_engine import EuropeanStrategyEngine
-# NOTE: betbot.wallet pulls in web3 (the `api` extra) at import time, so it's
-# imported lazily inside the functions that need it — keeping `betbot.main`
-# importable (and testable) on the base install.
 
 # Repo root (…/tfsm), used to locate config/team_aliases.yaml regardless of cwd.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -66,172 +64,49 @@ app.add_typer(glicko_app, name="glicko")
 
 
 # ----------------------------------------------------------------------
-# Exchange routing
+# Exchange routing (READ-ONLY — predictions-only build)
 # ----------------------------------------------------------------------
-class _ClientGroup:
-    """A closeable bag of HTTP clients created lazily during a run.
+def _build_router(settings) -> tuple[ExchangeRouter, list]:
+    """Construct a READ-ONLY exchange router for a run.
 
-    Lets ``_build_router`` hand the caller ONE entry in its close list that, on
-    ``close()``, closes every per-user client built after the router was made.
-    Closing is best-effort: one client's failure doesn't block the rest.
+    Returns ``(router, http_clients_to_close)``.
+
+    This build fetches Polymarket market PRICES only — it anchors predictions
+    and computes the edge-based bet/no-bet recommendation. It NEVER places an
+    order or moves funds: the Polymarket adapter is read-only and carries NO
+    order-placement path or signing key at all (only ``find_market`` /
+    ``get_orderbook`` exist), so there is nothing here to arm. Limitless has been
+    removed entirely; only Polymarket read pricing remains.
     """
-
-    def __init__(self) -> None:
-        self._clients: list = []
-
-    def add(self, client) -> None:
-        self._clients.append(client)
-
-    async def close(self) -> None:
-        for c in self._clients:
-            try:
-                await c.close()
-            except Exception as e:  # noqa: BLE001 — cleanup must not raise
-                get_logger(__name__).warning("client_close_failed", error=str(e))
-
-
-def _build_router(settings) -> tuple[ExchangeRouter, list, object]:
-    """Construct the exchange router for a run.
-
-    Returns ``(router, http_clients_to_close, make_signer_adapters)``.
-
-    ``enable_orders`` stays False through Phase 3 (paper only) — live ordering
-    is wired in Phase 5; each adapter's double-gate keeps place_order inert
-    regardless. Limitless football coverage is sparse and US IPs are geo-blocked
-    (surfaced as LimitlessGeoBlockedError, which the router isolates per-adapter),
-    so most runs route on Polymarket alone — expected, not an error.
-
-    ``make_signer_adapters(signing_key, funder)`` rebuilds the venue adapters
-    bound to a *different* signing key — this is how multi-tenant placement
-    trades each user's own wallet. Market discovery/scoring is wallet-independent
-    and done once via ``router``; only the final ``place_order`` is per-user.
-    """
-    from betbot.wallet import get_private_key
-
     resolver = TeamAliasResolver.from_yaml(_REPO_ROOT / "config" / "team_aliases.yaml")
-    enable = settings.mode == "live"  # double-gate: place_order also checks mode
-
-    # Fall back to the agent wallet key (the one you deposit into) for signing
-    # if explicit per-venue keys aren't set.
-    agent_key = get_private_key(settings.wallet_keyfile)
 
     gamma = GammaClient()
-    limitless_client = LimitlessClient(
-        api_key=settings.limitless_api_key,
-        api_secret=settings.limitless_api_secret,
-    )
-
-    # Per-user LimitlessClients (one per linked key) are created lazily as
-    # funded users are processed, and live for the run. They're gathered in a
-    # _ClientGroup so the caller's uniform ``await client.close()`` cleanup loop
-    # closes all of them without knowing they exist.
-    user_clients = _ClientGroup()
-
-    def make_signer_adapters(
-        *,
-        signing_key: str | None,
-        funder: str | None = None,
-        limitless_creds: dict | None = None,
-        agent_fallback: bool = False,
-    ) -> dict:
-        """Venue adapters bound to one signing key.
-
-        Polymarket is always present. Limitless is per-account:
-
-        * ``limitless_creds`` given → build a dedicated ``LimitlessClient`` with
-          THAT user's api_key/secret and a ``LimitlessAdapter`` signing with
-          THAT user's wallet key, so the order authenticates AND signs as the
-          key owner (Limitless keys are scoped to their own wallet/profile).
-        * ``agent_fallback=True`` → reuse the shared agent client built from
-          ``settings.limitless_api_key/secret`` (the no-user / global path,
-          unchanged from before).
-        * otherwise (a real user with no linked key) → OMIT Limitless entirely,
-          so the user's Polymarket leg still trades but no Limitless order is
-          ever attempted under the wrong (shared/agent) credentials.
-
-        Shares the Polymarket HTTP client (``gamma``) across all adapters.
-        """
-        pm = PolymarketAdapter(
-            gamma, resolver, enable_orders=enable, mode=settings.mode,
-            private_key=signing_key, funder=funder,
-            signature_type=settings.polymarket_signature_type,
-        )
-        adapters: dict = {ExchangeName.POLYMARKET: pm}
-
-        lm_client: LimitlessClient | None = None
-        if limitless_creds is not None:
-            lm_client = LimitlessClient(
-                api_key=limitless_creds.get("api_key", ""),
-                api_secret=limitless_creds.get("api_secret", ""),
-            )
-            user_clients.add(lm_client)
-        elif agent_fallback:
-            lm_client = limitless_client
-
-        if lm_client is not None:
-            adapters[ExchangeName.LIMITLESS] = LimitlessAdapter(
-                lm_client, resolver, enable_orders=enable, mode=settings.mode,
-                private_key=signing_key, fee_rate_bps=settings.limitless_fee_rate_bps,
-                max_order_usd=settings.max_bet_usd,
-            )
-        return adapters
-
-    base = make_signer_adapters(
-        signing_key=settings.polymarket_private_key or agent_key,
-        funder=settings.polymarket_funder or None,
-        agent_fallback=True,
-    )
+    pm = PolymarketAdapter(gamma, resolver)  # read-only: no key, no order path
     router = ExchangeRouter(
-        [base[ExchangeName.POLYMARKET], base[ExchangeName.LIMITLESS]],
+        [pm],
         min_plausible_price=settings.min_plausible_price,
         max_plausible_price=settings.max_plausible_price,
     )
-    # ``user_clients`` is a single closeable that fans out to every per-user
-    # Limitless client built mid-run, so the caller's uniform close loop reaches
-    # them all.
-    return router, [gamma, limitless_client, user_clients], make_signer_adapters
+    return router, [gamma]
 
 
 # ----------------------------------------------------------------------
 # Scoring run
 # ----------------------------------------------------------------------
 async def _score_once() -> int:
-    """Pull fixtures in the next 48h, score each, log paper bets."""
+    """Pull fixtures in the next 48h, score each, log a paper reco per fixture.
+
+    Predictions-only: reads Polymarket PRICES to anchor the edge-based
+    bet/no-bet recommendation and logs a "paper reco" row. No order is ever
+    placed and no funds move.
+    """
     settings = get_settings()
     log = get_logger(__name__)
     init_engine(settings.db_path)
 
-    kill_tripped = is_kill_switch_tripped()
-    if kill_tripped:
-        log.warning(
-            "kill_switch_active",
-            note="predictions still recorded, but NO new bets will be logged",
-        )
-
-    # Live pre-flight: only place real orders if the gate is clear. If it fails
-    # we still score + log paper bets (data keeps flowing), just no live orders.
-    live_orders = settings.mode == "live"
-    if live_orders and settings.require_gate:
-        gate = evaluate_gate(settings)
-        if not gate.passed:
-            log.error(
-                "live_gate_failed",
-                reasons=gate.reasons,
-                note="paper bets still logged; NO live orders this run",
-            )
-            live_orders = False
-    elif live_orders and not settings.require_gate:
-        log.warning(
-            "live_gate_skipped",
-            note="BETBOT_REQUIRE_GATE=false — trading live with no paper-history gate",
-        )
-
     log.info(
         "starting_scoring_run",
-        mode=settings.mode,
         leagues=list(settings.leagues),
-        kill_switch_tripped=kill_tripped,
-        live_orders=live_orders,
     )
 
     today = date.today()
@@ -240,10 +115,7 @@ async def _score_once() -> int:
     date_to = (today + timedelta(days=2)).isoformat()
 
     paper_bets_logged = 0
-    router, _http_clients, make_signer_adapters = _build_router(settings)
-    # Per-run cache of per-user signer adapters (keyed by wallet keyfile), so we
-    # build one ClobClient per user, not one per bet.
-    user_adapter_cache: dict[str, dict] = {}
+    router, _http_clients = _build_router(settings)
 
     async with FootballDataClient(
         api_key=settings.football_data_api_key,
@@ -288,9 +160,7 @@ async def _score_once() -> int:
                 for m in matches:
                     try:
                         bets = await _score_and_log_one(
-                            m, league, form_service, eng, router,
-                            settings, kill_tripped, live_orders,
-                            make_signer_adapters, user_adapter_cache,
+                            m, league, form_service, eng, router, settings,
                         )
                         paper_bets_logged += bets
                     except FootballDataError as e:
@@ -326,12 +196,8 @@ async def _score_and_log_one(
     engine: StrategyEngine,
     router: ExchangeRouter,
     settings,
-    kill_tripped: bool = False,
-    live_orders: bool = False,
-    make_signer_adapters=None,
-    user_adapter_cache: dict | None = None,
 ) -> int:
-    """Score one fixture and log a paper bet.
+    """Score one fixture and log a paper reco (recommendation record).
 
     Tri-state routing on the model's favourite outcome:
 
@@ -374,11 +240,8 @@ async def _score_and_log_one(
 
     pred_id = upsert_prediction(prediction, kickoff=kickoff)
 
-    # Kill switch: predictions are still recorded above (useful data), but we
-    # refuse to log any new bet while the drawdown kill switch is tripped.
-    if kill_tripped:
-        log.debug("bet_suppressed_kill_switch", fixture_id=fixture_id)
-        return 0
+    # Predictions-only: recos are NEVER suppressed (there is no trading and no
+    # drawdown kill switch gating them). They always flow.
 
     # Risk gate: stop if today's exposure has already hit the cap.
     if (
@@ -424,12 +287,6 @@ async def _score_and_log_one(
             )
         else:
             log.debug("paper_bet_already_logged", fixture_id=fixture_id)
-        # Phase 5: place the real order on every active user's own wallet
-        # (gated; skipped when not live).
-        await _place_live_for_users(
-            route, prediction, decision, settings, live_orders,
-            make_signer_adapters, user_adapter_cache if user_adapter_cache is not None else {},
-        )
         return 1 if inserted else 0
 
     # ---- No market: Phase-1 favourite-only paper bet -----------------
@@ -457,139 +314,6 @@ async def _score_and_log_one(
         return 1
     log.debug("paper_bet_already_logged", fixture_id=fixture_id)
     return 0
-
-
-async def _place_one(
-    adapter, route, prediction, decision, stake_usd, max_price, *, who
-) -> None:
-    """Place a single real order on one venue adapter (one wallet)."""
-    log = get_logger(__name__)
-    try:
-        result = await adapter.place_order(
-            route.market, decision.outcome, stake_usd, max_price
-        )
-        log.info(
-            "live_order_placed",
-            who=who,
-            fixture_id=prediction.fixture_id,
-            exchange=route.quote.exchange.value,
-            outcome=decision.outcome.value,
-            stake_usd=round(stake_usd, 2),
-            order_id=result.order_id,
-            status=result.status,
-        )
-    except Exception as e:  # noqa: BLE001 — paper row persists even if order fails
-        log.error(
-            "live_order_failed",
-            who=who,
-            fixture_id=prediction.fixture_id,
-            exchange=route.quote.exchange.value,
-            error=str(e),
-        )
-
-
-async def _place_live_for_users(
-    route, prediction, decision, settings, live_orders,
-    make_signer_adapters, user_adapter_cache: dict,
-) -> None:
-    """Place the decided bet on EVERY active user's own wallet — heavily gated.
-
-    Non-custodial multi-tenant placement: market discovery + the bet decision
-    are wallet-independent and already done by the caller; here we re-sign and
-    submit the same order from each user's isolated wallet, sized to that user's
-    own balance. One user's order never touches another's funds.
-
-    No-ops unless ``live_orders`` (live mode + gate clear). The paper bet has
-    already been logged and persists regardless of whether any live order
-    succeeds. When no users are registered, falls back to the single global
-    agent wallet (backward-compatible).
-    """
-    log = get_logger(__name__)
-    if not live_orders:
-        return
-
-    max_price = min(0.99, route.quote.yes_price + settings.order_slippage)
-    venue = route.quote.exchange
-
-    users = list_users()
-    if not users:
-        # Backward-compatible: trade the single global agent wallet. (No wallet
-        # import on this path — keeps the web3 dependency off the single-wallet
-        # flow and its tests.)
-        await _place_one(
-            route.adapter, route, prediction, decision,
-            decision.stake_usd, max_price, who="agent",
-        )
-        return
-
-    if make_signer_adapters is None:  # defensive — caller always supplies it live
-        log.error("multi_user_placement_unconfigured", fixture_id=prediction.fixture_id)
-        return
-
-    # Per-user path: size each order against that user's balance on the venue's
-    # chain. betbot.wallet pulls in web3, so import it only here.
-    from betbot.wallet import get_private_key, load_limitless_creds, usdc_balance
-
-    chain = "polygon" if venue == ExchangeName.POLYMARKET else "base"
-    rpc = settings.polygon_rpc_url if chain == "polygon" else settings.base_rpc_url
-
-    for u in users:
-        who = f"user:{u.telegram_user_id}"
-        # Per-user isolation: one user's bad key / RPC blip / adapter build error
-        # must not abort placement for everyone else (or the next fixture). The
-        # decided paper bet is already persisted regardless.
-        try:
-            key = get_private_key(Path(u.wallet_keyfile))
-            if not key:
-                log.warning("user_key_missing", who=who, keyfile=u.wallet_keyfile)
-                continue
-            bal = usdc_balance(u.wallet_address, chain, rpc)
-            stake = min(decision.stake_usd, bal.usdc) if bal.ok else 0.0
-            if stake < settings.min_user_stake_usd:
-                log.info(
-                    "user_bet_skipped_low_balance",
-                    who=who, chain=chain,
-                    balance=round(bal.usdc, 2) if bal.ok else None,
-                    need=settings.min_user_stake_usd,
-                )
-                continue
-            adapters = user_adapter_cache.get(u.wallet_keyfile)
-            if adapters is None:
-                # Each user trades their OWN Limitless account: pass THEIR linked
-                # api_key/secret (or None → no Limitless leg for them). Polymarket
-                # is always built and unaffected.
-                creds = load_limitless_creds(
-                    settings.secrets_dir, u.telegram_user_id
-                )
-                adapters = make_signer_adapters(
-                    signing_key=key,
-                    funder=u.wallet_address,
-                    limitless_creds=creds,
-                )
-                user_adapter_cache[u.wallet_keyfile] = adapters
-            adapter = adapters.get(venue)
-            if adapter is None:
-                # Venue is Limitless but this user hasn't linked a Limitless key.
-                # Skip their Limitless leg only — their Polymarket leg (a separate
-                # fixture/route) still trades. Logged once per (user, fixture).
-                log.info(
-                    "user_limitless_unlinked_skipped",
-                    who=who,
-                    fixture_id=prediction.fixture_id,
-                    venue=str(getattr(venue, "value", venue)),
-                    note="no linked Limitless key — skipping this user's Limitless leg",
-                )
-                continue
-            await _place_one(
-                adapter, route, prediction, decision, stake, max_price, who=who,
-            )
-        except Exception as e:  # noqa: BLE001 — isolate per-user placement failures
-            log.error(
-                "user_placement_failed",
-                who=who,
-                fixture_id=prediction.fixture_id,
-                error=str(e),
-            )
 
 
 # ----------------------------------------------------------------------
@@ -763,8 +487,8 @@ def run_daemon(
                 )
             except Exception as e:  # noqa: BLE001 — never crash the tick
                 get_logger(__name__).warning("clubelo_refresh_tick_failed", error=str(e))
-        # Settle finished bets first (updates the kill switch), then score —
-        # so a freshly-tripped kill switch suppresses this tick's new bets.
+        # Score recos for the next 48h, then settle finished recos (accuracy
+        # tracking). No orders are placed on either step.
         await _settle_once()
         await _score_once()
 
@@ -789,23 +513,53 @@ def run_daemon(
         except Exception as e:  # noqa: BLE001 — never crash the daemon
             get_logger(__name__).warning("club_refresh_failed", error=str(e))
 
-    async def _daily_report_tick() -> None:
-        # 21:00 Africa/Nairobi: trades/settlements/P&L/balances.
+    async def _matchday_alert_tick() -> None:
+        # Matchday-morning (Africa/Nairobi): today's entitlement-gated
+        # predictions per registered user.
         try:
-            await run_daily_report(get_settings())
+            await run_matchday_alert(get_settings())
         except Exception as e:  # noqa: BLE001 — never crash the daemon
-            get_logger(__name__).warning("daily_report_failed", error=str(e))
+            get_logger(__name__).warning("matchday_alert_failed", error=str(e))
 
-    async def _deposit_tick() -> None:
-        # Deposit pipeline: detect new user USDC, CCTP-bridge it to the
-        # trading chains, run venue approvals. Lazy import — betbot.bridge
-        # pulls in web3 (the `api` extra), which the base install lacks.
+    async def _schedule_kickoff_alerts(scheduler) -> None:
+        # Read today's predictions and schedule a one-off ~60m-before-kickoff
+        # reminder per fixture. Runs at daemon start AND daily (05:00 UTC) so a
+        # long-running daemon keeps picking up newly-scored fixtures. Jobs are
+        # idempotent (replace_existing on a per-fixture id). Never crashes.
         try:
-            from betbot.bridge import run_deposit_scan
+            _s = get_settings()
+            now = datetime.now(timezone.utc)
+            start, end, _day = nairobi_day_bounds(now)
+            preds = predictions_for_kickoff_range(start, end)
+            lead = timedelta(minutes=_s.kickoff_alert_lead_minutes)
+            scheduled = 0
+            for p in preds:
+                run_at = p.kickoff - lead
+                if run_at <= now:
+                    continue  # kickoff-60m already past — skip
+                fid = p.fixture_id
 
-            await run_deposit_scan(get_settings())
-        except Exception as e:  # noqa: BLE001 — never let the scanner crash the daemon
-            get_logger(__name__).warning("deposit_tick_failed", error=str(e))
+                async def _fire(fixture_id=fid) -> None:
+                    try:
+                        await send_fixture_alert(get_settings(), fixture_id)
+                    except Exception as e:  # noqa: BLE001 — never crash
+                        get_logger(__name__).warning(
+                            "kickoff_alert_failed", fixture_id=fixture_id,
+                            error=str(e),
+                        )
+
+                scheduler.add_job(
+                    _fire,
+                    trigger=DateTrigger(run_date=run_at, timezone=timezone.utc),
+                    id=f"kickoff_{fid}",
+                    replace_existing=True,
+                )
+                scheduled += 1
+            get_logger(__name__).info(
+                "kickoff_alerts_scheduled", scheduled=scheduled,
+            )
+        except Exception as e:  # noqa: BLE001 — never crash the daemon
+            get_logger(__name__).warning("schedule_kickoff_alerts_failed", error=str(e))
 
     async def _main() -> None:
         s = get_settings()
@@ -817,22 +571,23 @@ def run_daemon(
             trigger=CronTrigger.from_crontab("0 6 * * 1", timezone=timezone.utc),
             id="club_data_refresh",
         )
-        register_daily_jobs(scheduler, s, daily_report=_daily_report_tick)
+        register_daily_jobs(scheduler, s, matchday_alert=_matchday_alert_tick)
+        # Re-scan for today's fixtures daily so the daemon keeps scheduling
+        # kickoff reminders as new fixtures get scored.
         scheduler.add_job(
-            _deposit_tick,
-            trigger=IntervalTrigger(minutes=s.deposit_scan_minutes),
-            id="deposit_scan",
+            lambda: _schedule_kickoff_alerts(scheduler),
+            trigger=CronTrigger.from_crontab("0 5 * * *", timezone=timezone.utc),
+            id="reschedule_kickoff_alerts",
         )
         scheduler.start()
         log.info(
             "daemon_started",
             cron=cron_expr,
-            daily_report_hour_nairobi=(
-                s.daily_report_hour if s.daily_report_enabled else None
-            ),
-            deposit_scan_min=s.deposit_scan_minutes,
+            matchday_alert_hour_nairobi=s.matchday_alert_hour,
+            kickoff_alert_lead_minutes=s.kickoff_alert_lead_minutes,
         )
         await _tick()  # immediate first run
+        await _schedule_kickoff_alerts(scheduler)  # schedule today's reminders now
         try:
             await asyncio.Event().wait()
         finally:

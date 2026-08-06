@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta, timezone
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from betbot.logging import get_logger
 from betbot.storage.db import session_scope
@@ -15,6 +16,7 @@ from betbot.storage.models import (
     GlickoRating,
     KillSwitch,
     PaperBet,
+    PredictionReveal,
     PredictionRow,
     TreasuryBridge,
     User,
@@ -803,5 +805,128 @@ def list_users() -> list[User]:
         )
         s.expunge_all()
         return rows
+
+
+def increment_predictions_consumed(telegram_user_id: int) -> None:
+    """Charge one paid prediction reveal to this user (post-trial billing).
+
+    Called by the caller ONLY after a prediction is actually revealed — the
+    entitlement decision itself never mutates. No-op if the user is unknown.
+    """
+    with session_scope() as s:
+        u = s.execute(
+            select(User).where(User.telegram_user_id == telegram_user_id)
+        ).scalar_one_or_none()
+        if u is None:
+            return
+        u.predictions_consumed = (u.predictions_consumed or 0) + 1
+
+
+# ----------------------------------------------------------------------
+# Reveal ledger (per-(user, fixture) money idempotency)
+# ----------------------------------------------------------------------
+def has_revealed(telegram_user_id: int, fixture_id: int) -> bool:
+    """True if this fixture has already been revealed to this user.
+
+    An already-revealed fixture is re-shown FREE and never re-charged — this is
+    the guard that stops the matchday alert, the kickoff alert, and every
+    repeat of ``/predictions`` from billing the same fixture more than once.
+    """
+    with session_scope() as s:
+        row = s.execute(
+            select(PredictionReveal.id)
+            .where(PredictionReveal.telegram_user_id == telegram_user_id)
+            .where(PredictionReveal.fixture_id == fixture_id)
+            .limit(1)
+        ).scalar_one_or_none()
+        return row is not None
+
+
+def record_reveal(
+    telegram_user_id: int, fixture_id: int, charged: bool
+) -> bool:
+    """Record that this fixture was revealed to this user. Idempotent.
+
+    Returns ``True`` if a NEW ledger row was inserted, ``False`` if one already
+    existed (the unique constraint fired). Callers increment the paid-credit
+    counter only when this returns True AND ``charged`` is set, so committing a
+    reveal twice (e.g. a retried Telegram send) can never double-charge.
+    """
+    try:
+        with session_scope() as s:
+            s.add(
+                PredictionReveal(
+                    telegram_user_id=telegram_user_id,
+                    fixture_id=fixture_id,
+                    charged=charged,
+                )
+            )
+        return True
+    except IntegrityError:
+        # Row already exists (uq_reveal_user_fixture) — safe no-op.
+        return False
+
+
+# ----------------------------------------------------------------------
+# Prediction delivery queries (tipster alerts + /predictions)
+# ----------------------------------------------------------------------
+def predictions_for_kickoff_range(
+    start_dt: datetime, end_dt: datetime
+) -> list[PredictionRow]:
+    """Predictions whose kickoff is in ``[start_dt, end_dt)``, earliest first.
+
+    ONE row per fixture — the latest ``run_date`` wins. The scoring window is
+    48h, so a fixture is re-scored on consecutive daily runs and the table
+    holds 2-3 rows per fixture (unique on (fixture_id, run_date)); without this
+    dedup the tipster message would list the same fixture multiple times AND
+    (money bug) charge a paying user one credit per duplicate row in a single
+    render.
+
+    Rows are detached; the linked paper_bet (our recommendation) is eager-loaded
+    so :func:`betbot.tips.format_prediction` can read it after the session
+    closes without a DetachedInstanceError.
+    """
+    from sqlalchemy.orm import selectinload
+
+    with session_scope() as s:
+        rows = list(
+            s.execute(
+                select(PredictionRow)
+                .where(PredictionRow.kickoff >= start_dt)
+                .where(PredictionRow.kickoff < end_dt)
+                .order_by(PredictionRow.kickoff.asc())
+                .options(selectinload(PredictionRow.paper_bets))
+            ).scalars()
+        )
+        s.expunge_all()
+    # Keep only the freshest row per fixture (max run_date; id breaks ties),
+    # preserving kickoff order.
+    best: dict[int, PredictionRow] = {}
+    for r in rows:
+        cur = best.get(r.fixture_id)
+        if cur is None or (r.run_date, r.id) > (cur.run_date, cur.id):
+            best[r.fixture_id] = r
+    return [r for r in rows if best[r.fixture_id] is r]
+
+
+def prediction_for_fixture(fixture_id: int) -> PredictionRow | None:
+    """The most recent prediction for ``fixture_id`` (latest run_date wins).
+
+    Detached, with its paper_bets eager-loaded — used by the per-fixture
+    kickoff-60m alert.
+    """
+    from sqlalchemy.orm import selectinload
+
+    with session_scope() as s:
+        row = s.execute(
+            select(PredictionRow)
+            .where(PredictionRow.fixture_id == fixture_id)
+            .order_by(PredictionRow.run_date.desc())
+            .options(selectinload(PredictionRow.paper_bets))
+            .limit(1)
+        ).scalar_one_or_none()
+        if row is not None:
+            s.expunge_all()
+        return row
 
 

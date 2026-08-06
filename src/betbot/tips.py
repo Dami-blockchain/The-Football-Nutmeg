@@ -1,0 +1,97 @@
+"""Prediction delivery formatting — the tipster message bodies.
+
+Pure formatters over a stored :class:`~betbot.storage.models.PredictionRow`
+(and its linked ``paper_bet``, which IS our recommendation). Kept separate from
+storage/network so the exact message shapes are unit-testable with fixture data.
+
+The STANDING format rule (a memory-pinned product requirement): every match
+prediction carries a home/away designation, market anchoring, the xG readout
+when present, and a BOLD bet/no-bet call — defaulting to NO BET. A prediction is
+a BET only when a stored paper_bet exists with a market edge at/above threshold;
+otherwise (no market, or edge below threshold) it is NO BET.
+
+Messages use Telegram Markdown (``parse_mode="Markdown"``), matching
+:mod:`betbot.reports`.
+"""
+
+from __future__ import annotations
+
+from betbot.config import get_settings
+
+
+def _kickoff_str(pred) -> str:
+    """Kickoff as ``HH:MM`` UTC; empty if absent."""
+    ko = getattr(pred, "kickoff", None)
+    if ko is None:
+        return ""
+    return ko.strftime("%H:%M")
+
+
+def _reco_bet(pred, *, edge_threshold: float):
+    """The stored recommendation for this prediction, or ``None`` = NO BET.
+
+    Our recommendation is the linked paper_bet. A paper_bet with a market price
+    and an edge >= threshold is a BET on ``outcome``; anything else (no
+    paper_bet, no market price, or edge below threshold) is NO BET.
+    """
+    bets = list(getattr(pred, "paper_bets", None) or [])
+    for b in bets:
+        if b.market_price is not None and b.edge is not None and b.edge >= edge_threshold:
+            return b
+    return None
+
+
+def _outcome_label(outcome: str, home: str, away: str) -> str:
+    if outcome == "HOME":
+        return f"{home} (H)"
+    if outcome == "AWAY":
+        return f"{away} (A)"
+    return "the draw"
+
+
+def format_prediction(pred, *, edge_threshold: float | None = None) -> str:
+    """Full revealed prediction: teams (H/A), model triple + xG, market, call."""
+    if edge_threshold is None:
+        edge_threshold = get_settings().edge_threshold
+
+    home, away = pred.home_team, pred.away_team
+    ko = _kickoff_str(pred)
+    header = f"*{home} (H) v {away} (A)*"
+    if ko:
+        header += f" — {ko}"
+
+    model = (
+        f"Model: H {pred.p_home:.0%} / D {pred.p_draw:.0%} / A {pred.p_away:.0%}"
+    )
+    if pred.home_xg is not None and pred.away_xg is not None:
+        model += f"   (xG {pred.home_xg:.2f}–{pred.away_xg:.2f})"
+
+    reco = _reco_bet(pred, edge_threshold=edge_threshold)
+    if reco is not None:
+        market = f"Market: {reco.outcome} {reco.market_price:.2f}   Edge: {reco.edge:+.2f}"
+        call = f"*Bet: {_outcome_label(reco.outcome, home, away)}* (edge {reco.edge:+.2f})"
+    else:
+        # Any priced-but-below-threshold reco still shows the price if we have it.
+        priced = next(
+            (b for b in (getattr(pred, "paper_bets", None) or [])
+             if b.market_price is not None),
+            None,
+        )
+        if priced is not None:
+            market = f"Market: {priced.outcome} {priced.market_price:.2f}"
+            call = "*Bet: NO BET* (edge below threshold)"
+        else:
+            market = "Market: n/a"
+            call = "*Bet: NO BET* (no market)"
+
+    return "\n".join([header, model, market, call])
+
+
+def format_locked(pred) -> str:
+    """Teaser for a locked prediction — teams + kickoff only, NO probabilities."""
+    home, away = pred.home_team, pred.away_team
+    ko = _kickoff_str(pred)
+    header = f"*{home} (H) v {away} (A)*"
+    if ko:
+        header += f" — {ko}"
+    return f"{header}\n🔒 send 1 USDC (Polygon) to unlock this prediction"

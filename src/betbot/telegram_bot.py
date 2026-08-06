@@ -1,9 +1,11 @@
-"""Telegram bot — multi-user, non-custodial.
+"""Telegram bot — multi-user football-prediction TIPSTER.
 
-Each user registers with /start and gets their OWN isolated wallet (key stored
-server-side under .secrets/users/<id>.key). Funds stay in each user's own wallet
-— nothing is pooled. The bot reads its own functions in-process; it never moves
-one user's funds into another's.
+Each user registers with /start and gets their OWN isolated deposit wallet (key
+stored server-side under .secrets/users/<id>.key). The bot sends football
+predictions — it places NO orders and moves NO funds. Predictions are FREE for
+7 days from signup; after that each individual match prediction costs 1 USDC,
+paid by sending USDC on Polygon to the user's own address. The operator
+(TELEGRAM_ALLOWED_USER_ID) is always free/unlimited.
 
 Access: a user may register if (a) open registration is on, (b) their id is in
 the allowlist, or (c) they're already registered. Run with TELEGRAM_BOT_TOKEN
@@ -11,6 +13,8 @@ set:  python -m betbot.telegram_bot
 """
 
 from __future__ import annotations
+
+from datetime import datetime, timezone
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -22,18 +26,21 @@ from telegram.ext import (
     filters,
 )
 
-from betbot.backtest import backtest_stored
 from betbot.config import get_settings
-from betbot.gate import evaluate_gate
+from betbot.daily_jobs import (
+    commit_reveals,
+    nairobi_day_bounds,
+    render_user_predictions,
+)
+from betbot.entitlement import entitlement_for
 from betbot.llm_agent import LLMAgent
-from betbot.logging import configure_logging, get_logger
+from betbot.logging import get_logger
 from betbot.storage.db import init_engine
 from betbot.storage.repos import (
     get_or_create_user,
     get_user,
-    list_recent_paper_bets,
+    predictions_for_kickoff_range,
 )
-from betbot.wallet import all_balances, store_limitless_creds
 
 log = get_logger(__name__)
 
@@ -76,63 +83,73 @@ def _authed(handler):
 async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     u = _register(update)
     await update.message.reply_text(
-        "⚽ *The Football Nutmeg Agent*\n\n"
-        "I trade football prediction markets on Polymarket (Polygon) and "
-        "Limitless (Base) using a probability model, and I only bet when my "
-        "edge over the market price clears a threshold.\n\n"
-        "*You're registered.* You have your own isolated wallet — your funds "
-        "stay yours and are never pooled with anyone else's.\n\n"
-        f"*Your personal deposit address:*\n`{u.wallet_address}`\n\n"
-        "*Getting started*\n"
-        "1. Deposit at least *10 USDC* to your personal wallet address above "
-        "to begin.\n"
-        "2. The same address works on *Polygon* and *Base* — send USDC on "
-        "either chain (bridge between them with any standard bridge if "
-        "needed). /balance confirms arrival.\n"
-        "3. Trading starts in *paper mode*; live trading only switches on "
-        "once the performance gate passes.\n"
-        "4. Daily report (Nairobi time): performance report at *9pm*.\n\n"
+        "⚽ *Football Nutmeg Bot*\n\n"
+        "I send you football *predictions* for the top European leagues and the "
+        "Champions League: model probabilities, expected goals, and a clear "
+        "bet / no-bet call anchored to the market. I never place bets and never "
+        "move your funds.\n\n"
+        "*You're registered.*\n\n"
+        "*How it works*\n"
+        "• Predictions are *FREE for your first 7 days*.\n"
+        "• After the trial, each match prediction costs *1 USDC on Polygon* — "
+        "1 USDC unlocks 1 prediction.\n"
+        "• Pay by sending USDC (Polygon) to your personal address below; I "
+        "detect it on-chain automatically.\n\n"
+        f"*Your payment address (Polygon):*\n`{u.wallet_address}`\n\n"
         "*Commands*\n"
-        "/deposit – your wallet address (Polygon + Base)\n"
-        "/balance – your USDC balance\n"
-        "/status – mode, gate, performance\n"
-        "/bets – recent bets\n"
+        "/predictions – today's fixtures + predictions\n"
+        "/balance – your USDC balance + credits\n"
+        "/status – trial / credits\n"
         "/help – this guide\n\n"
-        "You can also just *ask me anything* in plain text — how deposits "
-        "work, what the bot is doing, what a report means.\n\n"
-        "⚠️ *Risk disclaimer:* prediction-market trading can lose money, "
-        "including everything you deposit. Past performance never guarantees "
-        "future results. This is not financial advice — only deposit what "
-        "you can afford to lose.",
+        "You can also just *ask me anything* in plain text.\n\n"
+        "⚠️ *Not financial advice.* Predictions can be wrong and betting can "
+        "lose money — only ever stake what you can afford to lose. Past results "
+        "never guarantee future ones.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
 
 @_authed
-async def deposit_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def predictions_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    s = get_settings()
     u = _register(update)
+    now = datetime.now(timezone.utc)
+    start, end, day = nairobi_day_bounds(now)
+    preds = predictions_for_kickoff_range(start, end)
+    text, reveals = render_user_predictions(u, preds, s, now=now)
+    # reply_text raises on a failed send; only commit (charge) once it returns.
     await update.message.reply_text(
-        "*Deposit USDC to your wallet*\n\n"
-        f"`{u.wallet_address}`\n\n"
-        "Same address on *Polygon* (Polymarket) and *Base* (Limitless). Send "
-        "USDC on either chain; /balance confirms it. Your funds stay in your own "
-        "wallet — never pooled with anyone else's.",
+        f"*⚽ Today's predictions — {day.isoformat()}*\n\n{text}",
         parse_mode=ParseMode.MARKDOWN,
     )
+    commit_reveals(u, reveals)
 
 
 @_authed
 async def balance_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     s = get_settings()
     u = _register(update)
-    balances = all_balances(u.wallet_address, s)
-    lines = "\n".join(
-        f"• {b.label}: {b.usdc:.2f} USDC" + ("" if b.ok else " (read failed)")
-        for b in balances
-    )
-    total = sum(b.usdc for b in balances if b.ok)
+    ent = entitlement_for(u, s)
+    from betbot.wallet import usdc_balance
+
+    cb = usdc_balance(u.wallet_address, "polygon", s.polygon_rpc_url)
+    bal = f"{cb.usdc:.2f} USDC" + ("" if cb.ok else " (read failed)")
+
+    if ent.reason == "operator":
+        status = "operator — unlimited predictions"
+    elif ent.reason == "trial":
+        status = f"free trial — {ent.trial_days_left} day(s) left"
+    elif ent.reason == "credit":
+        status = f"{ent.credits_remaining} prediction credit(s) remaining"
+    else:
+        status = "trial ended — send 1 USDC per prediction to unlock"
+
     await update.message.reply_text(
-        f"*Your balance* — total {total:.2f} USDC\n\n{lines}\n\n`{u.wallet_address}`",
+        f"*Your account*\n\n"
+        f"Polygon balance: {bal}\n"
+        f"Status: {status}\n\n"
+        f"*Payment address (Polygon):*\n`{u.wallet_address}`\n\n"
+        "Send *1 USDC per prediction* on Polygon to unlock more.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -140,74 +157,24 @@ async def balance_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 @_authed
 async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     s = get_settings()
-    g = evaluate_gate(s)
-    r = backtest_stored()
-    gate_line = "PASS ✅" if g.passed else "FAIL ❌"
+    u = _register(update)
+    ent = entitlement_for(u, s)
+    is_operator = ent.reason == "operator"
+    if is_operator:
+        access = "unlimited (operator)"
+    elif ent.reason == "trial":
+        access = f"free trial — {ent.trial_days_left} day(s) left"
+    elif ent.reason == "credit":
+        access = f"{ent.credits_remaining} prediction credit(s)"
+    else:
+        access = "locked — send 1 USDC per prediction"
     await update.message.reply_text(
-        f"*Status*\n\nMode: `{s.mode}`\nLive-trading gate: {gate_line}\n"
-        f"Settled bets: {r.n} (hit {r.hit_rate:.0%}, ROI {r.roi:+.1%})",
+        f"*Status*\n\n"
+        f"Access: {access}\n"
+        f"Operator: {'yes' if is_operator else 'no'}\n"
+        f"Predictions consumed: {u.predictions_consumed}",
         parse_mode=ParseMode.MARKDOWN,
     )
-
-
-@_authed
-async def bets_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    rows = list_recent_paper_bets(days=7)
-    if not rows:
-        await update.message.reply_text("No bets in the last 7 days.")
-        return
-    lines = []
-    for b in rows[:15]:
-        res = b.settled_outcome or "—"
-        pnl = f"{b.pnl_usd:+.2f}" if b.pnl_usd is not None else "—"
-        lines.append(f"#{b.fixture_id} {b.outcome} p={b.our_probability:.2f} → {res} ({pnl})")
-    await update.message.reply_text("*Recent bets*\n" + "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-
-
-@_authed
-async def linklimitless_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Capture + store a user's OWN Limitless API key/secret, 0600, never echoed.
-
-    Usage: ``/linklimitless <api_key> <api_secret>``.
-
-    NOTE: this CAPTURES + STORES the per-user Limitless key only. WIRING it into
-    live order placement (make_signer_adapters) is a deliberate follow-up — the
-    stored key is not yet used to place any order. Do not claim it trades yet.
-    """
-    s = get_settings()
-    u = _register(update)
-    args = ctx.args if ctx is not None else None
-    if not args or len(args) < 2:
-        await update.message.reply_text(
-            "Usage: `/linklimitless <api_key> <api_secret>`\n\n"
-            "🔒 Send this in a direct message only; the key is stored "
-            "encrypted-at-rest on your isolated profile and never shown again.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-    api_key, api_secret = args[0], args[1]
-    # Stored under the user's own secrets dir; values are NEVER logged or echoed.
-    store_limitless_creds(s.secrets_dir, u.telegram_user_id, api_key, api_secret)
-    # The user's message contains their live API secret — scrub it from the
-    # Telegram chat history so it doesn't linger in scrollback or on Telegram's
-    # servers. Best-effort: requires no special admin right in a private chat,
-    # but never fail the link if deletion is refused.
-    deleted = False
-    try:
-        await update.message.delete()
-        deleted = True
-    except Exception as e:  # noqa: BLE001 — deletion is a nicety, not the contract
-        log.info("linklimitless_msg_delete_failed", error=str(e))
-    confirm = (
-        "✅ Limitless API key linked. It's stored in your own isolated "
-        "profile (file-locked, never shown again)"
-        + (" and I deleted your message with the key." if deleted
-           else ". Tip: delete your message above so the key isn't left in "
-                "the chat.")
-        + " You're in the arbitrage pool once you deposit."
-    )
-    # Send to the chat directly — update.message may be gone after delete().
-    await ctx.bot.send_message(chat_id=update.effective_chat.id, text=confirm)
 
 
 # Lazily constructed so importing this module never needs settings; tests
@@ -242,11 +209,9 @@ def build_application(settings) -> Application:
     app = Application.builder().token(settings.telegram_bot_token).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", start_cmd))
-    app.add_handler(CommandHandler("deposit", deposit_cmd))
+    app.add_handler(CommandHandler("predictions", predictions_cmd))
     app.add_handler(CommandHandler("balance", balance_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("bets", bets_cmd))
-    app.add_handler(CommandHandler("linklimitless", linklimitless_cmd))
     # Free-text → LLM assistant. Added LAST so commands keep priority.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_handler))
     return app
@@ -254,6 +219,8 @@ def build_application(settings) -> Application:
 
 def main() -> None:
     settings = get_settings()
+    from betbot.logging import configure_logging
+
     configure_logging(settings.log_level)
     init_engine(settings.db_path)
     if not settings.telegram_bot_token:

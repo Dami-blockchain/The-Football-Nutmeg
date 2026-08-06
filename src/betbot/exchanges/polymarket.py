@@ -1,4 +1,4 @@
-"""PolymarketAdapter — discovery via Gamma, orderbook + orders via the CLOB v2.
+"""PolymarketAdapter — discovery via Gamma, orderbook reads via the CLOB v2.
 
 Implements the :class:`~betbot.exchanges.base.ExchangeAdapter` protocol for
 Polymarket. Two market layouts are handled:
@@ -8,11 +8,13 @@ Polymarket. Two market layouts are handled:
   win?". The YES token of each is the thing you buy to back that outcome.
 * **Layout A:** a single market carrying three outcomes + three token ids.
 
-Order placement is **double-gated**: it requires BOTH ``enable_orders=True`` at
-construction AND ``mode == "live"``. Either missing → :class:`OrdersDisabled`
-is raised before any CLOB call. (Polymarket migrated to CTF Exchange **V2** on
-2026-04-22; this uses ``py-clob-client-v2``. Real signed-order wiring lands in
-Phase 5; the gate and order construction live here.)
+**READ-ONLY.** This is a predictions-only build: the adapter fetches market
+PRICES to anchor predictions and compute the edge-based bet/no-bet
+recommendation. It has NO order-placement path and holds NO signing key — the
+CLOB client it builds is used solely for the public ``get_order_book`` endpoint.
+The former double-gated ``place_order`` machinery was removed (Fable review
+finding #4) so a careless edit can never re-arm live trading; there is nothing
+here to sign or post an order with.
 """
 
 from __future__ import annotations
@@ -26,7 +28,6 @@ from betbot.exchanges.base import (
     ExchangeName,
     MarketRef,
     OrderbookQuote,
-    OrderResult,
     Outcome,
 )
 from betbot.exchanges.matcher import (
@@ -52,17 +53,17 @@ class PolymarketError(RuntimeError):
     """A Polymarket operation failed."""
 
 
-class OrdersDisabled(PolymarketError):
-    """place_order was called while the live double-gate was not satisfied."""
-
-
 def _extract_win_team(question: str) -> str | None:
     m = _WIN_RE.search(question or "")
     return m.group("team").strip() if m else None
 
 
 class PolymarketAdapter:
-    """ExchangeAdapter for Polymarket. Discovery + orderbook now; orders gated."""
+    """ExchangeAdapter for Polymarket. Discovery + orderbook READS only.
+
+    There is no order-placement path and no signing key: the CLOB client is
+    built read-only and only ever calls the public ``get_order_book`` endpoint.
+    """
 
     name = ExchangeName.POLYMARKET
 
@@ -71,63 +72,33 @@ class PolymarketAdapter:
         gamma: GammaClient,
         resolver: TeamAliasResolver,
         *,
-        enable_orders: bool = False,
-        mode: str = "paper",
         clob_host: str = CLOB_HOST,
         chain_id: int = POLYGON_CHAIN_ID,
-        private_key: str | None = None,
-        funder: str | None = None,
-        signature_type: int = 0,
         clob_client: Any | None = None,
     ) -> None:
         self._gamma = gamma
         self._resolver = resolver
-        self._enable_orders = enable_orders
-        self._mode = mode
         self._clob_host = clob_host
         self._chain_id = chain_id
-        self._private_key = private_key
-        self._funder = funder
-        # CLOB signature type: 0=EOA (default), 1=POLY_PROXY (email/Magic
-        # deposit wallet), 2=POLY_GNOSIS_SAFE (browser proxy). A bare EOA on
-        # Polymarket v2 is rejected with "maker address not allowed, please
-        # use the deposit wallet flow"; the working route for an automated
-        # wallet is a Magic/proxy wallet with signature_type=1 and funder set
-        # to that proxy address (the EOA-deposit-wallet SDK path is bugged
-        # upstream — Polymarket/py-clob-client-v2#70).
-        self._signature_type = signature_type
         self._clob = clob_client  # injectable for tests; otherwise lazy-built
         self._events_cache: list[dict[str, Any]] | None = None
 
     # ------------------------------------------------------------------
-    @property
-    def orders_live(self) -> bool:
-        """The double-gate: both flags must be set for a real order to post."""
-        return self._enable_orders and self._mode == "live"
-
     def _get_clob(self) -> Any:
+        """Build (once) a READ-ONLY CLOB client for orderbook price reads.
+
+        No wallet key, no funder, no signature type, and NO API-credential
+        derivation — ``get_order_book`` is a public endpoint, and this adapter
+        cannot sign or post anything. Built lazily so importing the package
+        doesn't drag in the heavy CLOB stack unless a price is actually read.
+        """
         if self._clob is None:
-            # Imported lazily so the package import doesn't require the heavy
-            # CLOB/web3 stack unless an adapter actually talks to the CLOB.
             from py_clob_client_v2.client import ClobClient
 
-            clob = ClobClient(
+            self._clob = ClobClient(
                 host=self._clob_host,
                 chain_id=self._chain_id,
-                key=self._private_key,
-                funder=self._funder,
-                signature_type=self._signature_type,
             )
-            # CLOB v2 needs L2 API credentials derived from the wallet
-            # signature before any order endpoint will accept a request —
-            # without this every order fails with "API Credentials are needed
-            # to interact with this endpoint!". Derive (or create) them once
-            # per client and attach. create_or_derive returns the existing
-            # creds for this key if they exist, else mints new ones — safe and
-            # idempotent per wallet.
-            creds = clob.create_or_derive_api_key()
-            clob.set_api_creds(creds)
-            self._clob = clob
         return self._clob
 
     # ------------------------------------------------------------------
@@ -298,47 +269,6 @@ class PolymarketAdapter:
             yes_price=price,
             yes_size=size,
             timestamp=datetime.now(timezone.utc),
-        )
-
-    # ------------------------------------------------------------------
-    # Orders (double-gated)
-    # ------------------------------------------------------------------
-    async def place_order(
-        self,
-        market: MarketRef,
-        outcome: Outcome,
-        size_usd: float,
-        max_price: float,
-    ) -> OrderResult:
-        if not self.orders_live:
-            raise OrdersDisabled(
-                "place_order blocked: requires enable_orders=True AND mode=live "
-                f"(have enable_orders={self._enable_orders}, mode={self._mode!r})"
-            )
-        token_id = market.metadata.get("outcome_tokens", {}).get(outcome.value)
-        if not token_id:
-            raise PolymarketError(f"no token id for {outcome} on {market.market_id}")
-
-        from py_clob_client_v2.clob_types import MarketOrderArgsV2
-
-        order_args = MarketOrderArgsV2(
-            token_id=token_id,
-            amount=size_usd,
-            side="BUY",
-            price=max_price,
-        )
-        clob = self._get_clob()
-        resp = await asyncio.to_thread(clob.create_and_post_market_order, order_args)
-        resp = resp if isinstance(resp, dict) else {"raw": resp}
-        return OrderResult(
-            exchange=ExchangeName.POLYMARKET,
-            order_id=str(resp.get("orderID") or resp.get("orderId") or ""),
-            market_id=market.market_id,
-            outcome=outcome,
-            filled_size=float(resp.get("filled_size") or 0.0),
-            avg_price=float(resp.get("avg_price") or max_price),
-            status=str(resp.get("status") or "submitted"),
-            raw_response=resp,
         )
 
     async def get_position(self, market: MarketRef) -> float:

@@ -287,13 +287,50 @@ class User(Base):
     wallet_keyfile: Mapped[str] = mapped_column(String(255))
     active: Mapped[bool] = mapped_column(default=True)
     # Set True once the user taps the cross-venue arbitrage "tell me more"
-    # button on /start. Drives the Limitless-onboarding follow-up.
+    # button on /start. Legacy column, retained for DB compatibility only.
     arb_interest: Mapped[bool] = mapped_column(default=False)
+    # Paid predictions this user has consumed (post-trial). Each 1 USDC held
+    # buys one reveal; ``credits_remaining = floor(usdc) - predictions_consumed``.
+    # ``created_at`` is the trial start. See :mod:`betbot.entitlement`.
+    predictions_consumed: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class PredictionReveal(Base):
+    """Per-(user, fixture) reveal ledger — the money-idempotency record.
+
+    A single fixture prediction reaches a user through THREE paths (the
+    matchday-morning alert, the ~kickoff-60m alert, and every repeat of
+    ``/predictions``). Without this ledger each path — and each repeat —
+    re-charges a paying user for the SAME fixture. One row here per fixture a
+    user has been shown means each fixture is charged AT MOST ONCE and re-shown
+    FREE forever after. ``charged`` records whether the reveal actually cost a
+    credit (True only for a paid reveal; operator/trial reveals are recorded
+    ``charged=False`` so they stay free once the trial ends).
+
+    The unique constraint is the idempotency lock: an INSERT that collides is a
+    no-op (see :func:`betbot.storage.repos.record_reveal`), so committing a
+    reveal twice (e.g. a retried send) never double-charges.
+    """
+
+    __tablename__ = "prediction_reveals"
+    __table_args__ = (
+        UniqueConstraint(
+            "telegram_user_id", "fixture_id", name="uq_reveal_user_fixture"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    telegram_user_id: Mapped[int] = mapped_column(Integer, index=True)
+    fixture_id: Mapped[int] = mapped_column(Integer, index=True)
+    charged: Mapped[bool] = mapped_column(default=False)
+    revealed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
     )
 
 
