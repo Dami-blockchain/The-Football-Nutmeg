@@ -19,8 +19,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
-from betbot.config import INTERNATIONAL_COMPETITIONS, get_settings
-from betbot.data.api_football import ApiFootballClient
+from betbot.config import get_settings
 from betbot.data.football_data import FootballDataClient, FootballDataError
 from betbot.data.form import FormService, _parse_kickoff, _parse_team
 from betbot.exchanges.base import ExchangeName
@@ -31,12 +30,7 @@ from betbot.exchanges.polymarket import PolymarketAdapter
 from betbot.exchanges.polymarket_gamma import GammaClient
 from betbot.exchanges.router import ExchangeRouter
 from betbot.backtest import backtest_mock, backtest_stored
-from betbot.daily_jobs import (
-    persist_arb_opportunities,
-    register_daily_jobs,
-    run_arb_digest,
-    run_daily_report,
-)
+from betbot.daily_jobs import register_daily_jobs, run_daily_report
 from betbot.gate import evaluate_gate
 from betbot.logging import configure_logging, get_logger
 from betbot.settlement import SettlementWatcher
@@ -52,9 +46,9 @@ from betbot.storage.repos import (
     reset_kill_switch,
     upsert_prediction,
 )
-from betbot.strategy.availability import availability_penalty
 from betbot.strategy.engine import StrategyEngine
-from betbot.strategy.international_engine import InternationalStrategyEngine
+from betbot.strategy.club_engine import ClubStrategyEngine
+from betbot.strategy.cl_engine import EuropeanStrategyEngine
 # NOTE: betbot.wallet pulls in web3 (the `api` extra) at import time, so it's
 # imported lazily inside the functions that need it — keeping `betbot.main`
 # importable (and testable) on the base install.
@@ -67,10 +61,8 @@ bets_app = typer.Typer(help="Inspect logged paper bets.")
 app.add_typer(bets_app, name="bets")
 ks_app = typer.Typer(help="Inspect / reset the drawdown kill switch.")
 app.add_typer(ks_app, name="kill-switch")
-glicko_app = typer.Typer(help="Glicko-2 ratings (international / World Cup).")
+glicko_app = typer.Typer(help="Glicko-2 club ratings.")
 app.add_typer(glicko_app, name="glicko")
-arb_app = typer.Typer(help="Cross-venue arbitrage.")
-app.add_typer(arb_app, name="arb")
 
 
 # ----------------------------------------------------------------------
@@ -201,62 +193,6 @@ def _build_router(settings) -> tuple[ExchangeRouter, list, object]:
 
 
 # ----------------------------------------------------------------------
-# Player-availability (injury) adjustment — WC only, OFF by default
-# ----------------------------------------------------------------------
-async def _availability_adjustments(
-    af_client: ApiFootballClient | None,
-    settings,
-    home_name: str,
-    away_name: str,
-) -> tuple[float, float]:
-    """Return ``(home_rating_adj, away_rating_adj)`` Glicko-point shifts.
-
-    A COARSE absence-count signal: count each team's unavailable players and
-    map that to a small, capped NEGATIVE Glicko adjustment. v1 does NOT weight
-    by player importance and is OFF by default until validated on the
-    calibration report.
-
-    GRACEFUL by contract: any error, a missing key, or the feature being
-    disabled returns ``(0.0, 0.0)`` — this must NEVER break or skip a
-    prediction. Logged once per failure, not raised.
-    """
-    if af_client is None or not af_client.has_key:
-        return 0.0, 0.0
-    log = get_logger(__name__)
-    try:
-        home_id = await af_client.resolve_team_id(home_name)
-        away_id = await af_client.resolve_team_id(away_name)
-        season = settings.api_football_season
-
-        async def _adj(team_id: int | None) -> float:
-            if team_id is None:
-                return 0.0
-            injuries = await af_client.get_injuries(team_id, season)
-            return availability_penalty(
-                len(injuries),
-                per_player=settings.injury_penalty_per_player,
-                cap=settings.injury_penalty_cap,
-            )
-
-        home_adj = await _adj(home_id)
-        away_adj = await _adj(away_id)
-        if home_adj or away_adj:
-            log.info(
-                "availability_adjustment",
-                home=home_name, away=away_name,
-                home_adj=round(home_adj, 1), away_adj=round(away_adj, 1),
-            )
-        return home_adj, away_adj
-    except Exception as e:  # noqa: BLE001 — availability must never break scoring
-        log.warning(
-            "availability_fetch_failed",
-            home=home_name, away=away_name, error=str(e),
-            note="falling back to no adjustment (0/0)",
-        )
-        return 0.0, 0.0
-
-
-# ----------------------------------------------------------------------
 # Scoring run
 # ----------------------------------------------------------------------
 async def _score_once() -> int:
@@ -309,18 +245,6 @@ async def _score_once() -> int:
     # build one ClobClient per user, not one per bet.
     user_adapter_cache: dict[str, dict] = {}
 
-    # Optional player-availability (injury) client — built only when the WC
-    # adjustment is enabled AND a key is configured. Closed in the finally
-    # below. When absent, _availability_adjustments returns (0, 0) — a NO-OP.
-    af_client: ApiFootballClient | None = None
-    if settings.lineup_adjust_enabled and settings.api_football_key:
-        af_client = ApiFootballClient(
-            api_key=settings.api_football_key,
-            base_url=settings.api_football_base_url,
-            rate_limit_per_min=settings.api_football_rate_limit_per_min,
-        )
-        log.info("availability_adjustment_enabled", season=settings.api_football_season)
-
     async with FootballDataClient(
         api_key=settings.football_data_api_key,
         base_url=settings.football_data_base_url,
@@ -328,7 +252,16 @@ async def _score_once() -> int:
     ) as client:
         form_service = FormService(client, settings)
         engine = StrategyEngine(settings)
-        intl_engine = InternationalStrategyEngine(settings)
+        club_engine = (
+            ClubStrategyEngine(settings)
+            if settings.club_ensemble_enabled
+            else engine
+        )
+        cl_engine = (
+            EuropeanStrategyEngine(settings)
+            if settings.cl_elo_enabled
+            else engine
+        )
 
         try:
             for league in settings.leagues:
@@ -346,19 +279,18 @@ async def _score_once() -> int:
                     upcoming=len(matches),
                     window=f"{date_from}..{date_to}",
                 )
-                # International competitions (World Cup) use the Glicko engine;
-                # club leagues use the form-based StrategyEngine.
-                is_intl = league in INTERNATIONAL_COMPETITIONS
-                eng = intl_engine if is_intl else engine
+                # Engine routing: domestic top-5 leagues -> club Glicko/DC
+                # ensemble; Champions League -> cross-league ClubElo engine
+                # (R2), which falls back to naive internally on unresolved
+                # teams / a stale snapshot, and is `engine` outright when
+                # BETBOT_CL_ELO=false.
+                eng = cl_engine if league == "CL" else club_engine
                 for m in matches:
                     try:
                         bets = await _score_and_log_one(
                             m, league, form_service, eng, router,
                             settings, kill_tripped, live_orders,
                             make_signer_adapters, user_adapter_cache,
-                            # Injury adjustment is WC-only: pass the client only
-                            # for international competitions (None elsewhere).
-                            af_client=af_client if is_intl else None,
                         )
                         paper_bets_logged += bets
                     except FootballDataError as e:
@@ -378,8 +310,6 @@ async def _score_once() -> int:
         finally:
             for client in _http_clients:
                 await client.close()
-            if af_client is not None:
-                await af_client.close()
 
     log.info(
         "scoring_run_done",
@@ -400,7 +330,6 @@ async def _score_and_log_one(
     live_orders: bool = False,
     make_signer_adapters=None,
     user_adapter_cache: dict | None = None,
-    af_client: ApiFootballClient | None = None,
 ) -> int:
     """Score one fixture and log a paper bet.
 
@@ -426,23 +355,7 @@ async def _score_and_log_one(
         away_team=away,
     )
 
-    # WC-only player-availability (injury) adjustment. Graceful: returns (0, 0)
-    # when disabled, keyless, or on any fetch error — never breaks the
-    # prediction. Only the InternationalStrategyEngine accepts the rating-shift
-    # kwargs, so we pass them ONLY when there's a non-zero shift to apply; the
-    # zero case calls predict(fixture_form) exactly as before, preserving
-    # compatibility with the club engine (and any mock engine in tests).
-    home_adj = away_adj = 0.0
-    if league in INTERNATIONAL_COMPETITIONS:
-        home_adj, away_adj = await _availability_adjustments(
-            af_client, settings, home.name, away.name
-        )
-    if home_adj or away_adj:
-        prediction = engine.predict(
-            fixture_form, home_rating_adj=home_adj, away_rating_adj=away_adj
-        )
-    else:
-        prediction = engine.predict(fixture_form)
+    prediction = engine.predict(fixture_form)
     log.info(
         "prediction",
         fixture_id=fixture_id,
@@ -453,6 +366,8 @@ async def _score_and_log_one(
         p_home=round(prediction.p_home, 3),
         p_draw=round(prediction.p_draw, 3),
         p_away=round(prediction.p_away, 3),
+        home_xg=prediction.home_xg,
+        away_xg=prediction.away_xg,
         home_form=fixture_form.home_form.weighted_points,
         away_form=fixture_form.away_form.weighted_points,
     )
@@ -484,15 +399,7 @@ async def _score_and_log_one(
     )
     if route is not None:
         quote = route.quote
-        # "Bet every match" mode (WC): bypass the edge filter for international
-        # competitions so we take a position on every match that has a market.
-        bet_every = (
-            settings.international_bet_every_match
-            and prediction.competition_code in INTERNATIONAL_COMPETITIONS
-        )
-        decision = engine.decide_with_market(
-            prediction, favourite, quote.yes_price, require_edge=not bet_every
-        )
+        decision = engine.decide_with_market(prediction, favourite, quote.yes_price)
         if decision is None:
             # no_edge: the market price vetoes this bet. Do NOT fall back to
             # favourite-only logging — the market is the better predictor here.
@@ -518,7 +425,7 @@ async def _score_and_log_one(
         else:
             log.debug("paper_bet_already_logged", fixture_id=fixture_id)
         # Phase 5: place the real order on every active user's own wallet
-        # (gated; skipped for WC and when not live).
+        # (gated; skipped when not live).
         await _place_live_for_users(
             route, prediction, decision, settings, live_orders,
             make_signer_adapters, user_adapter_cache if user_adapter_cache is not None else {},
@@ -592,25 +499,13 @@ async def _place_live_for_users(
     submit the same order from each user's isolated wallet, sized to that user's
     own balance. One user's order never touches another's funds.
 
-    No-ops unless ``live_orders`` (live mode + gate clear). NEVER places for
-    INTERNATIONAL_COMPETITIONS (World Cup) unless explicitly allowed — that
-    guard is the hard rule. The paper bet has already been logged and persists
-    regardless of whether any live order succeeds. When no users are registered,
-    falls back to the single global agent wallet (backward-compatible).
+    No-ops unless ``live_orders`` (live mode + gate clear). The paper bet has
+    already been logged and persists regardless of whether any live order
+    succeeds. When no users are registered, falls back to the single global
+    agent wallet (backward-compatible).
     """
     log = get_logger(__name__)
     if not live_orders:
-        return
-    if (
-        prediction.competition_code in INTERNATIONAL_COMPETITIONS
-        and not settings.allow_international_live
-    ):
-        log.info(
-            "live_order_skipped_international",
-            fixture_id=prediction.fixture_id,
-            competition=prediction.competition_code,
-            note="set BETBOT_ALLOW_INTERNATIONAL_LIVE=true to enable",
-        )
         return
 
     max_price = min(0.99, route.quote.yes_price + settings.order_slippage)
@@ -765,22 +660,6 @@ def backtest_cmd(
         )
 
 
-@app.command("calibration")
-def calibration_cmd() -> None:
-    """Show WC model calibration — RPS/Brier + reliability over settled matches."""
-    settings = get_settings()
-    configure_logging(settings.log_level)
-    init_engine(settings.db_path)
-    from betbot.calibration import build_report
-    from betbot.reports import format_calibration_report
-    from betbot.storage.repos import scored_model_predictions
-
-    report = build_report(scored_model_predictions())
-    # Strip Telegram Markdown for the terminal.
-    text = format_calibration_report(report).replace("```", "").replace("*", "")
-    typer.echo(text)
-
-
 @app.command("gate")
 def gate_cmd() -> None:
     """Check whether the paper record clears the live-trading gate."""
@@ -839,7 +718,7 @@ def glicko_ratings() -> None:
 
     rows = all_ratings()
     if not rows:
-        typer.echo("No Glicko ratings yet. Seed with: python scripts/seed_glicko.py")
+        typer.echo("No Glicko ratings yet. Seed with: python scripts/seed_glicko_club.py")
         return
     typer.echo(f"{'team':<28} {'rating':>8} {'RD':>6} {'vol':>7}")
     for name, r in rows:
@@ -848,143 +727,12 @@ def glicko_ratings() -> None:
 
 @glicko_app.command("seed")
 def glicko_seed() -> None:
-    """Bootstrap ratings (Path 1 results-CSV, or Path 2 World-Cup teams)."""
+    """Bootstrap club Glicko-2 ratings from fetched club results."""
     import runpy
 
-    runpy.run_path(str(_REPO_ROOT / "scripts" / "seed_glicko.py"), run_name="__main__")
-
-
-async def _run_arb_scan(settings, limit: int, min_margin: float) -> list:
-    """Scan Polymarket + Limitless + SX Bet; return complete opportunities at or
-    above ``min_margin``, best first. Builds + closes its own clients."""
-    import re
-    from datetime import datetime, timezone
-
-    from betbot.exchanges.arbitrage import ArbScanner
-    from betbot.exchanges.sxbet import SXBetAdapter, SXBetClient
-
-    win = re.compile(r"will\s+(.+?)\s+win", re.IGNORECASE)
-    router, clients, _make_adapters = _build_router(settings)
-    gamma = clients[0]
-    # SX Bet is scan-only — added to the arb scan, NOT the betting router.
-    sx_client = SXBetClient()
-    sx = SXBetAdapter(
-        sx_client, TeamAliasResolver.from_yaml(_REPO_ROOT / "config" / "team_aliases.yaml")
+    runpy.run_path(
+        str(_REPO_ROOT / "scripts" / "seed_glicko_club.py"), run_name="__main__"
     )
-    clients = clients + [sx_client]
-    scanner = ArbScanner(router.adapters + [sx])
-    found = []
-    try:
-        events = await gamma.list_soccer_events(limit=limit)
-        for e in events:
-            teams = []
-            for m in e.get("markets") or []:
-                if m.get("closed"):
-                    continue
-                mt = win.search(m.get("question", "") or "")
-                if mt:
-                    teams.append(mt.group(1).strip())
-            if len(teams) < 2:
-                continue
-            opp = await scanner.scan(teams[0], teams[1], datetime.now(timezone.utc))
-            if opp and opp.complete and opp.margin >= min_margin:
-                found.append(opp)
-    finally:
-        for c in clients:
-            await c.close()
-    found.sort(key=lambda o: o.margin, reverse=True)
-    return found
-
-
-async def _arb_scan(settings, limit: int, min_margin: float) -> None:
-    found = await _run_arb_scan(settings, limit, min_margin)
-    if not found:
-        typer.echo("No cross-venue matches found across venues "
-                   "(per-match overlap is rare — Limitless/SX list few matches).")
-        return
-    typer.echo(f"{'match':<32}{'sum':>6}{'margin':>9}   legs (outcome:venue@price)")
-    for o in found[:25]:
-        legs = "  ".join(f"{ov}:{lg.exchange.value[:4]}@{lg.price:.2f}"
-                         for ov, lg in o.legs.items())
-        tag = " ARB" if o.margin > 0 else ""
-        typer.echo(f"{(o.home_team + ' v ' + o.away_team)[:31]:<32}"
-                   f"{o.price_sum:>6.2f}{o.margin:>+8.1%}{tag}   {legs}")
-
-
-async def _arb_scan_and_notify(settings) -> int:
-    """Scan and push a Telegram alert for each real (margin>0) opportunity,
-    then hand the opportunities to the (self-gating) executor."""
-    from betbot.notify import send_telegram
-
-    log = get_logger(__name__)
-    found = await _run_arb_scan(
-        settings, settings.arb_scan_limit, settings.arb_notify_min_margin
-    )
-    # Persist every hit so the 21:00 daily report can count today's total.
-    persist_arb_opportunities(found)
-    sent = 0
-    for o in found:
-        legs = "\n".join(f"  {ov}: {lg.exchange.value} @ {lg.price:.3f}"
-                         for ov, lg in o.legs.items())
-        msg = (f"🔔 *Arb opportunity*\n*{o.home_team} v {o.away_team}*\n"
-               f"locked margin *{o.margin:+.1%}* (cost {o.price_sum:.3f})\n{legs}")
-        if await send_telegram(settings, msg):
-            sent += 1
-    if found:
-        log.info("arb_notified", opportunities=len(found), sent=sent)
-        await _maybe_execute_arbs(settings, found)
-    return sent
-
-
-async def _maybe_execute_arbs(settings, opportunities: list) -> None:
-    """Hand scanned opportunities to the gated arb executor.
-
-    The executor self-gates (BETBOT_ARB_EXECUTE + live mode + kill switch +
-    margin/sizing/balance/daily-cap checks) and notifies Telegram on every
-    execution or abort. The flag check here just avoids building live adapters
-    on every tick while execution is off (the default).
-    """
-    if not opportunities or not settings.arb_execute:
-        return
-    from betbot.arb_executor import ArbExecutor
-
-    log = get_logger(__name__)
-    init_engine(settings.db_path)
-    router, clients, _make_adapters = _build_router(settings)
-    adapters = {a.name: a for a in router.adapters}
-    try:
-        executor = ArbExecutor(settings, adapters)
-        results = await executor.execute_all(opportunities)
-        log.info(
-            "arb_execute_tick_done",
-            considered=len(opportunities),
-            statuses=[r.status for r in results],
-        )
-    finally:
-        for c in clients:
-            await c.close()
-
-
-@arb_app.command("scan")
-def arb_scan(
-    limit: Annotated[int, typer.Option(help="max soccer events to scan")] = 100,
-    min_margin: Annotated[float, typer.Option(help="report at/above this margin")] = -0.05,
-) -> None:
-    """Scan for cross-venue arbitrage (read-only). Positive margin = locked profit."""
-    settings = get_settings()
-    configure_logging(settings.log_level)
-    asyncio.run(_arb_scan(settings, limit, min_margin))
-
-
-@arb_app.command("watch")
-def arb_watch() -> None:
-    """One-shot scan + Telegram alert per opportunity (the daemon also does this
-    automatically every BETBOT_ARB_SCAN_INTERVAL_MIN minutes)."""
-    settings = get_settings()
-    configure_logging(settings.log_level)
-    init_engine(settings.db_path)  # scan results are persisted for the daily report
-    n = asyncio.run(_arb_scan_and_notify(settings))
-    typer.echo(f"Notified {n} opportunity(ies).")
 
 
 @app.command("run-daemon")
@@ -1003,30 +751,46 @@ def run_daemon(
     trigger = CronTrigger.from_crontab(cron_expr, timezone=timezone.utc)
 
     async def _tick() -> None:
+        # Refresh the cross-league Elo snapshot the CL engine reads, so a
+        # fixture is priced off today's ratings. Non-fatal + off the event
+        # loop; on failure the engine keeps the last snapshot.
+        _s = get_settings()
+        if _s.cl_elo_enabled:
+            try:
+                from betbot.data.clubelo import refresh_latest
+                await asyncio.to_thread(
+                    refresh_latest, Path(_s.clubelo_latest_path)
+                )
+            except Exception as e:  # noqa: BLE001 — never crash the tick
+                get_logger(__name__).warning("clubelo_refresh_tick_failed", error=str(e))
         # Settle finished bets first (updates the kill switch), then score —
         # so a freshly-tripped kill switch suppresses this tick's new bets.
         await _settle_once()
         await _score_once()
 
-    async def _arb_tick() -> None:
-        try:
-            await _arb_scan_and_notify(get_settings())
-        except Exception as e:  # noqa: BLE001 — never let the watcher crash the daemon
-            get_logger(__name__).warning("arb_tick_failed", error=str(e))
+    async def _club_refresh_tick() -> None:
+        # Weekly: refresh results + re-seed club Glicko + refit club DC so
+        # ratings track the season instead of freezing at seed time.
+        # Subprocess (not import): the scripts are argparse mains; isolation
+        # means a bad refresh can never corrupt the daemon.
+        import subprocess
 
-    async def _arb_digest_tick() -> None:
-        # 09:00 Africa/Nairobi: one scan + digest to operator AND all users.
+        def _run() -> None:
+            for script in ("fetch_club_results.py", "seed_glicko_club.py",
+                           "fit_dixon_coles_club.py"):
+                subprocess.run(
+                    [".venv/bin/python", f"scripts/{script}"],
+                    cwd=str(_REPO_ROOT), timeout=1800, check=True,
+                    capture_output=True,
+                )
         try:
-            s = get_settings()
-            await run_arb_digest(
-                s,
-                lambda: _run_arb_scan(s, s.arb_scan_limit, s.arb_notify_min_margin),
-            )
+            await asyncio.to_thread(_run)
+            get_logger(__name__).info("club_data_refreshed")
         except Exception as e:  # noqa: BLE001 — never crash the daemon
-            get_logger(__name__).warning("arb_digest_failed", error=str(e))
+            get_logger(__name__).warning("club_refresh_failed", error=str(e))
 
     async def _daily_report_tick() -> None:
-        # 21:00 Africa/Nairobi: trades/settlements/P&L/arb-count/balances.
+        # 21:00 Africa/Nairobi: trades/settlements/P&L/balances.
         try:
             await run_daily_report(get_settings())
         except Exception as e:  # noqa: BLE001 — never crash the daemon
@@ -1049,15 +813,11 @@ def run_daemon(
         scheduler = AsyncIOScheduler(timezone=timezone.utc)
         scheduler.add_job(_tick, trigger=trigger, id="score_and_settle")
         scheduler.add_job(
-            _arb_tick,
-            trigger=IntervalTrigger(minutes=s.arb_scan_interval_min),
-            id="arb_watch",
+            _club_refresh_tick,
+            trigger=CronTrigger.from_crontab("0 6 * * 1", timezone=timezone.utc),
+            id="club_data_refresh",
         )
-        register_daily_jobs(
-            scheduler, s,
-            arb_digest=_arb_digest_tick,
-            daily_report=_daily_report_tick,
-        )
+        register_daily_jobs(scheduler, s, daily_report=_daily_report_tick)
         scheduler.add_job(
             _deposit_tick,
             trigger=IntervalTrigger(minutes=s.deposit_scan_minutes),
@@ -1067,8 +827,6 @@ def run_daemon(
         log.info(
             "daemon_started",
             cron=cron_expr,
-            arb_scan_min=s.arb_scan_interval_min,
-            arb_digest_hour_nairobi=s.arb_digest_hour if s.arb_digest_enabled else None,
             daily_report_hour_nairobi=(
                 s.daily_report_hour if s.daily_report_enabled else None
             ),

@@ -54,6 +54,11 @@ class PredictionRow(Base):
     away_score: Mapped[float] = mapped_column(Float)
     draw_score: Mapped[float] = mapped_column(Float)
 
+    # Expected-goals readout (display-only). Nullable: only populated when the
+    # Dixon-Coles component is available for both teams; None on fallback paths.
+    home_xg: Mapped[float | None] = mapped_column(Float, nullable=True)
+    away_xg: Mapped[float | None] = mapped_column(Float, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )
@@ -320,10 +325,22 @@ class ModelPrediction(Base):
     w_glicko: Mapped[float] = mapped_column(Float)     # Hedge weights used
     w_ensemble: Mapped[float] = mapped_column(Float)
 
+    # Dispersion challenger triple (flag-gated experiment, dual-logged always).
+    c_home: Mapped[float | None] = mapped_column(Float, nullable=True)
+    c_draw: Mapped[float | None] = mapped_column(Float, nullable=True)
+    c_away: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # Margin-of-victory challenger triple (flag-gated experiment, dual-logged).
+    m_home: Mapped[float | None] = mapped_column(Float, nullable=True)
+    m_draw: Mapped[float | None] = mapped_column(Float, nullable=True)
+    m_away: Mapped[float | None] = mapped_column(Float, nullable=True)
+
     # Filled at settlement.
     outcome: Mapped[str | None] = mapped_column(String(4), nullable=True)
     rps_glicko: Mapped[float | None] = mapped_column(Float, nullable=True)
     rps_ensemble: Mapped[float | None] = mapped_column(Float, nullable=True)
+    rps_challenger: Mapped[float | None] = mapped_column(Float, nullable=True)
+    rps_mov: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow

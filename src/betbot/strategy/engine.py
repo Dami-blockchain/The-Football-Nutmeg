@@ -33,6 +33,10 @@ class Prediction:
     home_score: float
     away_score: float
     draw_score: float
+    # Expected-goals readout (display-only): Dixon-Coles lambdas for the two
+    # sides. None on fallback paths where no DC component is available.
+    home_xg: float | None = None
+    away_xg: float | None = None
 
     @property
     def best_outcome(self) -> Outcome:

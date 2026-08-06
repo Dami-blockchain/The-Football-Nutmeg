@@ -137,47 +137,11 @@ async def test_live_order_placed_when_enabled(fresh_db, settings):
     assert len(router.adapter.placed) == 1  # real order placed on the venue
 
 
-async def test_wc_live_order_skipped(fresh_db, settings):
-    # World Cup (INTERNATIONAL_COMPETITIONS): paper bet logs, but NEVER a live order.
-    router = FakeRouter(_home_quote(0.50))
-    n = await _score_and_log_one(MATCH, "WC", FakeForm(), StrategyEngine(settings),
-                                 router, settings, False, True)  # live_orders=True
-    assert n == 1
-    assert router.adapter.placed == []  # guard held — no live order on WC
-
-
-async def test_wc_live_order_allowed_when_flag_set(fresh_db, settings):
-    settings.allow_international_live = True  # operator opt-in
-    router = FakeRouter(_home_quote(0.50))
-    n = await _score_and_log_one(MATCH, "WC", FakeForm(), StrategyEngine(settings),
-                                 router, settings, False, True)
-    assert n == 1
-    assert len(router.adapter.placed) == 1  # now WC can place live
-
-
 async def test_paper_mode_places_no_live_order(fresh_db, settings):
     router = FakeRouter(_home_quote(0.50))
     await _score_and_log_one(MATCH, "PL", FakeForm(), StrategyEngine(settings),
                              router, settings, False, False)  # live_orders=False
     assert router.adapter.placed == []
-
-
-async def test_bet_every_match_wc_forces_bet_without_edge(fresh_db, settings):
-    settings.international_bet_every_match = True
-    router = FakeRouter(_home_quote(0.97))  # high price -> normally no edge
-    n = await _score_and_log_one(MATCH, "WC", FakeForm(), StrategyEngine(settings),
-                                 router, settings, False, False)
-    assert n == 1  # bet placed despite no edge
-    rows = list_recent_paper_bets(days=7)
-    assert len(rows) == 1 and rows[0].market_price == 0.97
-
-
-async def test_wc_no_edge_still_vetoes_without_flag(fresh_db, settings):
-    # default international_bet_every_match=False -> normal veto on no edge
-    router = FakeRouter(_home_quote(0.97))
-    n = await _score_and_log_one(MATCH, "WC", FakeForm(), StrategyEngine(settings),
-                                 router, settings, False, False)
-    assert n == 0
 
 
 async def test_exposure_cap_blocks_logging(fresh_db, settings):
@@ -277,31 +241,3 @@ async def test_multi_user_sizes_down_to_balance(fresh_db, settings, tmp_path, mo
     assert placed[0][1] == 3.5                   # capped to the user's balance
 
 
-async def test_multi_user_wc_guard_blocks_all(fresh_db, settings, tmp_path, monkeypatch):
-    """The World Cup hard-guard holds even with funded users (flag off)."""
-    from types import SimpleNamespace
-
-    import betbot.wallet as wallet_mod
-    from betbot.exchanges.base import MarketRef
-    from betbot.main import _place_live_for_users
-    from betbot.storage.repos import get_or_create_user
-
-    get_or_create_user(444, "Dave", secrets_dir=str(tmp_path / "secrets"))
-    monkeypatch.setattr(wallet_mod, "usdc_balance",
-                        lambda a, c, r: wallet_mod.ChainBalance(c, c, 100.0, True))
-
-    built = []
-
-    def fake_make(*, signing_key, funder=None, limitless_creds=None):
-        d = {ExchangeName.POLYMARKET: FakeAdapter(), ExchangeName.LIMITLESS: FakeAdapter()}
-        built.append(d)
-        return d
-
-    route = RoutedQuote(adapter=FakeAdapter(),
-                        market=MarketRef(ExchangeName.POLYMARKET, "m", "A vs B", {}),
-                        quote=_home_quote(0.50))
-    prediction = SimpleNamespace(competition_code="WC", fixture_id=9001)
-    decision = SimpleNamespace(outcome=Outcome.HOME, stake_usd=10.0)
-
-    await _place_live_for_users(route, prediction, decision, settings, True, fake_make, {})
-    assert built == []                           # no per-user adapters built; guard held

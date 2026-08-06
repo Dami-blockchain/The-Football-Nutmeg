@@ -7,7 +7,6 @@ from betbot.storage.repos import (
     get_or_create_user,
     get_user,
     list_users,
-    set_arb_interest,
 )
 
 import pytest
@@ -41,10 +40,10 @@ def test_distinct_users_get_distinct_wallets(db):
 
 
 def test_new_user_defaults_arb_interest_false(db):
+    # arb_interest column survives on the User model (DB back-compat) and
+    # defaults to False for new rows, even though the opt-in flow is gone.
     u = get_or_create_user(9, "a", secrets_dir=str(db / "secrets"))
     assert u.arb_interest is False
-    set_arb_interest(9, True)
-    assert get_user(9).arb_interest is True
 
 
 def test_additive_migration_adds_arb_interest_to_legacy_db(tmp_path):

@@ -18,16 +18,6 @@ _MATCH_WIDTH = 24  # truncate long "Home v Away" strings so tables fit a phone
 
 
 @dataclass(frozen=True)
-class ArbLine:
-    """One arb opportunity, reduced to exactly what the digest message needs."""
-
-    match: str                # "Arsenal v Chelsea"
-    margin: float             # locked profit fraction; >0 = real arb
-    price_sum: float          # total cost of the three YES legs
-    legs: tuple[str, ...]     # e.g. ("HOME: POLYMARKET @ 0.450", ...)
-
-
-@dataclass(frozen=True)
 class BetLine:
     """One bet row for the daily report (a trade placed or settled today)."""
 
@@ -37,6 +27,9 @@ class BetLine:
     market_price: float | None = None   # None = favourite-only (no market)
     settled_outcome: str | None = None
     pnl_usd: float | None = None
+    # Expected-goals readout (display-only): DC lambdas, when both are present.
+    home_xg: float | None = None
+    away_xg: float | None = None
 
 
 @dataclass(frozen=True)
@@ -60,34 +53,12 @@ class DailyReport:
     settlements: tuple[BetLine, ...]
     realised_today_usd: float
     realised_cumulative_usd: float
-    arb_count_today: int
     balances: tuple[BalanceLine, ...]
-    # Optional one-liner on the live Glicko-vs-ensemble model race (Hedge).
-    # Operator-only; None when model selection is off or has no data yet.
-    model_race: str | None = None
 
 
 # ----------------------------------------------------------------------
 # Formatters (pure)
 # ----------------------------------------------------------------------
-def format_arb_digest(lines: Sequence[ArbLine], day: date) -> str:
-    """The 09:00 arb digest body. Clean 'no arb' message when nothing found."""
-    header = f"*Arb digest — {day.isoformat()}*"
-    if not lines:
-        return (
-            f"{header}\n\n"
-            "No arb found today — cross-venue prices never summed below $1."
-        )
-    parts = [header, "", f"Found *{len(lines)}* opportunity(ies):"]
-    for ln in lines:
-        parts.append("")
-        parts.append(
-            f"*{ln.match}* — margin *{ln.margin:+.1%}* (cost {ln.price_sum:.3f})"
-        )
-        parts.extend(f"  {leg}" for leg in ln.legs)
-    return "\n".join(parts)
-
-
 def _activity_parts(report: DailyReport) -> list[str]:
     """The day's shared trading activity (trades + settlements) — the part
     of the report that is the same for every recipient."""
@@ -120,9 +91,6 @@ def format_daily_report(report: DailyReport) -> str:
         f"*Realised P&L:* today {report.realised_today_usd:+.2f} USD"
         f" | cumulative {report.realised_cumulative_usd:+.2f} USD"
     )
-    parts.append(f"*Arb opportunities today:* {report.arb_count_today}")
-    if report.model_race:
-        parts.append(f"*Model race:* {report.model_race}")
 
     if report.balances:
         parts.append("*Balances (USDC)*")
@@ -149,60 +117,11 @@ def format_user_daily_report(
     parts.append(
         f"*Realised P&L today:* {report.realised_today_usd:+.2f} USD"
     )
-    parts.append(f"*Arb opportunities today:* {report.arb_count_today}")
-    if report.model_race:
-        parts.append(f"*Model race:* {report.model_race}")
     if balance is not None:
         parts.append("*Your balances (USDC)*")
         parts.append(_mono(_balances_table([balance])))
     else:
         parts.append("*Your balances:* unavailable")
-    return "\n".join(parts)
-
-
-def format_calibration_report(report) -> str:
-    """Calibration of the WC model race — RPS/Brier/hit-rate + a reliability
-    table (predicted favourite confidence vs how often it actually won).
-
-    ``report`` is a betbot.calibration.CalibrationReport. Lower RPS/Brier is
-    better; a well-calibrated model's 'pred' and 'won' columns track each
-    other. A persistent positive gap (pred > won) = over-confidence.
-    """
-    e, g = report.ensemble, report.glicko
-    if e.n == 0:
-        return ("*Model calibration*\nNo settled WC matches yet — calibration "
-                "needs results to score. Check back after the next matchday.")
-    parts = [
-        f"*Model calibration* (after {e.n} settled match"
-        f"{'es' if e.n != 1 else ''})", "",
-        "*Scores* (lower = better; favourite hit-rate higher = better)",
-        _mono(_table(
-            ("model", "RPS", "Brier", "logloss", "hit%"),
-            [
-                (m.name, f"{m.rps:.3f}", f"{m.brier:.3f}",
-                 f"{m.log_loss:.3f}", f"{m.favourite_hit_rate*100:.0f}%")
-                for m in (e, g)
-            ],
-            right=frozenset({1, 2, 3, 4}),
-        )),
-    ]
-    if e.bins:
-        parts += [
-            "*Reliability* (ensemble — is its confidence honest?)",
-            _mono(_table(
-                ("confidence", "n", "pred", "won", "gap"),
-                [
-                    (f"{b.lo*100:.0f}-{min(b.hi,1.0)*100:.0f}%", str(b.n),
-                     f"{b.mean_predicted*100:.0f}%", f"{b.hit_rate*100:.0f}%",
-                     f"{b.gap*100:+.0f}")
-                    for b in e.bins
-                ],
-                right=frozenset({1, 2, 3, 4}),
-            )),
-            "_'gap' = predicted − actual; persistently positive = "
-            "over-confident. One matchday is far too few to judge — watch the "
-            "trend over the group stage._",
-        ]
     return "\n".join(parts)
 
 
@@ -231,6 +150,13 @@ def _table(
     return "\n".join([fmt(headers)] + [fmt(r) for r in rows])
 
 
+def _xg_cell(b: BetLine) -> str:
+    """The model's expected-goals readout, ``home-away``; ``-`` when absent."""
+    if b.home_xg is None or b.away_xg is None:
+        return "-"
+    return f"{b.home_xg:.2f}-{b.away_xg:.2f}"
+
+
 def _trades_table(bets: Sequence[BetLine]) -> str:
     rows = [
         (
@@ -238,10 +164,13 @@ def _trades_table(bets: Sequence[BetLine]) -> str:
             b.outcome,
             f"{b.stake_usd:.2f}",
             f"{b.market_price:.2f}" if b.market_price is not None else "-",
+            _xg_cell(b),
         )
         for b in bets
     ]
-    return _table(("match", "out", "stake", "price"), rows, right=frozenset({2, 3}))
+    return _table(
+        ("match", "out", "stake", "price", "xG"), rows, right=frozenset({2, 3, 4})
+    )
 
 
 def _settlements_table(bets: Sequence[BetLine]) -> str:
