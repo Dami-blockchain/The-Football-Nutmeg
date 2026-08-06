@@ -95,7 +95,7 @@ async def test_happy_path_calls_messages_api(monkeypatch):
     body = call["json"]
     assert body["model"] == "claude-haiku-4-5-20251001"
     assert body["max_tokens"] == 500
-    assert "10 USDC" in body["system"]  # system prompt carries the user guide
+    assert "1 USDC" in body["system"]  # system prompt carries the user guide
     assert body["messages"][-1] == {"role": "user", "content": "how do I deposit?"}
 
 
@@ -234,14 +234,17 @@ async def test_start_onboarding_content(tg_env):
 
     [reply] = update.message.replies
     u = get_user(777)
-    assert u.wallet_address in reply  # personal deposit address
-    assert "10 USDC" in reply  # minimum deposit to begin
-    assert "bridge" in reply.lower()  # bridging explained
-    assert "9pm" in reply  # daily report (the 9am arb digest is gone)
-    for cmd in ("/deposit", "/balance", "/status", "/bets", "/help"):
+    assert u.wallet_address in reply  # personal payment address
+    assert "7 days" in reply.lower()  # free trial window
+    assert "1 USDC" in reply  # per-prediction price
+    for cmd in ("/predictions", "/balance", "/status", "/help"):
         assert cmd in reply
     assert "not financial advice" in reply.lower()  # risk disclaimer
     assert "lose money" in reply.lower()
+    # Trading / deposit-to-trade / bridge language is gone.
+    assert "bridge" not in reply.lower()
+    assert "/deposit" not in reply
+    assert "/bets" not in reply
 
 
 async def test_free_text_registers_user_and_replies_via_llm(

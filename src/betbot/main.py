@@ -10,13 +10,14 @@ Commands (run as ``nutmeg <command>``, ``tfsm <command>`` or ``betbot <command>`
 from __future__ import annotations
 
 import asyncio
-from datetime import date, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated
 
 import typer
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 
 from betbot.config import get_settings
 from betbot.data.football_data import FootballDataClient, FootballDataError
@@ -26,7 +27,12 @@ from betbot.exchanges.polymarket import PolymarketAdapter
 from betbot.exchanges.polymarket_gamma import GammaClient
 from betbot.exchanges.router import ExchangeRouter
 from betbot.backtest import backtest_mock, backtest_stored
-from betbot.daily_jobs import register_daily_jobs, run_daily_report
+from betbot.daily_jobs import (
+    nairobi_day_bounds,
+    register_daily_jobs,
+    run_matchday_alert,
+    send_fixture_alert,
+)
 from betbot.gate import evaluate_gate
 from betbot.logging import configure_logging, get_logger
 from betbot.settlement import SettlementWatcher
@@ -37,6 +43,7 @@ from betbot.storage.repos import (
     insert_paper_bet,
     insert_paper_bet_no_market,
     list_recent_paper_bets,
+    predictions_for_kickoff_range,
     reset_kill_switch,
     upsert_prediction,
 )
@@ -506,12 +513,53 @@ def run_daemon(
         except Exception as e:  # noqa: BLE001 — never crash the daemon
             get_logger(__name__).warning("club_refresh_failed", error=str(e))
 
-    async def _daily_report_tick() -> None:
-        # 21:00 Africa/Nairobi: trades/settlements/P&L/balances.
+    async def _matchday_alert_tick() -> None:
+        # Matchday-morning (Africa/Nairobi): today's entitlement-gated
+        # predictions per registered user.
         try:
-            await run_daily_report(get_settings())
+            await run_matchday_alert(get_settings())
         except Exception as e:  # noqa: BLE001 — never crash the daemon
-            get_logger(__name__).warning("daily_report_failed", error=str(e))
+            get_logger(__name__).warning("matchday_alert_failed", error=str(e))
+
+    async def _schedule_kickoff_alerts(scheduler) -> None:
+        # Read today's predictions and schedule a one-off ~60m-before-kickoff
+        # reminder per fixture. Runs at daemon start AND daily (05:00 UTC) so a
+        # long-running daemon keeps picking up newly-scored fixtures. Jobs are
+        # idempotent (replace_existing on a per-fixture id). Never crashes.
+        try:
+            _s = get_settings()
+            now = datetime.now(timezone.utc)
+            start, end, _day = nairobi_day_bounds(now)
+            preds = predictions_for_kickoff_range(start, end)
+            lead = timedelta(minutes=_s.kickoff_alert_lead_minutes)
+            scheduled = 0
+            for p in preds:
+                run_at = p.kickoff - lead
+                if run_at <= now:
+                    continue  # kickoff-60m already past — skip
+                fid = p.fixture_id
+
+                async def _fire(fixture_id=fid) -> None:
+                    try:
+                        await send_fixture_alert(get_settings(), fixture_id)
+                    except Exception as e:  # noqa: BLE001 — never crash
+                        get_logger(__name__).warning(
+                            "kickoff_alert_failed", fixture_id=fixture_id,
+                            error=str(e),
+                        )
+
+                scheduler.add_job(
+                    _fire,
+                    trigger=DateTrigger(run_date=run_at, timezone=timezone.utc),
+                    id=f"kickoff_{fid}",
+                    replace_existing=True,
+                )
+                scheduled += 1
+            get_logger(__name__).info(
+                "kickoff_alerts_scheduled", scheduled=scheduled,
+            )
+        except Exception as e:  # noqa: BLE001 — never crash the daemon
+            get_logger(__name__).warning("schedule_kickoff_alerts_failed", error=str(e))
 
     async def _main() -> None:
         s = get_settings()
@@ -523,16 +571,23 @@ def run_daemon(
             trigger=CronTrigger.from_crontab("0 6 * * 1", timezone=timezone.utc),
             id="club_data_refresh",
         )
-        register_daily_jobs(scheduler, s, daily_report=_daily_report_tick)
+        register_daily_jobs(scheduler, s, matchday_alert=_matchday_alert_tick)
+        # Re-scan for today's fixtures daily so the daemon keeps scheduling
+        # kickoff reminders as new fixtures get scored.
+        scheduler.add_job(
+            lambda: _schedule_kickoff_alerts(scheduler),
+            trigger=CronTrigger.from_crontab("0 5 * * *", timezone=timezone.utc),
+            id="reschedule_kickoff_alerts",
+        )
         scheduler.start()
         log.info(
             "daemon_started",
             cron=cron_expr,
-            daily_report_hour_nairobi=(
-                s.daily_report_hour if s.daily_report_enabled else None
-            ),
+            matchday_alert_hour_nairobi=s.matchday_alert_hour,
+            kickoff_alert_lead_minutes=s.kickoff_alert_lead_minutes,
         )
         await _tick()  # immediate first run
+        await _schedule_kickoff_alerts(scheduler)  # schedule today's reminders now
         try:
             await asyncio.Event().wait()
         finally:

@@ -151,14 +151,17 @@ class Settings(BaseSettings):
 
         return str(Path(self.wallet_keyfile).resolve().parent)
 
-    # ---- Daily Telegram jobs (Nairobi wall-clock schedule) ------------
+    # ---- Tipster Telegram alerts (Nairobi wall-clock schedule) --------
     # The cron triggers pin timezone="Africa/Nairobi" (NOT a UTC offset), so
-    # "exactly 9pm" stays true to the operator's wall clock even if the zone's
-    # rules ever change.
-    daily_report_enabled: bool = Field(
-        default=True, alias="BETBOT_DAILY_REPORT_ENABLED"
+    # the alert hour stays true to the operator's wall clock even if the zone's
+    # rules ever change. The matchday-morning alert fires at this hour; the
+    # per-fixture kickoff reminder fires kickoff_alert_lead_minutes before KO.
+    matchday_alert_hour: int = Field(
+        default=8, alias="BETBOT_MATCHDAY_ALERT_HOUR"
     )
-    daily_report_hour: int = Field(default=21, alias="BETBOT_DAILY_REPORT_HOUR")
+    kickoff_alert_lead_minutes: int = Field(
+        default=60, alias="BETBOT_KICKOFF_ALERT_LEAD_MIN"
+    )
 
     # ---- Glicko-2 defaults (shared by the club rating machinery) ------
     glicko_tau: float = Field(default=0.5, alias="BETBOT_GLICKO_TAU")
