@@ -83,7 +83,7 @@ def _authed(handler):
 async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     u = _register(update)
     await update.message.reply_text(
-        "⚽ *The Football Nutmeg — Tipster*\n\n"
+        "⚽ *Football Nutmeg Bot*\n\n"
         "I send you football *predictions* for the top European leagues and the "
         "Champions League: model probabilities, expected goals, and a clear "
         "bet / no-bet call anchored to the market. I never place bets and never "
