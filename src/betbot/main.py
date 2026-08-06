@@ -73,15 +73,15 @@ def _build_router(settings) -> tuple[ExchangeRouter, list]:
 
     This build fetches Polymarket market PRICES only — it anchors predictions
     and computes the edge-based bet/no-bet recommendation. It NEVER places an
-    order or moves funds: the Polymarket adapter is built with no signing key
-    and ``enable_orders=False`` / ``mode="paper"``, so ``place_order`` is inert
-    (only ``find_market`` / ``get_orderbook`` are ever exercised via the router).
-    Limitless has been removed entirely; only Polymarket read pricing remains.
+    order or moves funds: the Polymarket adapter is read-only and carries NO
+    order-placement path or signing key at all (only ``find_market`` /
+    ``get_orderbook`` exist), so there is nothing here to arm. Limitless has been
+    removed entirely; only Polymarket read pricing remains.
     """
     resolver = TeamAliasResolver.from_yaml(_REPO_ROOT / "config" / "team_aliases.yaml")
 
     gamma = GammaClient()
-    pm = PolymarketAdapter(gamma, resolver)  # read-only: no key, orders disabled
+    pm = PolymarketAdapter(gamma, resolver)  # read-only: no key, no order path
     router = ExchangeRouter(
         [pm],
         min_plausible_price=settings.min_plausible_price,

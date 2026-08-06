@@ -4,11 +4,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-import pytest
-
 from betbot.exchanges.base import ExchangeName, Outcome
 from betbot.exchanges.matcher import TeamAliasResolver
-from betbot.exchanges.polymarket import OrdersDisabled, PolymarketAdapter
+from betbot.exchanges.polymarket import PolymarketAdapter
 
 KICKOFF = datetime(2026, 1, 20, 15, 0, tzinfo=timezone.utc)
 
@@ -23,24 +21,11 @@ class FakeGamma:
 
 
 class FakeClob:
-    def __init__(self, book=None, order_resp=None):
+    def __init__(self, book=None):
         self._book = book
-        self._order_resp = order_resp or {}
-        self.order_calls = []
 
     def get_order_book(self, token_id):
         return self._book
-
-    def create_and_post_market_order(self, order_args, *a, **k):
-        self.order_calls.append(order_args)
-        return self._order_resp
-
-    def create_or_derive_api_key(self):
-        self.derived = True
-        return {"api_key": "k", "secret": "s", "passphrase": "p"}
-
-    def set_api_creds(self, creds):
-        self.creds_set = creds
 
 
 def _layout_b_event():
@@ -72,13 +57,11 @@ def _layout_a_event():
     }
 
 
-def _adapter(events, clob=None, *, enable_orders=False, mode="paper"):
+def _adapter(events, clob=None):
     return PolymarketAdapter(
         FakeGamma(events),
         TeamAliasResolver(),
         clob_client=clob,
-        enable_orders=enable_orders,
-        mode=mode,
     )
 
 
@@ -211,43 +194,26 @@ async def test_get_orderbook_unknown_outcome_token_none():
     assert await a.get_orderbook(ref, Outcome.HOME) is None
 
 
-# ---- place_order double-gate (the safety-critical test) --------------
-async def test_place_order_blocked_in_paper_mode():
-    clob = FakeClob(order_resp={"orderID": "x"})
-    a = _adapter([_layout_b_event()], clob=clob, enable_orders=True, mode="paper")
-    ref = await a.find_market("Arsenal FC", "Chelsea FC", KICKOFF)
-    with pytest.raises(OrdersDisabled):
-        await a.place_order(ref, Outcome.HOME, 10.0, 0.6)
-    assert clob.order_calls == []  # CLOB never touched
+# ---- read-only: no order/sign capability (the safety-critical test) --
+def test_adapter_has_no_order_or_sign_capability():
+    """Predictions-only build: the former double-gated place_order machinery
+    was deleted so a careless edit can never re-arm live trading. The adapter
+    exposes NO order-placement or signing surface — only reads.
+    """
+    a = _adapter([])
+    # No order path at all.
+    assert not hasattr(PolymarketAdapter, "place_order")
+    assert not hasattr(PolymarketAdapter, "orders_live")
+    # No signing key / order-gate state carried on the instance.
+    for attr in ("_private_key", "_funder", "_signature_type",
+                 "_enable_orders", "_mode"):
+        assert not hasattr(a, attr), f"unexpected signing/order state: {attr}"
 
 
-async def test_place_order_blocked_without_enable_flag():
-    clob = FakeClob(order_resp={"orderID": "x"})
-    a = _adapter([_layout_b_event()], clob=clob, enable_orders=False, mode="live")
-    ref = await a.find_market("Arsenal FC", "Chelsea FC", KICKOFF)
-    with pytest.raises(OrdersDisabled):
-        await a.place_order(ref, Outcome.HOME, 10.0, 0.6)
-    assert clob.order_calls == []
-
-
-async def test_place_order_posts_when_double_gated_open():
-    clob = FakeClob(order_resp={
-        "orderID": "0xabc", "status": "matched",
-        "filled_size": 10.0, "avg_price": 0.55,
-    })
-    a = _adapter([_layout_b_event()], clob=clob, enable_orders=True, mode="live")
-    ref = await a.find_market("Arsenal FC", "Chelsea FC", KICKOFF)
-    result = await a.place_order(ref, Outcome.HOME, 10.0, 0.6)
-    assert len(clob.order_calls) == 1
-    assert result.order_id == "0xabc"
-    assert result.status == "matched"
-    assert result.exchange is ExchangeName.POLYMARKET
-
-
-async def test_get_clob_derives_and_sets_api_creds(monkeypatch):
-    """CLOB v2 rejects every order endpoint until L2 API creds are derived
-    from the wallet and attached. _get_clob must do that on construction —
-    otherwise live orders fail with 'API Credentials are needed'."""
+async def test_get_clob_is_read_only(monkeypatch):
+    """_get_clob builds a bare read-only CLOB client — no wallet key, no funder,
+    no signature type, and it never derives/sets L2 API creds (get_order_book is
+    a public endpoint). There is nothing here that could sign an order."""
     import sys
     import types
 
@@ -257,59 +223,20 @@ async def test_get_clob_derives_and_sets_api_creds(monkeypatch):
         def __init__(self, **kw):
             calls["init_kwargs"] = kw
 
-        def create_or_derive_api_key(self):
-            calls["derived"] = True
-            return {"api_key": "k", "secret": "s", "passphrase": "p"}
-
-        def set_api_creds(self, creds):
-            calls["creds_set"] = creds
+        # If _get_clob ever tried to sign/derive, these would blow up.
+        def create_or_derive_api_key(self):  # pragma: no cover
+            raise AssertionError("read-only client must not derive API creds")
 
     fake_mod = types.ModuleType("py_clob_client_v2.client")
     fake_mod.ClobClient = _FakeClobClient
     monkeypatch.setitem(sys.modules, "py_clob_client_v2.client", fake_mod)
 
-    # No clob injected → _get_clob constructs a real (here faked) client.
-    a = _adapter([], enable_orders=True, mode="live")
+    a = _adapter([])
     clob = a._get_clob()
-
-    assert calls.get("derived") is True, "must derive API creds on construction"
-    assert calls.get("creds_set") == {"api_key": "k", "secret": "s", "passphrase": "p"}
-    # Cached — a second call must not re-derive.
-    calls.clear()
-    assert a._get_clob() is clob
-    assert "derived" not in calls
-
-
-async def test_get_clob_passes_signature_type_and_funder(monkeypatch):
-    """The Magic/proxy deposit-wallet route needs signature_type + funder
-    threaded into the CLOB client; a bare EOA (type 0) is rejected by
-    Polymarket v2 with 'maker address not allowed'."""
-    import sys
-    import types
-
-    calls: dict = {}
-
-    class _FakeClobClient:
-        def __init__(self, **kw):
-            calls["init_kwargs"] = kw
-
-        def create_or_derive_api_key(self):
-            return {"api_key": "k"}
-
-        def set_api_creds(self, creds):
-            pass
-
-    fake_mod = types.ModuleType("py_clob_client_v2.client")
-    fake_mod.ClobClient = _FakeClobClient
-    monkeypatch.setitem(sys.modules, "py_clob_client_v2.client", fake_mod)
-
-    a = PolymarketAdapter(
-        FakeGamma([]), TeamAliasResolver(),
-        enable_orders=True, mode="live",
-        private_key="0xabc", funder="0xPROXY", signature_type=1,
-    )
-    a._get_clob()
     kw = calls["init_kwargs"]
-    assert kw["signature_type"] == 1
-    assert kw["funder"] == "0xPROXY"
-    assert kw["key"] == "0xabc"
+    # No signing surface passed to the client.
+    assert "key" not in kw
+    assert "funder" not in kw
+    assert "signature_type" not in kw
+    # Cached — a second call reuses the same client.
+    assert a._get_clob() is clob
