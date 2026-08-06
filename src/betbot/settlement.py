@@ -20,13 +20,10 @@ from datetime import datetime, timezone
 
 from betbot.data.football_data import FootballDataClient
 from betbot.logging import get_logger
-from betbot.config import INTERNATIONAL_COMPETITIONS
 from betbot.storage.repos import (
-    apply_rating_period,
     is_kill_switch_tripped,
     list_unsettled_bets_due,
     record_settlement,
-    score_model_prediction,
     settled_pnl_window,
     trip_kill_switch,
 )
@@ -86,7 +83,6 @@ class SettlementWatcher:
         due = list_unsettled_bets_due(now, s.settle_grace_minutes)
 
         settled = in_play = no_result = 0
-        wc_results: dict[int, tuple[str, str, str]] = {}  # fixture_id -> (home, away, outcome)
         for bet in due:
             try:
                 match = await self._client.get_match(bet.fixture_id)
@@ -109,14 +105,6 @@ class SettlementWatcher:
             pnl = compute_pnl(bet.market_price, bet.outcome, outcome.value, bet.stake_usd)
             record_settlement(bet.id, outcome.value, pnl, now)
             settled += 1
-
-            # Collect international results to update Glicko ratings (once/fixture).
-            comp = (match.get("competition") or {}).get("code")
-            if comp in INTERNATIONAL_COMPETITIONS and bet.fixture_id not in wc_results:
-                home = (match.get("homeTeam") or {}).get("name")
-                away = (match.get("awayTeam") or {}).get("name")
-                if home and away:
-                    wc_results[bet.fixture_id] = (home, away, outcome.value)
             log.info(
                 "bet_settled",
                 fixture_id=bet.fixture_id,
@@ -124,28 +112,6 @@ class SettlementWatcher:
                 result=outcome.value,
                 pnl_usd=round(pnl, 2),
             )
-
-        # Update Glicko ratings from this matchday's international results.
-        if wc_results:
-            try:
-                n = apply_rating_period(
-                    list(wc_results.values()),
-                    period=now.date().isoformat(),
-                    tau=self._settings.glicko_tau,
-                    default_rating=self._settings.glicko_default_rating,
-                    default_rd=self._settings.glicko_default_rd,
-                    default_vol=self._settings.glicko_default_vol,
-                )
-                log.info("glicko_period_applied", fixtures=len(wc_results), teams=n)
-            except Exception as e:  # noqa: BLE001
-                log.error("glicko_period_failed", error=str(e))
-            # Score the dual-logged model race (Hedge) for these fixtures.
-            for fid, (_h, _a, result) in wc_results.items():
-                try:
-                    if score_model_prediction(fid, result):
-                        log.info("model_race_scored", fixture_id=fid, result=result)
-                except Exception as e:  # noqa: BLE001
-                    log.error("model_race_score_failed", fixture_id=fid, error=str(e))
 
         tripped, pnl_w, staked_w = self._evaluate_kill_switch()
         log.info(

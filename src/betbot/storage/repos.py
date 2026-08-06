@@ -10,12 +10,10 @@ from betbot.logging import get_logger
 from betbot.storage.db import session_scope
 from betbot.storage.models import (
     ArbExecution,
-    ArbScanResult,
     Deposit,
     GasTopup,
     GlickoRating,
     KillSwitch,
-    ModelPrediction,
     PaperBet,
     PredictionRow,
     TreasuryBridge,
@@ -48,6 +46,8 @@ def upsert_prediction(
             existing.home_score = prediction.home_score
             existing.away_score = prediction.away_score
             existing.draw_score = prediction.draw_score
+            existing.home_xg = prediction.home_xg
+            existing.away_xg = prediction.away_xg
             s.flush()
             return existing.id
         row = PredictionRow(
@@ -63,6 +63,8 @@ def upsert_prediction(
             home_score=prediction.home_score,
             away_score=prediction.away_score,
             draw_score=prediction.draw_score,
+            home_xg=prediction.home_xg,
+            away_xg=prediction.away_xg,
         )
         s.add(row)
         s.flush()
@@ -252,17 +254,21 @@ def list_settled_market_bets(window_days: int | None = None) -> list[PaperBet]:
 # ----------------------------------------------------------------------
 def list_bets_created_between(
     start: datetime, end: datetime
-) -> list[tuple[PaperBet, str, str]]:
-    """``(bet, home_team, away_team)`` for bets logged in ``[start, end)``.
+) -> list[tuple[PaperBet, str, str, float | None, float | None]]:
+    """``(bet, home_team, away_team, home_xg, away_xg)`` for bets logged in
+    ``[start, end)``.
 
-    Team names are joined in here (rather than via the lazy relationship)
+    Team names + xG are joined in here (rather than via the lazy relationship)
     because rows are detached before returning — relationship access on a
     detached row raises DetachedInstanceError.
     """
     with session_scope() as s:
         rows = list(
             s.execute(
-                select(PaperBet, PredictionRow.home_team, PredictionRow.away_team)
+                select(
+                    PaperBet, PredictionRow.home_team, PredictionRow.away_team,
+                    PredictionRow.home_xg, PredictionRow.away_xg,
+                )
                 .join(PredictionRow, PaperBet.prediction_id == PredictionRow.id)
                 .where(PaperBet.created_at >= start)
                 .where(PaperBet.created_at < end)
@@ -270,17 +276,21 @@ def list_bets_created_between(
             )
         )
         s.expunge_all()
-        return [(r[0], r[1], r[2]) for r in rows]
+        return [(r[0], r[1], r[2], r[3], r[4]) for r in rows]
 
 
 def list_bets_settled_between(
     start: datetime, end: datetime
-) -> list[tuple[PaperBet, str, str]]:
-    """``(bet, home_team, away_team)`` for bets settled in ``[start, end)``."""
+) -> list[tuple[PaperBet, str, str, float | None, float | None]]:
+    """``(bet, home_team, away_team, home_xg, away_xg)`` for bets settled in
+    ``[start, end)``."""
     with session_scope() as s:
         rows = list(
             s.execute(
-                select(PaperBet, PredictionRow.home_team, PredictionRow.away_team)
+                select(
+                    PaperBet, PredictionRow.home_team, PredictionRow.away_team,
+                    PredictionRow.home_xg, PredictionRow.away_xg,
+                )
                 .join(PredictionRow, PaperBet.prediction_id == PredictionRow.id)
                 .where(PaperBet.settled_at.is_not(None))
                 .where(PaperBet.settled_at >= start)
@@ -289,7 +299,7 @@ def list_bets_settled_between(
             )
         )
         s.expunge_all()
-        return [(r[0], r[1], r[2]) for r in rows]
+        return [(r[0], r[1], r[2], r[3], r[4]) for r in rows]
 
 
 def cumulative_realized_pnl_usd() -> float:
@@ -303,41 +313,6 @@ def cumulative_realized_pnl_usd() -> float:
             select(PaperBet.pnl_usd).where(PaperBet.settled_at.is_not(None))
         ).scalars()
         return float(sum(r or 0.0 for r in rows))
-
-
-def record_arb_opportunity(
-    *,
-    home_team: str,
-    away_team: str,
-    venues: str,
-    margin: float,
-    price_sum: float,
-    scanned_at: datetime | None = None,
-) -> None:
-    """Persist one arb-scan hit so the daily report can count today's total."""
-    with session_scope() as s:
-        s.add(
-            ArbScanResult(
-                scanned_at=scanned_at or datetime.now(timezone.utc),
-                home_team=home_team[:80],
-                away_team=away_team[:80],
-                venues=venues[:120],
-                margin=margin,
-                price_sum=price_sum,
-            )
-        )
-
-
-def count_arb_opportunities_between(start: datetime, end: datetime) -> int:
-    """How many arb opportunities all scans recorded in ``[start, end)``."""
-    with session_scope() as s:
-        n = s.execute(
-            select(func.count())
-            .select_from(ArbScanResult)
-            .where(ArbScanResult.scanned_at >= start)
-            .where(ArbScanResult.scanned_at < end)
-        ).scalar_one()
-        return int(n)
 
 
 # ----------------------------------------------------------------------
@@ -820,19 +795,6 @@ def get_user(telegram_user_id: int) -> User | None:
         return u
 
 
-def set_arb_interest(telegram_user_id: int, value: bool) -> bool:
-    """Persist whether a user opted into cross-venue arbitrage. Returns False
-    if the user doesn't exist (caller should register first)."""
-    with session_scope() as s:
-        u = s.execute(
-            select(User).where(User.telegram_user_id == telegram_user_id)
-        ).scalar_one_or_none()
-        if u is None:
-            return False
-        u.arb_interest = value
-        return True
-
-
 def list_users() -> list[User]:
     with session_scope() as s:
         rows = list(
@@ -843,135 +805,3 @@ def list_users() -> list[User]:
         return rows
 
 
-# ---- Online model selection (Hedge) — see strategy/model_select.py ------
-
-_OUTCOME_INDEX = {"HOME": 0, "DRAW": 1, "AWAY": 2}
-
-
-def upsert_model_prediction(
-    fixture_id: int,
-    home_team: str,
-    away_team: str,
-    glicko: tuple[float, float, float],
-    ensemble: tuple[float, float, float],
-    weights: tuple[float, float],
-    challenger: tuple[float, float, float] | None = None,
-    mov: tuple[float, float, float] | None = None,
-) -> None:
-    """Record both models' pre-match view. Re-predicting before kickoff
-    overwrites; once an outcome is scored the row is frozen.
-
-    ``challenger`` is the dispersion-sharpened triple (c_* columns); ``mov`` is
-    the margin-of-victory challenger triple (m_* columns). Both are dual-logged
-    regardless of whether their live flag is on; ``None`` leaves them unset.
-    """
-    with session_scope() as s:
-        row = s.execute(
-            select(ModelPrediction).where(ModelPrediction.fixture_id == fixture_id)
-        ).scalar_one_or_none()
-        if row is not None and row.outcome is not None:
-            return  # already settled — never rewrite history
-        if row is None:
-            row = ModelPrediction(fixture_id=fixture_id,
-                                  home_team=home_team, away_team=away_team,
-                                  g_home=0, g_draw=0, g_away=0,
-                                  e_home=0, e_draw=0, e_away=0,
-                                  w_glicko=0, w_ensemble=0)
-            s.add(row)
-        row.home_team, row.away_team = home_team, away_team
-        row.g_home, row.g_draw, row.g_away = glicko
-        row.e_home, row.e_draw, row.e_away = ensemble
-        row.w_glicko, row.w_ensemble = weights
-        if challenger is not None:
-            row.c_home, row.c_draw, row.c_away = challenger
-        if mov is not None:
-            row.m_home, row.m_draw, row.m_away = mov
-
-
-def score_model_prediction(fixture_id: int, outcome: str) -> bool:
-    """Fill RPS for both models once the result is known. Idempotent —
-    returns False if there's no row or it was already scored."""
-    from betbot.strategy.ensemble import ranked_probability_score
-
-    oi = _OUTCOME_INDEX.get(outcome)
-    if oi is None:
-        return False
-    with session_scope() as s:
-        row = s.execute(
-            select(ModelPrediction).where(ModelPrediction.fixture_id == fixture_id)
-        ).scalar_one_or_none()
-        if row is None or row.outcome is not None:
-            return False
-        row.outcome = outcome
-        row.rps_glicko = ranked_probability_score(
-            (row.g_home, row.g_draw, row.g_away), oi
-        )
-        row.rps_ensemble = ranked_probability_score(
-            (row.e_home, row.e_draw, row.e_away), oi
-        )
-        if row.c_home is not None:
-            row.rps_challenger = ranked_probability_score(
-                (row.c_home, row.c_draw, row.c_away), oi
-            )
-        if row.m_home is not None:
-            row.rps_mov = ranked_probability_score(
-                (row.m_home, row.m_draw, row.m_away), oi
-            )
-        return True
-
-
-def model_select_losses() -> tuple[float, float, int]:
-    """(cumulative RPS glicko, cumulative RPS ensemble, n scored matches)."""
-    with session_scope() as s:
-        rows = list(
-            s.execute(
-                select(ModelPrediction).where(ModelPrediction.outcome.is_not(None))
-            ).scalars()
-        )
-        return (
-            sum(r.rps_glicko or 0.0 for r in rows),
-            sum(r.rps_ensemble or 0.0 for r in rows),
-            len(rows),
-        )
-
-
-def scored_model_predictions() -> list[tuple]:
-    """Settled model_predictions as ``[(glicko_triple, ensemble_triple, oi)]``
-    for the calibration report. Newest data last (insertion order)."""
-    with session_scope() as s:
-        rows = list(
-            s.execute(
-                select(ModelPrediction)
-                .where(ModelPrediction.outcome.is_not(None))
-                .order_by(ModelPrediction.id.asc())
-            ).scalars()
-        )
-        out = []
-        for r in rows:
-            oi = _OUTCOME_INDEX.get(r.outcome)
-            if oi is None:
-                continue
-            out.append((
-                (r.g_home, r.g_draw, r.g_away),
-                (r.e_home, r.e_draw, r.e_away),
-                oi,
-            ))
-        return out
-
-
-def model_select_summary(eta: float = 2.0) -> dict:
-    """Operator-facing snapshot: who's winning the live model race."""
-    from betbot.strategy.model_select import hedge_weights
-
-    lg, le, n = model_select_losses()
-    w_g, w_e = hedge_weights(lg, le, eta=eta)
-    return {
-        "scored_matches": n,
-        "cum_rps_glicko": round(lg, 4),
-        "cum_rps_ensemble": round(le, 4),
-        "avg_rps_glicko": round(lg / n, 4) if n else None,
-        "avg_rps_ensemble": round(le / n, 4) if n else None,
-        "weight_glicko": round(w_g, 3),
-        "weight_ensemble": round(w_e, 3),
-        "leader": ("glicko" if lg < le else "ensemble") if n else "no data yet",
-    }

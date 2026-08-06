@@ -11,6 +11,7 @@
 # Keep this list conservative: a bad alias silently mis-routes a bet.
 
 aliases:
+  "RCD Espanyol de Barcelona": ["Espanol", "Espanyol", "Espanyol Barcelona"]
   "Royale Union Saint-Gilloise": ["St Gillis", "Union SG", "Union Saint-Gilloise", "USG"]
   "Paris Saint-Germain FC": ["PSG", "Paris SG", "Paris Saint Germain"]
   "FC Bayern München": ["Bayern Munich", "Bayern", "Bayern Munchen"]

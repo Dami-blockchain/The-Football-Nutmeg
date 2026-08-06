@@ -129,7 +129,6 @@ def main() -> None:
     if args.probe:
         items, info = run_actor(token, {"mode": "league_matches",
                                         "leagues": ["EPL"], "seasons": [2024]}, cap_usd=2.0)
-        charge = info.get("usageTotalUsd") or info.get("stats", {}).get("computeUnits")
         print(f"probe status={info.get('status')} items={len(items)} "
               f"charge_usd≈{info.get('usageTotalUsd')}")
         if items:

@@ -132,12 +132,16 @@ class ClubStrategyEngine:
         components: list[tuple[float, tuple[float, float, float]]] = [
             (s.club_weight_glicko, glicko_probs)
         ]
+        home_xg: float | None = None
+        away_xg: float | None = None
         if self._dc_params is not None:
+            hk, ak = self._dc_key(home_name), self._dc_key(away_name)
             dc_probs = dc.match_probabilities(
-                self._dc_params, self._dc_key(home_name), self._dc_key(away_name),
-                home_field=True,
+                self._dc_params, hk, ak, home_field=True,
             )
             components.append((s.club_weight_dc, dc_probs))
+            lam_h, lam_a = dc.expected_goals(self._dc_params, hk, ak, home_field=True)
+            home_xg, away_xg = round(lam_h, 2), round(lam_a, 2)
         if s.club_weight_form > 0:
             fp = self._base.predict(fixture_form)
             components.append((s.club_weight_form, (fp.p_home, fp.p_draw, fp.p_away)))
@@ -155,6 +159,8 @@ class ClubStrategyEngine:
             home_score=rh.rating,   # store ratings for transparency
             away_score=ra.rating,
             draw_score=0.0,
+            home_xg=home_xg,
+            away_xg=away_xg,
         )
 
     def decide_with_market(

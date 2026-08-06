@@ -44,6 +44,20 @@ not across the board. So the objective function is:
 * **Meta-blend + per-league isotonic calibration + Hedge selection**: we
   have the machinery (ensemble.py, model_select.py) — wired only to WC.
 
+## STRIP (2026-08-06) — club-focused core
+Operator-directed cleanup before merge: removed ALL World-Cup machinery
+(intl engine, availability/injuries, fundamentals, simulator, dispersion +
+MOV challengers, model-select/Hedge, calibration, api-football client, WC
+scripts/tests/config) and the cross-venue ARB scanner/executor/SX Bet (+ its
+digest/telegram opt-in). Deposit bridge, Telegram bot, multi-tenant trading
+KEPT. R1 sweep harness removed with MOV (result recorded above; all
+recoverable from git history). ADDED: weekly club data refresh (Mon 06:00 UTC
+daemon job: fetch results -> re-seed Glicko -> refit DC) fixing frozen-ratings
+bug — settlement previously updated ratings only for WC fixtures. ADDED:
+expected-goals readout (DC lambdas) on every club/CL prediction, persisted +
+shown in the daily report xG column. Alias fixes: Espanyol was wrongly
+receiving Barcelona's rating (fuzzy-match bug, now pinned by alias).
+
 ## Phases (each gated; ship = beats incumbent on walk-forward CI)
 
 ### R1 — Quick wins from existing code (no new data)

@@ -54,6 +54,11 @@ class PredictionRow(Base):
     away_score: Mapped[float] = mapped_column(Float)
     draw_score: Mapped[float] = mapped_column(Float)
 
+    # Expected-goals readout (display-only). Nullable: only populated when the
+    # Dixon-Coles component is available for both teams; None on fallback paths.
+    home_xg: Mapped[float | None] = mapped_column(Float, nullable=True)
+    away_xg: Mapped[float | None] = mapped_column(Float, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )

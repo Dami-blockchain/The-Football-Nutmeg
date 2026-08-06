@@ -50,8 +50,7 @@ USER GUIDE (this is what you help people with):
 - The bot models match probabilities (form, ratings, ensemble), compares them
   with market prices, and only logs a bet when its edge threshold is met.
   It starts in paper mode; live trading is gated behind a performance gate.
-- Daily rhythm (Nairobi time, EAT): a cross-venue arbitrage digest at 9am and
-  a performance report at 9pm.
+- Daily rhythm (Nairobi time, EAT): a performance report at 9pm.
 - Commands: /start (register + guide), /deposit (your wallet address),
   /balance (your USDC balance), /status (mode, gate, performance),
   /bets (recent bets), /help (this guide).

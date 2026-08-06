@@ -237,7 +237,7 @@ async def test_start_onboarding_content(tg_env):
     assert u.wallet_address in reply  # personal deposit address
     assert "10 USDC" in reply  # minimum deposit to begin
     assert "bridge" in reply.lower()  # bridging explained
-    assert "9am" in reply and "9pm" in reply  # daily reports
+    assert "9pm" in reply  # daily report (the 9am arb digest is gone)
     for cmd in ("/deposit", "/balance", "/status", "/bets", "/help"):
         assert cmd in reply
     assert "not financial advice" in reply.lower()  # risk disclaimer

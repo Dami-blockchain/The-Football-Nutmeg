@@ -12,11 +12,10 @@ set:  python -m betbot.telegram_bot
 
 from __future__ import annotations
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
-    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -33,107 +32,10 @@ from betbot.storage.repos import (
     get_or_create_user,
     get_user,
     list_recent_paper_bets,
-    set_arb_interest,
 )
 from betbot.wallet import all_balances, store_limitless_creds
 
 log = get_logger(__name__)
-
-# Callback data for the /start cross-venue-arbitrage opt-in button.
-ARB_INTEREST_CB = "arb_interest"
-
-# Cross-venue arbitrage explainer, sent when a user opts in.
-ARB_EXPLAINER = (
-    "🔁 *Cross-venue arbitrage*\n\n"
-    "Sometimes the same match is priced differently on Polymarket and "
-    "Limitless. When the gap is big enough, I can buy *both* sides — one on "
-    "each venue — so you lock a profit no matter who wins. I only fire when "
-    "the locked margin clears *2%*, size within strict caps, and never chase "
-    "a half-filled trade.\n\n"
-    "To include you, I trade the Polymarket leg from your wallet "
-    "automatically. The *Limitless* leg needs you to open a Limitless account "
-    "once and link an API key — here's how. 👇"
-)
-
-# Very detailed step-by-step Limitless onboarding, sent after the explainer
-# (and after the optional video). Split into a few Telegram messages so each
-# step is easy to read on a phone and the whole thing isn't one wall of text.
-# These are sent in order; LIMITLESS_GUIDE_PARTS[-1] carries the /linklimitless
-# call-to-action.
-LIMITLESS_GUIDE_PARTS = (
-    # Part 1 — what you're about to do + the one prerequisite.
-    "📋 *Set up Limitless — full walkthrough*\n"
-    "_About 5 minutes. Follow it with app.limitless.exchange open beside this "
-    "chat. You only ever do this once._\n\n"
-    "*What you'll end up with:* a Limitless account funded with USDC on the "
-    "Base network, and an API key you paste to me so I can place the Limitless "
-    "side of an arbitrage for you.\n\n"
-    "*Before you start, you need:* a crypto wallet (e.g. MetaMask, Rabby, or "
-    "any wallet app) — OR just an email address, since Limitless lets you sign "
-    "in with email and creates a wallet for you.",
-    # Part 2 — open the account.
-    "*Step 1 — Open your Limitless account*\n"
-    "1. On your phone or computer, go to *app.limitless.exchange*\n"
-    "2. Tap *Connect* (or *Sign in*) in the top corner.\n"
-    "3. Choose how to sign in:\n"
-    "   • *Email* — type your email, then the code they send you. Limitless "
-    "makes a wallet for you automatically.\n"
-    "   • *Wallet* — pick your wallet app (MetaMask etc.) and approve the "
-    "connection.\n"
-    "4. You're in when you can see your account/balance in the corner. ✅",
-    # Part 3 — fund it (the part people get wrong).
-    "*Step 2 — Add money (USDC on Base)*\n"
-    "Limitless runs on the *Base* network and trades in *USDC*. Your money "
-    "must be USDC *on Base* specifically — not Ethereum, not Polygon.\n\n"
-    "• If you bought USDC on an exchange (Coinbase, Binance…), withdraw it and "
-    "choose the *Base* network when asked, sending to your Limitless wallet "
-    "address.\n"
-    "• If your USDC is on another network, use any bridge (e.g. *bridge.base.org*) "
-    "to move it to Base first.\n"
-    "• Start small — even *10–20 USDC* is enough to take part.\n\n"
-    "⚠️ Picking the wrong network is the #1 mistake — double-check it says "
-    "*Base* before you confirm.",
-    # Part 4 — create the API key.
-    "*Step 3 — Create your API key*\n"
-    "1. In Limitless, open *Settings* (often a gear icon or your profile menu).\n"
-    "2. Find *API* (sometimes labelled *Developer* or *API keys*).\n"
-    "3. Tap *Create API key*. If it asks for a *scope* or *permission*, choose "
-    "*trading*.\n"
-    "4. Limitless now shows you an *API key* and an *API secret*.\n\n"
-    "🔑 *Copy BOTH immediately* — the *secret is shown only once*. If you lose "
-    "it you just make a new key (which replaces the old one). Paste them "
-    "somewhere safe for the next step.",
-    # Part 5 — hand it to the bot (CTA + security).
-    "*Step 4 — Link it to me*\n"
-    "Send me this message, pasting in your two values:\n\n"
-    "`/linklimitless YOUR_API_KEY YOUR_API_SECRET`\n\n"
-    "_Example:_ `/linklimitless lmts_ab12... sk_9f8e...`\n\n"
-    "🔒 *Your safety:* your key is saved only in your own isolated profile, "
-    "file-locked, never shown again, and used solely to place *your* Limitless "
-    "arbitrage orders. The moment you send it, I *delete your message* so the "
-    "key isn't left sitting in this chat. Only ever send it here, in this "
-    "direct chat — never in a group.\n\n"
-    "That's it — once you've also deposited, you're in the arbitrage pool. 🎉",
-)
-
-# OPTIONAL extra: an operator can record the ~90s screen-capture (script below)
-# and set BETBOT_ARB_GUIDE_VIDEO_URL. The written walkthrough above is the
-# primary, self-sufficient guide — the video is a nice-to-have, never a missing
-# piece, so there is no "coming soon" placeholder when it's unset.
-#
-# Operator: record ~90s screen capture covering:
-#   (0-12s)  What arb is: same match, two venues, different prices → buy both
-#            sides → profit locked regardless of result.
-#   (12-28s) How the bot does it: scans Polymarket + Limitless every cycle,
-#            only fires at >=2% locked margin, sizes within caps,
-#            both-legs-or-abort.
-#   (28-42s) What you need: deposit >=10 USDC; the Polymarket leg is automatic;
-#            the Limitless leg needs your own Limitless account + API key.
-#   (42-80s) Open Limitless: app.limitless.exchange → connect wallet (Privy) →
-#            fund with USDC on Base → Settings/API → Create key (trading scope)
-#            → copy key + secret (shown once).
-#   (80-90s) Link it: send /linklimitless <key> <secret> to the bot. Done —
-#            you're in the arb pool.
 
 
 def _allowed(update: Update) -> bool:
@@ -189,8 +91,7 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "needed). /balance confirms arrival.\n"
         "3. Trading starts in *paper mode*; live trading only switches on "
         "once the performance gate passes.\n"
-        "4. Daily reports (Nairobi time): arbitrage digest at *9am*, "
-        "performance report at *9pm*.\n\n"
+        "4. Daily report (Nairobi time): performance report at *9pm*.\n\n"
         "*Commands*\n"
         "/deposit – your wallet address (Polygon + Base)\n"
         "/balance – your USDC balance\n"
@@ -204,16 +105,6 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "future results. This is not financial advice — only deposit what "
         "you can afford to lose.",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "🔁 Cross-venue arbitrage — tell me more",
-                        callback_data=ARB_INTEREST_CB,
-                    )
-                ]
-            ]
-        ),
     )
 
 
@@ -254,8 +145,7 @@ async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     gate_line = "PASS ✅" if g.passed else "FAIL ❌"
     await update.message.reply_text(
         f"*Status*\n\nMode: `{s.mode}`\nLive-trading gate: {gate_line}\n"
-        f"Settled bets: {r.n} (hit {r.hit_rate:.0%}, ROI {r.roi:+.1%})\n"
-        f"Cross-venue arb alerts: on (every {s.arb_scan_interval_min} min)",
+        f"Settled bets: {r.n} (hit {r.hit_rate:.0%}, ROI {r.roi:+.1%})",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -272,42 +162,6 @@ async def bets_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         pnl = f"{b.pnl_usd:+.2f}" if b.pnl_usd is not None else "—"
         lines.append(f"#{b.fixture_id} {b.outcome} p={b.our_probability:.2f} → {res} ({pnl})")
     await update.message.reply_text("*Recent bets*\n" + "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-
-
-@_authed
-async def arb_interest_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """User tapped the cross-venue-arbitrage opt-in button on /start.
-
-    Persists arb_interest=True, answers the callback, then sends three things
-    in order: the explainer, a how-to video (or a graceful fallback note), and
-    the Limitless onboarding guide.
-    """
-    s = get_settings()
-    query = update.callback_query
-    user = update.effective_user
-    # Make sure the user exists (and so the flag has somewhere to live) — a
-    # callback can in principle arrive before any other handler registered them.
-    _register(update)
-    set_arb_interest(user.id, True)
-    await query.answer()
-
-    chat_id = query.message.chat_id
-    # (a) explainer
-    await ctx.bot.send_message(
-        chat_id, ARB_EXPLAINER, parse_mode=ParseMode.MARKDOWN
-    )
-    # (b) OPTIONAL video — only when the operator configured one. The written
-    # walkthrough below is the primary, complete guide, so there is no
-    # "coming soon" placeholder when no video is set. A bad URL/file_id must
-    # never break onboarding.
-    if s.arb_guide_video_url:
-        try:
-            await ctx.bot.send_video(chat_id, video=s.arb_guide_video_url)
-        except Exception as e:  # noqa: BLE001 — a bad URL can't break onboarding
-            log.warning("arb_guide_video_failed", error=str(e))
-    # (c) the detailed Limitless walkthrough, one message per step.
-    for part in LIMITLESS_GUIDE_PARTS:
-        await ctx.bot.send_message(chat_id, part, parse_mode=ParseMode.MARKDOWN)
 
 
 @_authed
@@ -393,9 +247,6 @@ def build_application(settings) -> Application:
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("bets", bets_cmd))
     app.add_handler(CommandHandler("linklimitless", linklimitless_cmd))
-    # Inline-button opt-in for cross-venue arbitrage. Registered before the
-    # catch-all MessageHandler so it's never shadowed.
-    app.add_handler(CallbackQueryHandler(arb_interest_cb, pattern=f"^{ARB_INTEREST_CB}$"))
     # Free-text → LLM assistant. Added LAST so commands keep priority.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_handler))
     return app

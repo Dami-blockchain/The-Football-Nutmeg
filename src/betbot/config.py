@@ -10,8 +10,8 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Top-5 European leagues + UCL. Codes are football-data.org competition IDs.
-LEAGUE_CODES: tuple[str, ...] = ("PL", "PD", "BL1", "SA", "FL1", "CL", "WC")
-INTERNATIONAL_COMPETITIONS: frozenset[str] = frozenset({"WC"})
+LEAGUE_CODES: tuple[str, ...] = ("PL", "PD", "BL1", "SA", "FL1", "CL")
+
 
 class Settings(BaseSettings):
     """All runtime knobs. Loaded from .env at process start.
@@ -37,35 +37,6 @@ class Settings(BaseSettings):
     )
     football_data_rate_limit_per_min: int = Field(
         default=10, alias="FOOTBALL_DATA_RATE_LIMIT_PER_MIN"
-    )
-
-    # ---- API-Football (API-SPORTS) — player availability (injuries) ----
-    # OPTIONAL. Empty key = graceful NO-OP (no injury adjustment), like the
-    # other optional integrations. Free tier is 100 req/day, so team-id
-    # lookups are cached; injuries are fetched per WC fixture.
-    api_football_key: str = Field(default="", alias="API_FOOTBALL_KEY")
-    api_football_base_url: str = Field(
-        default="https://v3.football.api-sports.io", alias="API_FOOTBALL_BASE_URL"
-    )
-    api_football_rate_limit_per_min: int = Field(
-        default=10, alias="API_FOOTBALL_RATE_LIMIT_PER_MIN"
-    )
-    api_football_season: int = Field(default=2026, alias="API_FOOTBALL_SEASON")
-
-    # ---- Lineup / availability adjustment (WC only; OFF until validated) ----
-    # When enabled AND an API-Football key is set, the WC scoring loop fetches
-    # each team's injury list and shifts that team's Glicko rating DOWN by a
-    # small, capped amount before pricing. v1 is a COARSE absence-count signal
-    # (NOT weighted by player importance) and is OFF by default until validated
-    # on the calibration report. Glicko points are small (SCALE ~173.7), so
-    # these defaults move probabilities only a few points even for a depleted
-    # side — conservative by design.
-    lineup_adjust_enabled: bool = Field(default=False, alias="BETBOT_LINEUP_ADJUST")
-    injury_penalty_per_player: float = Field(
-        default=8.0, alias="BETBOT_INJURY_PENALTY_PER_PLAYER"
-    )
-    injury_penalty_cap: float = Field(
-        default=40.0, alias="BETBOT_INJURY_PENALTY_CAP"
     )
 
     # League scope (immutable for v1).
@@ -209,19 +180,6 @@ class Settings(BaseSettings):
     min_user_stake_usd: float = Field(default=1.0, alias="BETBOT_MIN_USER_STAKE_USD")
     # Max slippage added to the quoted price when sending a market buy.
     order_slippage: float = Field(default=0.02, alias="BETBOT_ORDER_SLIPPAGE")
-    # Allow live orders on INTERNATIONAL_COMPETITIONS (World Cup). Default OFF:
-    # the Glicko model is weak vs efficient WC markets and Appendix A makes WC
-    # paper-only by default. Set true to opt in (still gated by live mode + gate).
-    allow_international_live: bool = Field(
-        default=False, alias="BETBOT_ALLOW_INTERNATIONAL_LIVE"
-    )
-    # Bet EVERY international (WC) match that has a market, bypassing the edge
-    # filter. This is -EV against efficient markets (see the Qatar 2022 backtest)
-    # but is what the operator wants for the World Cup. The kill switch + daily
-    # exposure cap still apply as guardrails.
-    international_bet_every_match: bool = Field(
-        default=False, alias="BETBOT_INTERNATIONAL_BET_EVERY_MATCH"
-    )
     # Require the live-readiness gate before placing live orders. Set false to
     # go live without a paper-trading record (NOT recommended — you lose the
     # "earned the right to trade" safety check).
@@ -297,106 +255,20 @@ class Settings(BaseSettings):
         default=10.0, alias="BETBOT_TREASURY_REBALANCE_THRESHOLD_USD"
     )
 
-    # ---- Arbitrage watch (Telegram alerts) ---------------------------
-    arb_notify_min_margin: float = Field(
-        default=0.01, alias="BETBOT_ARB_NOTIFY_MIN_MARGIN"
-    )
-    arb_scan_interval_min: int = Field(
-        default=10, alias="BETBOT_ARB_SCAN_INTERVAL_MIN"
-    )
-    arb_scan_limit: int = Field(default=80, alias="BETBOT_ARB_SCAN_LIMIT")
-    # Optional how-to video shown when a user signals arbitrage interest on
-    # /start. Either a public URL or a Telegram file_id works with send_video.
-    # Empty = the bot sends a graceful "video coming" note; the written guide
-    # below it covers everything regardless.
-    arb_guide_video_url: str = Field(
-        default="", alias="BETBOT_ARB_GUIDE_VIDEO_URL"
-    )
-
-    # ---- Arbitrage EXECUTION (heavily gated; OFF by default) ----------
-    # Master switch. Even when true, execution also requires mode=live, a clear
-    # kill switch, margin >= arb_execute_min_margin, and funded balances on
-    # BOTH venues. The executor self-gates on every opportunity.
-    arb_execute: bool = Field(default=False, alias="BETBOT_ARB_EXECUTE")
-    # Execution threshold — deliberately stricter than the 0.01 alert threshold.
-    arb_execute_min_margin: float = Field(
-        default=0.02, alias="BETBOT_ARB_EXECUTE_MIN_MARGIN"
-    )
-    # Total stake per opportunity, summed across all legs.
-    arb_max_stake_usd: float = Field(default=25.0, alias="BETBOT_ARB_MAX_STAKE_USD")
-    # Per-day cap summed over arb_executions rows that (may have) moved money.
-    arb_daily_cap_usd: float = Field(default=100.0, alias="BETBOT_ARB_DAILY_CAP_USD")
-
     # ---- Daily Telegram jobs (Nairobi wall-clock schedule) ------------
     # The cron triggers pin timezone="Africa/Nairobi" (NOT a UTC offset), so
-    # "09:00" and "exactly 9pm" stay true to the operator's wall clock even
-    # if the zone's rules ever change.
-    arb_digest_enabled: bool = Field(
-        default=True, alias="BETBOT_ARB_DIGEST_ENABLED"
-    )
-    arb_digest_hour: int = Field(default=9, alias="BETBOT_ARB_DIGEST_HOUR")
+    # "exactly 9pm" stays true to the operator's wall clock even if the zone's
+    # rules ever change.
     daily_report_enabled: bool = Field(
         default=True, alias="BETBOT_DAILY_REPORT_ENABLED"
     )
     daily_report_hour: int = Field(default=21, alias="BETBOT_DAILY_REPORT_HOUR")
 
-    # ---- Glicko-2 (international / World Cup, Phase 5.5) --------------
+    # ---- Glicko-2 defaults (shared by the club rating machinery) ------
     glicko_tau: float = Field(default=0.5, alias="BETBOT_GLICKO_TAU")
     glicko_default_rating: float = Field(default=1500.0, alias="BETBOT_GLICKO_DEFAULT_RATING")
     glicko_default_rd: float = Field(default=200.0, alias="BETBOT_GLICKO_DEFAULT_RD")
     glicko_default_vol: float = Field(default=0.06, alias="BETBOT_GLICKO_DEFAULT_VOL")
-    glicko_draw_rho: float = Field(default=0.30, alias="BETBOT_GLICKO_DRAW_RHO")
-    glicko_host_home_mu: float = Field(default=0.2, alias="BETBOT_GLICKO_HOST_HOME_MU")
-    glicko_results_csv: str = Field(default="", alias="BETBOT_GLICKO_RESULTS_CSV")
-
-    # ---- Ensemble (Klement fundamentals + Dixon-Coles + market) -------
-    # Artifacts are regenerable: scripts/fit_dixon_coles.py writes the DC
-    # params; scripts/backtest_ensemble.py writes the calibration. Missing
-    # files are fine — the engine falls back to pure Glicko.
-    dc_params_path: Path = Field(
-        default=Path("./data/dc_params.json"), alias="BETBOT_DC_PARAMS_PATH"
-    )
-    ensemble_calibration_path: Path = Field(
-        default=Path("./data/ensemble_calibration.json"),
-        alias="BETBOT_ENSEMBLE_CALIBRATION_PATH",
-    )
-    # Relative log-pool weights. Market-leaning by design: the closing line
-    # is the strongest single forecaster, so the models act as a
-    # disagreement detector rather than trying to out-predict it.
-    ensemble_weight_glicko: float = Field(
-        default=1.0, alias="BETBOT_ENSEMBLE_W_GLICKO"
-    )
-    # Qatar-2022 walk-forward: DC monotonically improves RPS on 1k+ pre-WC
-    # competitive matches, but on the 64 WC-finals matches the ensemble was
-    # NOT distinguishable from pure Glicko (+0.021 ± 0.024 RPS). Default is
-    # therefore moderate, not the in-sample optimum (3.0). See
-    # scripts/backtest_ensemble.py.
-    ensemble_weight_dc: float = Field(default=1.0, alias="BETBOT_ENSEMBLE_W_DC")
-    ensemble_weight_market: float = Field(
-        default=2.5, alias="BETBOT_ENSEMBLE_W_MARKET"
-    )
-    # Online model selection (Hedge): dual-log pure-Glicko vs ensemble per
-    # WC fixture, score both at settlement, and weight the live prediction
-    # toward whichever is winning this tournament. Eta = learning rate
-    # (0 = ignore evidence; higher = converge faster).
-    model_select_enabled: bool = Field(default=True, alias="BETBOT_MODEL_SELECT")
-    model_select_eta: float = Field(default=2.0, alias="BETBOT_MODEL_SELECT_ETA")
-
-    # ---- Dispersion challenger (flag-gated, default OFF) --------------------
-    # When DISABLED (default) the live prediction is byte-identical to before;
-    # the challenger is still computed and dual-logged (c_* columns) so its RPS
-    # can be compared head-to-head before anyone flips the switch. When ENABLED,
-    # the live prediction uses the dispersion-sharpened triple. ``kappa`` widens
-    # only the home/away split (draw untouched); 1.0 = exact no-op.
-    dispersion_fix_enabled: bool = Field(default=False, alias="BETBOT_DISPERSION_FIX")
-    dispersion_kappa: float = Field(default=1.30, alias="BETBOT_DISPERSION_KAPPA")
-
-    # ---- Margin-of-victory rating challenger (flag-gated, default OFF) -------
-    # When DISABLED (default) the live prediction is byte-identical; the MOV
-    # challenger is computed from data/glicko_mov.json and dual-logged (m_*
-    # columns). When ENABLED, the live glicko component uses MOV ratings.
-    mov_fix_enabled: bool = Field(default=False, alias="BETBOT_MOV_FIX")
-    glicko_mov_path: str = Field(default="data/glicko_mov.json", alias="BETBOT_GLICKO_MOV_PATH")
 
     # ---- Club ensemble engine (domestic leagues: PL/PD/BL1/SA/FL1) -----
     # The same Glicko+Dixon-Coles machinery the WC engine uses, wired to club
@@ -445,14 +317,6 @@ class Settings(BaseSettings):
     cl_weight_elo: float = Field(default=1.0, alias="BETBOT_CL_W_ELO")
     cl_weight_dc: float = Field(default=1.0, alias="BETBOT_CL_W_DC")
     cl_weight_market: float = Field(default=1.0, alias="BETBOT_CL_W_MARKET")
-
-    # ---- Tournament simulator (outright/futures, scripts/simulate_wc.py)
-    # How random extra-time/penalties are when a knockout match draws:
-    # 1.0 = pure coin flip, 0.0 = fully decided by relative DC strength.
-    sim_penalty_randomness: float = Field(
-        default=0.5, alias="BETBOT_SIM_PENALTY_RANDOMNESS"
-    )
-    sim_runs: int = Field(default=20_000, alias="BETBOT_SIM_RUNS")
 
     # ---- Storage ------------------------------------------------------
     db_path: Path = Field(

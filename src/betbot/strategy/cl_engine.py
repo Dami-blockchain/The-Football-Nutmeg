@@ -210,6 +210,8 @@ class EuropeanStrategyEngine:
         components: list[tuple[float, tuple[float, float, float]]] = [
             (s.cl_weight_elo, elo_probs)
         ]
+        home_xg: float | None = None
+        away_xg: float | None = None
         if s.cl_weight_dc > 0 and self._dc_params is not None:
             kh, ka = self._dc_key(home_name), self._dc_key(away_name)
             if kh in self._dc_params.teams and ka in self._dc_params.teams:
@@ -217,6 +219,10 @@ class EuropeanStrategyEngine:
                     self._dc_params, kh, ka, home_field=True
                 )
                 components.append((s.cl_weight_dc, dc_probs))
+                lam_h, lam_a = dc.expected_goals(
+                    self._dc_params, kh, ka, home_field=True
+                )
+                home_xg, away_xg = round(lam_h, 2), round(lam_a, 2)
 
         p_home, p_draw, p_away = log_pool(components)
         return Prediction(
@@ -230,6 +236,8 @@ class EuropeanStrategyEngine:
             home_score=self._snapshot[hit_h],  # store Elo ratings for transparency
             away_score=self._snapshot[hit_a],
             draw_score=0.0,
+            home_xg=home_xg,
+            away_xg=away_xg,
         )
 
     def decide_with_market(

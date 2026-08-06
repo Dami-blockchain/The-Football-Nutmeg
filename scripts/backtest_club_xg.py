@@ -158,8 +158,6 @@ def main() -> None:
         print(f"{n:10s} {100*st['hit']/c:>7.2f} {st['rps']/c:>9.4f} {st['ll']/c:>9.4f}")
 
     # Bootstrap CI on baseline - variant, aligned per match.
-    base_map = dict(zip(range(len(rps_series["baseline"])),
-                        [x[1] for x in rps_series["baseline"]]))
     for variant in ("xG", "blend"):
         diffs = [b - v for (b, v) in zip([x[1] for x in rps_series["baseline"]],
                                          [x[1] for x in rps_series[variant]])]

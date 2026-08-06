@@ -35,6 +35,9 @@ _ADDITIVE_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("model_predictions", "m_draw", "FLOAT"),
     ("model_predictions", "m_away", "FLOAT"),
     ("model_predictions", "rps_mov", "FLOAT"),
+    # Expected-goals readout (display-only) — DC lambdas for the two sides.
+    ("predictions", "home_xg", "REAL"),
+    ("predictions", "away_xg", "REAL"),
 )
 
 
