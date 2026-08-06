@@ -828,6 +828,13 @@ def predictions_for_kickoff_range(
 ) -> list[PredictionRow]:
     """Predictions whose kickoff is in ``[start_dt, end_dt)``, earliest first.
 
+    ONE row per fixture — the latest ``run_date`` wins. The scoring window is
+    48h, so a fixture is re-scored on consecutive daily runs and the table
+    holds 2-3 rows per fixture (unique on (fixture_id, run_date)); without this
+    dedup the tipster message would list the same fixture multiple times AND
+    (money bug) charge a paying user one credit per duplicate row in a single
+    render.
+
     Rows are detached; the linked paper_bet (our recommendation) is eager-loaded
     so :func:`betbot.tips.format_prediction` can read it after the session
     closes without a DetachedInstanceError.
@@ -845,7 +852,14 @@ def predictions_for_kickoff_range(
             ).scalars()
         )
         s.expunge_all()
-        return rows
+    # Keep only the freshest row per fixture (max run_date; id breaks ties),
+    # preserving kickoff order.
+    best: dict[int, PredictionRow] = {}
+    for r in rows:
+        cur = best.get(r.fixture_id)
+        if cur is None or (r.run_date, r.id) > (cur.run_date, cur.id):
+            best[r.fixture_id] = r
+    return [r for r in rows if best[r.fixture_id] is r]
 
 
 def prediction_for_fixture(fixture_id: int) -> PredictionRow | None:
