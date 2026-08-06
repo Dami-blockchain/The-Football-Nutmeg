@@ -17,6 +17,7 @@ from apscheduler.triggers.cron import CronTrigger
 from betbot.config import Settings
 from betbot.daily_jobs import (
     broadcast_chat_ids,
+    commit_reveals,
     nairobi_day_bounds,
     register_daily_jobs,
     render_user_predictions,
@@ -25,6 +26,17 @@ from betbot.daily_jobs import (
 )
 from betbot.entitlement import Entitlement
 from betbot.storage.db import init_engine
+from betbot.storage.repos import (
+    get_user,
+    has_revealed,
+    record_reveal,
+)
+
+
+# By default nothing has been revealed yet — tests that exercise the
+# already-revealed path inject their own fn.
+def _never_revealed(uid, fid):
+    return False
 
 
 @pytest.fixture
@@ -86,49 +98,49 @@ def _ent(reason, *, trial=0, credits=0):
 # ----------------------------------------------------------------------
 def test_operator_reveals_all():
     preds = [_Pred(fixture_id=1), _Pred(fixture_id=2, home_team="Spurs")]
-    text, revealed = render_user_predictions(
+    text, reveals = render_user_predictions(
         _User(111), preds, _tg_settings_stub(),
         entitlement_fn=lambda u, s, now=None: _ent("operator"),
+        already_revealed_fn=_never_revealed,
     )
-    assert revealed == 2
+    # Recorded (so they stay free after any trial) but NEVER charged.
+    assert reveals == [(1, False), (2, False)]
     assert "operator" in text
     assert "🔒" not in text
 
 
 def test_trial_reveals_all():
     preds = [_Pred(fixture_id=1), _Pred(fixture_id=2)]
-    text, revealed = render_user_predictions(
+    text, reveals = render_user_predictions(
         _User(5), preds, _tg_settings_stub(),
         entitlement_fn=lambda u, s, now=None: _ent("trial", trial=3),
+        already_revealed_fn=_never_revealed,
     )
-    assert revealed == 2
+    assert reveals == [(1, False), (2, False)]  # free, but recorded
     assert "3 days left" in text
     assert "🔒" not in text
 
 
 def test_credits_reveal_then_lock():
     preds = [_Pred(fixture_id=i) for i in range(3)]
-    consumed: list[int] = []
-    text, revealed = render_user_predictions(
+    text, reveals = render_user_predictions(
         _User(5), preds, _tg_settings_stub(),
         entitlement_fn=lambda u, s, now=None: _ent("credit", credits=2),
-        consume_fn=lambda tid: consumed.append(tid),
+        already_revealed_fn=_never_revealed,
     )
-    assert revealed == 2  # only 2 credits
-    assert consumed == [5, 5]  # charged once per reveal
-    assert text.count("🔒") == 1  # the third is locked
+    # Only the 2 funded fixtures are revealed + charged; the third is locked.
+    assert reveals == [(0, True), (1, True)]
+    assert text.count("🔒") == 1
 
 
 def test_locked_user_gets_all_teasers():
     preds = [_Pred(fixture_id=1), _Pred(fixture_id=2)]
-    consumed: list[int] = []
-    text, revealed = render_user_predictions(
+    text, reveals = render_user_predictions(
         _User(5), preds, _tg_settings_stub(),
         entitlement_fn=lambda u, s, now=None: _ent("locked"),
-        consume_fn=lambda tid: consumed.append(tid),
+        already_revealed_fn=_never_revealed,
     )
-    assert revealed == 0
-    assert consumed == []
+    assert reveals == []  # nothing revealed, nothing charged
     # One lock in the header + one teaser per prediction (2) = 3.
     assert text.count("🔒") == 3
     assert text.count("send 1 USDC (Polygon) to unlock this prediction") == 2
@@ -136,11 +148,12 @@ def test_locked_user_gets_all_teasers():
 
 
 def test_no_fixtures_message():
-    text, revealed = render_user_predictions(
+    text, reveals = render_user_predictions(
         _User(5), [], _tg_settings_stub(),
         entitlement_fn=lambda u, s, now=None: _ent("trial", trial=3),
+        already_revealed_fn=_never_revealed,
     )
-    assert revealed == 0
+    assert reveals == []
     assert "No fixtures today" in text
 
 
@@ -151,7 +164,7 @@ def _tg_settings_stub() -> Settings:
 # ----------------------------------------------------------------------
 # run_matchday_alert
 # ----------------------------------------------------------------------
-async def test_run_matchday_alert_delivers_per_user(tmp_path):
+async def test_run_matchday_alert_delivers_per_user(db, tmp_path):
     s = _tg_settings(tmp_path)
     users = [_User(111), _User(222)]
     preds = [_Pred(fixture_id=1)]
@@ -175,7 +188,7 @@ async def test_run_matchday_alert_delivers_per_user(tmp_path):
     assert all("Matchday" in t for _, t in sent)
 
 
-async def test_matchday_one_bad_send_does_not_drop_others(tmp_path):
+async def test_matchday_one_bad_send_does_not_drop_others(db, tmp_path):
     s = _tg_settings(tmp_path)
     users = [_User(111), _User(222)]
 
@@ -196,7 +209,7 @@ async def test_matchday_one_bad_send_does_not_drop_others(tmp_path):
 # ----------------------------------------------------------------------
 # send_fixture_alert (kickoff-60m)
 # ----------------------------------------------------------------------
-async def test_send_fixture_alert_includes_lineup_caveat(tmp_path):
+async def test_send_fixture_alert_includes_lineup_caveat(db, tmp_path):
     s = _tg_settings(tmp_path)
     sent: list[str] = []
 
@@ -281,6 +294,122 @@ def test_reports_daily_formatter_still_importable():
 
     text = format_daily_report(DailyReport(date(2026, 6, 11), (), (), 0.0, 0.0, ()))
     assert "Daily report" in text
+
+
+# ----------------------------------------------------------------------
+# Reveal ledger — the money-delivery guarantees (Fable findings #2 + #3)
+# ----------------------------------------------------------------------
+def _paying_user(tmp_path, tid=777):
+    """A real registered user with a real wallet, past trial."""
+    from betbot.storage.repos import get_or_create_user
+
+    u = get_or_create_user(tid, "payer", secrets_dir=str(tmp_path / ".secrets"))
+    return u
+
+
+def test_repeat_render_charges_a_fixture_at_most_once(db, tmp_path):
+    """Paying user, 2 credits, 2 new fixtures. First render charges both; after
+    commit, a second render (fixtures now in the ledger) is FREE — no re-charge."""
+    u = _paying_user(tmp_path)
+    preds = [_Pred(fixture_id=1), _Pred(fixture_id=2)]
+    s = _tg_settings_stub()
+    ent = lambda usr, se, now=None: _ent("credit", credits=2)  # noqa: E731
+
+    # First render: nothing revealed yet -> both are NEW paid reveals.
+    text1, reveals1 = render_user_predictions(
+        u, preds, s, entitlement_fn=ent, already_revealed_fn=has_revealed
+    )
+    assert reveals1 == [(1, True), (2, True)]
+    assert text1.count("🔒") == 0
+
+    # Commit after a (simulated) confirmed send: 2 charged rows, consumed == 2.
+    commit_reveals(u, reveals1)
+    assert has_revealed(u.telegram_user_id, 1) is True
+    assert has_revealed(u.telegram_user_id, 2) is True
+    assert get_user(u.telegram_user_id).predictions_consumed == 2
+
+    # Second render: both already in the ledger -> shown FREE, reveals empty.
+    text2, reveals2 = render_user_predictions(
+        u, preds, s, entitlement_fn=ent, already_revealed_fn=has_revealed
+    )
+    assert reveals2 == []          # nothing NEW to charge
+    assert text2.count("🔒") == 0  # still fully revealed (free)
+    # A redundant commit must not double-charge.
+    commit_reveals(u, reveals2)
+    assert get_user(u.telegram_user_id).predictions_consumed == 2
+
+
+async def test_send_failure_never_charges(db, tmp_path):
+    """Send returns False -> commit is NOT called -> no ledger rows, no charge."""
+    u = _paying_user(tmp_path, tid=778)
+    s = _tg_settings(tmp_path)
+
+    async def failing_send(settings, chat_id, text):
+        return False  # Telegram refused the message
+
+    delivered = await run_matchday_alert(
+        s, send_fn=failing_send,
+        fixtures_fn=lambda a, b: [_Pred(fixture_id=42)],
+        entitlement_fn=lambda usr, se, now=None: _ent("credit", credits=1),
+        users_fn=lambda: [u],
+    )
+    assert delivered == 0
+    assert has_revealed(u.telegram_user_id, 42) is False
+    assert get_user(u.telegram_user_id).predictions_consumed == 0
+
+
+async def test_matchday_then_kickoff_same_fixture_charges_once(db, tmp_path):
+    """After matchday charges a fixture, the kickoff-60m alert for the SAME
+    fixture reveals it FREE (already in the ledger) — zero additional charge."""
+    u = _paying_user(tmp_path, tid=779)
+    s = _tg_settings(tmp_path)
+
+    async def ok_send(settings, chat_id, text):
+        return True
+
+    ent = lambda usr, se, now=None: _ent("credit", credits=5)  # noqa: E731
+
+    await run_matchday_alert(
+        s, send_fn=ok_send,
+        fixtures_fn=lambda a, b: [_Pred(fixture_id=99)],
+        entitlement_fn=ent, users_fn=lambda: [u],
+    )
+    assert get_user(u.telegram_user_id).predictions_consumed == 1
+    assert has_revealed(u.telegram_user_id, 99) is True
+
+    # Kickoff alert for the same fixture — already revealed, so no new charge.
+    await send_fixture_alert(
+        s, 99, send_fn=ok_send,
+        prediction_fn=lambda fid: _Pred(fixture_id=fid),
+        entitlement_fn=ent, users_fn=lambda: [u],
+    )
+    assert get_user(u.telegram_user_id).predictions_consumed == 1
+
+
+def test_operator_trial_reveals_recorded_but_never_charged(db, tmp_path):
+    """Operator/trial reveals carry charged=False; commit records the ledger
+    (so it stays free after the trial) but NEVER increments consumed."""
+    u = _paying_user(tmp_path, tid=780)
+    _t, reveals = render_user_predictions(
+        u, [_Pred(fixture_id=7)], _tg_settings_stub(),
+        entitlement_fn=lambda usr, se, now=None: _ent("trial", trial=4),
+        already_revealed_fn=has_revealed,
+    )
+    assert reveals == [(7, False)]
+    commit_reveals(u, reveals)
+    assert has_revealed(u.telegram_user_id, 7) is True
+    assert get_user(u.telegram_user_id).predictions_consumed == 0
+
+
+def test_record_reveal_is_idempotent(db, tmp_path):
+    """Second record_reveal for the same (user, fixture) returns False; a
+    guarded commit therefore never double-increments."""
+    u = _paying_user(tmp_path, tid=781)
+    assert record_reveal(u.telegram_user_id, 5, True) is True
+    assert record_reveal(u.telegram_user_id, 5, True) is False
+    # commit_reveals twice must charge exactly once.
+    commit_reveals(u, [(5, True)])  # row already exists -> no increment
+    assert get_user(u.telegram_user_id).predictions_consumed == 0
 
 
 # keep timedelta import used (kickoff scheduling reference)

@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta, timezone
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from betbot.logging import get_logger
 from betbot.storage.db import session_scope
@@ -15,6 +16,7 @@ from betbot.storage.models import (
     GlickoRating,
     KillSwitch,
     PaperBet,
+    PredictionReveal,
     PredictionRow,
     TreasuryBridge,
     User,
@@ -818,6 +820,51 @@ def increment_predictions_consumed(telegram_user_id: int) -> None:
         if u is None:
             return
         u.predictions_consumed = (u.predictions_consumed or 0) + 1
+
+
+# ----------------------------------------------------------------------
+# Reveal ledger (per-(user, fixture) money idempotency)
+# ----------------------------------------------------------------------
+def has_revealed(telegram_user_id: int, fixture_id: int) -> bool:
+    """True if this fixture has already been revealed to this user.
+
+    An already-revealed fixture is re-shown FREE and never re-charged — this is
+    the guard that stops the matchday alert, the kickoff alert, and every
+    repeat of ``/predictions`` from billing the same fixture more than once.
+    """
+    with session_scope() as s:
+        row = s.execute(
+            select(PredictionReveal.id)
+            .where(PredictionReveal.telegram_user_id == telegram_user_id)
+            .where(PredictionReveal.fixture_id == fixture_id)
+            .limit(1)
+        ).scalar_one_or_none()
+        return row is not None
+
+
+def record_reveal(
+    telegram_user_id: int, fixture_id: int, charged: bool
+) -> bool:
+    """Record that this fixture was revealed to this user. Idempotent.
+
+    Returns ``True`` if a NEW ledger row was inserted, ``False`` if one already
+    existed (the unique constraint fired). Callers increment the paid-credit
+    counter only when this returns True AND ``charged`` is set, so committing a
+    reveal twice (e.g. a retried Telegram send) can never double-charge.
+    """
+    try:
+        with session_scope() as s:
+            s.add(
+                PredictionReveal(
+                    telegram_user_id=telegram_user_id,
+                    fixture_id=fixture_id,
+                    charged=charged,
+                )
+            )
+        return True
+    except IntegrityError:
+        # Row already exists (uq_reveal_user_fixture) — safe no-op.
+        return False
 
 
 # ----------------------------------------------------------------------

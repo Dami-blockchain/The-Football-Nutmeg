@@ -27,10 +27,12 @@ from apscheduler.triggers.cron import CronTrigger
 from betbot.entitlement import entitlement_for
 from betbot.logging import get_logger
 from betbot.storage.repos import (
+    has_revealed,
     increment_predictions_consumed,
     list_users,
     predictions_for_kickoff_range,
     prediction_for_fixture,
+    record_reveal,
 )
 from betbot.tips import format_locked, format_prediction
 
@@ -95,44 +97,79 @@ def render_user_predictions(
     *,
     now: datetime | None = None,
     entitlement_fn=entitlement_for,
-    consume_fn=increment_predictions_consumed,
+    already_revealed_fn=has_revealed,
     edge_threshold: float | None = None,
-) -> tuple[str, int]:
-    """Build one user's gated message body for a set of predictions.
+) -> tuple[str, list[tuple[int, bool]]]:
+    """Build one user's gated message body. **Pure — no DB writes.**
 
-    Returns ``(text, revealed_count)``. Operator/trial reveal ALL; payers
-    reveal up to ``credits_remaining``, consuming one credit per reveal and
-    re-evaluating so we never reveal more than the balance funds; the rest are
-    locked teasers. Credit consumption goes through ``consume_fn`` (injectable
-    for tests). ``entitlement_fn`` is injected so tests avoid the network.
+    Returns ``(text, reveals)`` where ``reveals`` is a list of
+    ``(fixture_id, charged)`` for each fixture NEWLY revealed in THIS render
+    (i.e. not already in the reveal ledger). The caller commits those reveals —
+    and only charges credits — AFTER a confirmed Telegram send, via
+    :func:`commit_reveals`. Nothing here mutates the DB, so a render whose send
+    fails costs the user nothing.
+
+    Per prediction:
+
+    * **already revealed** (``already_revealed_fn`` is True): shown FREE, added
+      to no ``reveals`` entry — it was accounted for on its first reveal.
+    * **operator / trial**: shown, appended as ``(fid, False)`` — a free reveal,
+      but recorded so it stays free once the trial ends.
+    * **paying**: up to ``credits_remaining`` NEW fixtures are revealed and
+      appended as ``(fid, True)``; the rest are locked teasers.
+    * **locked** (no credit): locked teaser, nothing appended.
+
+    ``entitlement_fn`` and ``already_revealed_fn`` are injected so tests avoid
+    the network and DB.
     """
     if edge_threshold is None:
         edge_threshold = settings.edge_threshold
 
     ent = entitlement_fn(user, settings, now=now)
     parts = [_entitlement_header(ent)]
-    revealed = 0
+    reveals: list[tuple[int, bool]] = []
 
     if not predictions:
         parts.append("\nNo fixtures today.")
-        return "\n".join(parts), 0
+        return "\n".join(parts), reveals
 
-    if ent.reason in ("operator", "trial"):
-        for p in predictions:
-            parts.append("\n" + format_prediction(p, edge_threshold=edge_threshold))
-            revealed += 1
-        return "\n".join(parts), revealed
-
-    # Paying (or locked): reveal up to the paid credits, charging as we go.
+    free_reason = ent.reason in ("operator", "trial")
+    # Paid credits fund only NEW fixtures; already-revealed ones are free and
+    # don't draw down the budget.
     credits = max(0, ent.credits_remaining) if ent.reason == "credit" else 0
+    paid_revealed = 0
+
     for p in predictions:
-        if revealed < credits:
+        # Already paid for on a prior path/repeat — always free, never re-charged.
+        if already_revealed_fn(user.telegram_user_id, p.fixture_id):
             parts.append("\n" + format_prediction(p, edge_threshold=edge_threshold))
-            consume_fn(user.telegram_user_id)
-            revealed += 1
+            continue
+
+        if free_reason:
+            parts.append("\n" + format_prediction(p, edge_threshold=edge_threshold))
+            reveals.append((p.fixture_id, False))
+        elif paid_revealed < credits:
+            parts.append("\n" + format_prediction(p, edge_threshold=edge_threshold))
+            reveals.append((p.fixture_id, True))
+            paid_revealed += 1
         else:
             parts.append("\n" + format_locked(p))
-    return "\n".join(parts), revealed
+
+    return "\n".join(parts), reveals
+
+
+def commit_reveals(user, reveals: list[tuple[int, bool]]) -> None:
+    """Persist reveals AFTER a confirmed send; charge one credit per NEW paid one.
+
+    ``record_reveal`` returns False if the ledger row already existed (a retried
+    send), so this is idempotent — no double ledger row and, crucially, no
+    double :func:`increment_predictions_consumed`. A credit is charged ONLY when
+    a brand-new ``charged=True`` row is inserted, which only happens after a send
+    the caller has already confirmed returned True.
+    """
+    for fid, charged in reveals:
+        if record_reveal(user.telegram_user_id, fid, charged) and charged:
+            increment_predictions_consumed(user.telegram_user_id)
 
 
 # ----------------------------------------------------------------------
@@ -168,13 +205,15 @@ async def run_matchday_alert(
 
     sent = 0
     for user in users_fn():
-        text, _revealed = render_user_predictions(
+        text, reveals = render_user_predictions(
             user, fixtures, settings, now=now, entitlement_fn=entitlement_fn
         )
         body = f"*⚽ Matchday — {day.isoformat()}*\n\n{text}"
         try:
             if await send(settings, user.telegram_user_id, body):
                 sent += 1
+                # Charge + record ONLY after a confirmed send.
+                commit_reveals(user, reveals)
         except Exception as e:  # noqa: BLE001 — one bad send must not drop the rest
             log.warning(
                 "matchday_alert_send_failed",
@@ -220,13 +259,15 @@ async def send_fixture_alert(
     )
     sent = 0
     for user in users_fn():
-        text, _revealed = render_user_predictions(
+        text, reveals = render_user_predictions(
             user, [pred], settings, now=now, entitlement_fn=entitlement_fn
         )
         body = f"*⏰ Kickoff soon*\n\n{text}\n\n{caveat}"
         try:
             if await send(settings, user.telegram_user_id, body):
                 sent += 1
+                # Charge + record ONLY after a confirmed send.
+                commit_reveals(user, reveals)
         except Exception as e:  # noqa: BLE001
             log.warning(
                 "kickoff_alert_send_failed",

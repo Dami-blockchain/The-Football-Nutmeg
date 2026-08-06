@@ -27,7 +27,11 @@ from telegram.ext import (
 )
 
 from betbot.config import get_settings
-from betbot.daily_jobs import nairobi_day_bounds, render_user_predictions
+from betbot.daily_jobs import (
+    commit_reveals,
+    nairobi_day_bounds,
+    render_user_predictions,
+)
 from betbot.entitlement import entitlement_for
 from betbot.llm_agent import LLMAgent
 from betbot.logging import get_logger
@@ -112,11 +116,13 @@ async def predictions_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     now = datetime.now(timezone.utc)
     start, end, day = nairobi_day_bounds(now)
     preds = predictions_for_kickoff_range(start, end)
-    text, _revealed = render_user_predictions(u, preds, s, now=now)
+    text, reveals = render_user_predictions(u, preds, s, now=now)
+    # reply_text raises on a failed send; only commit (charge) once it returns.
     await update.message.reply_text(
         f"*⚽ Today's predictions — {day.isoformat()}*\n\n{text}",
         parse_mode=ParseMode.MARKDOWN,
     )
+    commit_reveals(u, reveals)
 
 
 @_authed
