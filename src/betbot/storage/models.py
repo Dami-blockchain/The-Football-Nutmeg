@@ -287,8 +287,12 @@ class User(Base):
     wallet_keyfile: Mapped[str] = mapped_column(String(255))
     active: Mapped[bool] = mapped_column(default=True)
     # Set True once the user taps the cross-venue arbitrage "tell me more"
-    # button on /start. Drives the Limitless-onboarding follow-up.
+    # button on /start. Legacy column, retained for DB compatibility only.
     arb_interest: Mapped[bool] = mapped_column(default=False)
+    # Paid predictions this user has consumed (post-trial). Each 1 USDC held
+    # buys one reveal; ``credits_remaining = floor(usdc) - predictions_consumed``.
+    # ``created_at`` is the trial start. See :mod:`betbot.entitlement`.
+    predictions_consumed: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )
