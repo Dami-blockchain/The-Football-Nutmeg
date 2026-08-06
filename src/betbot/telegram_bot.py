@@ -144,8 +144,8 @@ async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     r = backtest_stored()
     gate_line = "PASS ✅" if g.passed else "FAIL ❌"
     await update.message.reply_text(
-        f"*Status*\n\nMode: `{s.mode}`\nLive-trading gate: {gate_line}\n"
-        f"Settled bets: {r.n} (hit {r.hit_rate:.0%}, ROI {r.roi:+.1%})",
+        f"*Status*\n\nModel gate: {gate_line}\n"
+        f"Settled recos: {r.n} (hit {r.hit_rate:.0%}, ROI {r.roi:+.1%})",
         parse_mode=ParseMode.MARKDOWN,
     )
 

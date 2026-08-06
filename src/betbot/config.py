@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -25,9 +24,6 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
-
-    # ---- Mode ----------------------------------------------------------
-    mode: Literal["paper", "live"] = Field(default="paper", alias="BETBOT_MODE")
 
     # ---- Football-data.org --------------------------------------------
     football_data_api_key: str = Field(default="", alias="FOOTBALL_DATA_API_KEY")
@@ -114,10 +110,9 @@ class Settings(BaseSettings):
     telegram_allowed_user_ids: str = Field(
         default="", alias="TELEGRAM_ALLOWED_USER_IDS"
     )
-    # Open to the public by default: anyone who messages the bot can register
-    # and gets their own isolated wallet. Funds are never pooled, and live
-    # trading stays behind the mode=paper default + gate, so opening
-    # registration does not weaken any money-moving safeguard.
+    # Open to the public by default: anyone who messages the bot can register.
+    # This is a predictions-only service — the bot places no orders and moves
+    # no funds — so opening registration exposes no money-moving surface.
     telegram_open_registration: bool = Field(
         default=True, alias="TELEGRAM_OPEN_REGISTRATION"
     )
@@ -155,105 +150,6 @@ class Settings(BaseSettings):
         from pathlib import Path
 
         return str(Path(self.wallet_keyfile).resolve().parent)
-
-    # ---- Live-trading secrets (Phase 5; only used in live mode) -------
-    polymarket_private_key: str = Field(default="", alias="POLYMARKET_PRIVATE_KEY")
-    polymarket_funder: str = Field(default="", alias="POLYMARKET_FUNDER")
-    # CLOB signature type: 0=EOA, 1=POLY_PROXY (email/Magic deposit wallet),
-    # 2=POLY_GNOSIS_SAFE. A bare EOA is rejected on Polymarket v2 ("maker
-    # address not allowed, use the deposit wallet flow"); the working route
-    # for an automated wallet is a Magic/proxy wallet with type=1 + funder set
-    # to that proxy address. Default 0 keeps existing behaviour.
-    polymarket_signature_type: int = Field(
-        default=0, alias="POLYMARKET_SIGNATURE_TYPE"
-    )
-    limitless_private_key: str = Field(default="", alias="LIMITLESS_PRIVATE_KEY")
-    # Limitless API auth (create in the Limitless app: connect the agent wallet,
-    # then derive a scoped API token). Without these, live orders can't post.
-    limitless_api_key: str = Field(default="", alias="LIMITLESS_API_KEY")
-    limitless_api_secret: str = Field(default="", alias="LIMITLESS_API_SECRET")
-    # Limitless feeRateBps must fall in the exchange's per-user band (a 0 fee is
-    # rejected). Set the value from the Limitless docs/support before live orders.
-    limitless_fee_rate_bps: int = Field(default=0, alias="LIMITLESS_FEE_RATE_BPS")
-    # Multi-tenant: minimum per-user stake. A user whose wallet balance is below
-    # this is skipped for that bet (rather than placing a dust order or failing).
-    min_user_stake_usd: float = Field(default=1.0, alias="BETBOT_MIN_USER_STAKE_USD")
-    # Max slippage added to the quoted price when sending a market buy.
-    order_slippage: float = Field(default=0.02, alias="BETBOT_ORDER_SLIPPAGE")
-    # Require the live-readiness gate before placing live orders. Set false to
-    # go live without a paper-trading record (NOT recommended — you lose the
-    # "earned the right to trade" safety check).
-    require_gate: bool = Field(default=True, alias="BETBOT_REQUIRE_GATE")
-
-    # ---- Deposit pipeline (CCTP bridging; betbot/bridge.py) -----------
-    # Master gate for EVERY on-chain action the pipeline takes (gas top-ups,
-    # CCTP burns/mints, venue approvals). False = detect + log only.
-    auto_bridge: bool = Field(default=True, alias="BETBOT_AUTO_BRIDGE")
-    # Deposits below this are ignored (logged): bridging dust costs more in
-    # gas + operational noise than the deposit is worth.
-    min_deposit_usdc: float = Field(default=10.0, alias="BETBOT_MIN_DEPOSIT_USDC")
-    # Fraction of each bridged deposit reserved for Base / Limitless. Default
-    # 0.0: Polymarket (Polygon) is the only live venue today — Limitless live
-    # orders are parked — so 100% of a deposit goes to Polygon.
-    bridge_split_base: float = Field(default=0.0, alias="BETBOT_BRIDGE_SPLIT_BASE")
-    # Native-gas top-ups sent from the agent wallet: user wallets are created
-    # empty and can't pay for their own approvals/burns. Small by design —
-    # enough for a handful of simple transactions, not a balance to manage.
-    gas_topup_pol: float = Field(default=0.5, alias="BETBOT_GAS_TOPUP_POL")
-    gas_topup_eth: float = Field(default=0.0005, alias="BETBOT_GAS_TOPUP_ETH")
-    # Abuse guard for the public bot: max agent-funded gas top-ups per user
-    # wallet per UTC day (persisted in the gas_topups table, so restarts
-    # don't reset it). A normal deposit needs at most 2-3 top-ups (source
-    # chain + each trading chain); 4 leaves headroom for a retry. 0 = no cap.
-    gas_topup_daily_cap: int = Field(
-        default=4, alias="BETBOT_GAS_TOPUP_DAILY_CAP"
-    )
-    deposit_scan_minutes: int = Field(
-        default=10, alias="BETBOT_DEPOSIT_SCAN_MINUTES"
-    )
-    # Extra source-chain RPCs (Polygon/Base RPCs are defined above).
-    ethereum_rpc_url: str = Field(
-        default="https://eth.drpc.org", alias="ETHEREUM_RPC_URL"
-    )
-    arbitrum_rpc_url: str = Field(
-        default="https://arbitrum.drpc.org", alias="ARBITRUM_RPC_URL"
-    )
-    # Circle's attestation service for CCTP (poll after depositForBurn).
-    iris_api_url: str = Field(
-        default="https://iris-api.circle.com", alias="BETBOT_IRIS_API_URL"
-    )
-    # Limitless CTF Exchange address on Base (market.venue.exchange). Needed
-    # only when bridge_split_base > 0; empty = skip the Limitless approval
-    # with a logged warning (see scripts/limitless_approve.py).
-    limitless_exchange: str = Field(default="", alias="LIMITLESS_EXCHANGE")
-
-    # ---- Treasury rebalancer (agent-owned float; bridge.TreasuryRebalancer) --
-    # The agent treasury wallet self-maintains target USDC balances on both
-    # trading chains in the background, so the operator never has to manually
-    # bridge trading funds. Runs on the deposit-scan tick AFTER the user scan.
-    #
-    # Master switch for the rebalancer. Even when true it ALSO respects
-    # auto_bridge (the on-chain master kill): if auto_bridge is false the
-    # rebalancer is off too. False = positions nothing automatically (the
-    # manual scripts/bridge_agent_funds.py override still works).
-    treasury_auto_rebalance: bool = Field(
-        default=True, alias="BETBOT_TREASURY_AUTO_REBALANCE"
-    )
-    # Target USDC the agent wallet keeps on each trading chain. Funds are
-    # positioned AHEAD of trades (CCTP attestation takes ~15 min — a trade
-    # can't wait for a bridge).
-    treasury_target_polygon_usd: float = Field(
-        default=50.0, alias="BETBOT_TREASURY_TARGET_POLYGON_USD"
-    )
-    treasury_target_base_usd: float = Field(
-        default=50.0, alias="BETBOT_TREASURY_TARGET_BASE_USD"
-    )
-    # A chain is only rebalanced once it is below its target by MORE than this
-    # — bridging dust costs more gas than it's worth, and avoids thrashing on
-    # tiny fluctuations.
-    treasury_rebalance_threshold_usd: float = Field(
-        default=10.0, alias="BETBOT_TREASURY_REBALANCE_THRESHOLD_USD"
-    )
 
     # ---- Daily Telegram jobs (Nairobi wall-clock schedule) ------------
     # The cron triggers pin timezone="Africa/Nairobi" (NOT a UTC offset), so
@@ -328,11 +224,6 @@ class Settings(BaseSettings):
 
     # ---- Scheduler ----------------------------------------------------
     daemon_cron: str = Field(default="0 8 * * *", alias="BETBOT_DAEMON_CRON")
-
-    # ---- Convenience properties ---------------------------------------
-    @property
-    def is_paper(self) -> bool:
-        return self.mode == "paper"
 
 
 @lru_cache(maxsize=1)
