@@ -181,9 +181,27 @@ class Settings(BaseSettings):
     matchday_alert_hour: int = Field(
         default=8, alias="BETBOT_MATCHDAY_ALERT_HOUR"
     )
-    kickoff_alert_lead_minutes: int = Field(
-        default=60, alias="BETBOT_KICKOFF_ALERT_LEAD_MIN"
+    # Per-competition lead for the pre-match lineup-adjusted alert. Confirmed
+    # XIs post ~1h before KO; PL posts earliest (~75m) so we fire at KO-70,
+    # every other competition at KO-55. The morning heads-up quotes the SAME
+    # lead so its stated "prediction at HH:MM" == the actual firing time.
+    pl_lineup_alert_lead_minutes: int = Field(
+        default=70, alias="BETBOT_PL_LINEUP_ALERT_LEAD_MIN"
     )
+    lineup_alert_lead_minutes_default: int = Field(
+        default=55, alias="BETBOT_LINEUP_ALERT_LEAD_MIN"
+    )
+
+    def lineup_alert_lead_minutes(self, competition_code: str | None) -> int:
+        """Minutes before kickoff to fire the pre-match lineup alert.
+
+        Premier League (``PL``) -> 70; every other competition -> 55. Used by
+        BOTH the morning heads-up (to state "prediction at HH:MM") and the
+        scheduler (to fire the alert), so the two can never drift apart.
+        """
+        if (competition_code or "").upper() == "PL":
+            return self.pl_lineup_alert_lead_minutes
+        return self.lineup_alert_lead_minutes_default
 
     # ---- Glicko-2 defaults (shared by the club rating machinery) ------
     glicko_tau: float = Field(default=0.5, alias="BETBOT_GLICKO_TAU")

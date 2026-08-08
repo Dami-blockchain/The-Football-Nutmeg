@@ -87,6 +87,55 @@ def format_prediction(pred, *, edge_threshold: float | None = None) -> str:
     return "\n".join([header, model, market, call])
 
 
+def _format_xi(side: dict | None) -> str:
+    """One team's confirmed XI + formation as ``[4-3-3] Name, Name, …`` or ''."""
+    if not side:
+        return ""
+    xi = list(side.get("xi") or [])
+    formation = (side.get("formation") or "").strip()
+    if not xi:
+        return ""
+    prefix = f"[{formation}] " if formation else ""
+    return prefix + ", ".join(xi)
+
+
+def format_prediction_with_lineup(
+    pred,
+    lineup: dict | None,
+    *,
+    edge_threshold: float | None = None,
+    adj_note: str | None = None,
+    absences: str | None = None,
+) -> str:
+    """Full revealed prediction PREFIXED with the confirmed XIs (pre-match alert).
+
+    ``lineup`` is ``{"home": {"formation", "xi"}, "away": {...}}`` (from
+    :meth:`ApiFootballClient.get_lineups`) or ``None``. When present, both XIs
+    (with formation) are shown above the standing prediction block; an optional
+    ``absences`` line flags the key regulars who are OUT (only when the lineup
+    adjustment is nonzero), and ``adj_note`` carries a caveat (e.g. lineup not
+    yet confirmed). The prediction body itself is the UNCHANGED
+    :func:`format_prediction` output, so the standing format rule is preserved.
+    """
+    home, away = pred.home_team, pred.away_team
+    parts: list[str] = []
+    if lineup:
+        home_xi = _format_xi(lineup.get("home"))
+        away_xi = _format_xi(lineup.get("away"))
+        if home_xi:
+            parts.append(f"*{home} (H)* XI: {home_xi}")
+        if away_xi:
+            parts.append(f"*{away} (A)* XI: {away_xi}")
+        if absences:
+            parts.append(f"⚠️ Key absences: {absences}")
+    if adj_note:
+        parts.append(adj_note)
+    body = format_prediction(pred, edge_threshold=edge_threshold)
+    if parts:
+        return "\n".join(parts) + "\n\n" + body
+    return body
+
+
 def format_locked(pred) -> str:
     """Teaser for a locked prediction — teams + kickoff only, NO probabilities."""
     home, away = pred.home_team, pred.away_team

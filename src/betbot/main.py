@@ -30,8 +30,8 @@ from betbot.backtest import backtest_mock, backtest_stored
 from betbot.daily_jobs import (
     nairobi_day_bounds,
     register_daily_jobs,
-    run_matchday_alert,
-    send_fixture_alert,
+    run_matchday_notice,
+    send_prediction_alert,
 )
 from betbot.gate import evaluate_gate
 from betbot.logging import configure_logging, get_logger
@@ -317,6 +317,73 @@ async def _score_and_log_one(
 
 
 # ----------------------------------------------------------------------
+# Per-fixture re-scoring (pre-match lineup-adjusted alert, R4b)
+# ----------------------------------------------------------------------
+def _build_engines(settings, form_service):
+    """Return ``(club_engine, cl_engine)`` mirroring _score_once's routing."""
+    base = StrategyEngine(settings)
+    club_engine = (
+        ClubStrategyEngine(settings) if settings.club_ensemble_enabled else base
+    )
+    cl_engine = (
+        EuropeanStrategyEngine(settings) if settings.cl_elo_enabled else base
+    )
+    return club_engine, cl_engine
+
+
+async def score_fixture_adjusted(
+    settings,
+    fixture_id: int,
+    *,
+    home_rating_adj: float = 0.0,
+    away_rating_adj: float = 0.0,
+):
+    """Re-score ONE fixture lineup-adjusted, returning ``(Prediction, kickoff)``.
+
+    Rebuilds the same FixtureForm the daily scoring run uses — the fixture's
+    teams/kickoff come from football-data (:meth:`get_match`), and the form
+    snapshots from :class:`FormService` — then calls the SAME engine the daily
+    run routes to (``cl_engine`` for CL, else ``club_engine``) with R4a's
+    ``home_rating_adj`` / ``away_rating_adj``. With both adjustments 0.0 the
+    result is byte-identical to the baseline. Returns ``(None, None)`` if the
+    fixture can't be fetched (network gap / unknown id) so the caller falls
+    back to the stored baseline prediction.
+    """
+    log = get_logger(__name__)
+    async with FootballDataClient(
+        api_key=settings.football_data_api_key,
+        base_url=settings.football_data_base_url,
+        rate_limit_per_min=settings.football_data_rate_limit_per_min,
+    ) as client:
+        match = await client.get_match(fixture_id)
+        if not match:
+            log.info("rescore_no_match", fixture_id=fixture_id)
+            return None, None
+        league = str((match.get("competition") or {}).get("code") or "")
+        kickoff = _parse_kickoff(match["utcDate"])
+        home = _parse_team(match["homeTeam"])
+        away = _parse_team(match["awayTeam"])
+
+        form_service = FormService(client, settings)
+        club_engine, cl_engine = _build_engines(settings, form_service)
+        engine = cl_engine if league == "CL" else club_engine
+
+        fixture_form = await form_service.fixture_form(
+            fixture_id=fixture_id,
+            competition_code=league,
+            kickoff=kickoff,
+            home_team=home,
+            away_team=away,
+        )
+        prediction = engine.predict(
+            fixture_form,
+            home_rating_adj=home_rating_adj,
+            away_rating_adj=away_rating_adj,
+        )
+        return prediction, kickoff
+
+
+# ----------------------------------------------------------------------
 # Settlement run
 # ----------------------------------------------------------------------
 async def _settle_once():
@@ -513,53 +580,87 @@ def run_daemon(
         except Exception as e:  # noqa: BLE001 — never crash the daemon
             get_logger(__name__).warning("club_refresh_failed", error=str(e))
 
-    async def _matchday_alert_tick() -> None:
-        # Matchday-morning (Africa/Nairobi): today's entitlement-gated
-        # predictions per registered user.
+    async def _matchday_notice_tick() -> None:
+        # Morning heads-up (Africa/Nairobi): FREE fixture list, no prediction.
         try:
-            await run_matchday_alert(get_settings())
+            await run_matchday_notice(get_settings())
         except Exception as e:  # noqa: BLE001 — never crash the daemon
-            get_logger(__name__).warning("matchday_alert_failed", error=str(e))
+            get_logger(__name__).warning("matchday_notice_failed", error=str(e))
+
+    async def _fire_prediction_alert(fixture_id: int) -> None:
+        # Pre-match lineup-adjusted, gated. Wire the re-scoring helper so the
+        # alert re-scores off the confirmed XI; lineup_fn defaults to the
+        # production LineupService inside send_prediction_alert.
+        try:
+            await send_prediction_alert(
+                get_settings(), fixture_id, rescore_fn=score_fixture_adjusted,
+            )
+        except Exception as e:  # noqa: BLE001 — never crash
+            get_logger(__name__).warning(
+                "prematch_alert_failed", fixture_id=fixture_id, error=str(e),
+            )
 
     async def _schedule_kickoff_alerts(scheduler) -> None:
-        # Read today's predictions and schedule a one-off ~60m-before-kickoff
-        # reminder per fixture. Runs at daemon start AND daily (05:00 UTC) so a
-        # long-running daemon keeps picking up newly-scored fixtures. Jobs are
-        # idempotent (replace_existing on a per-fixture id). Never crashes.
+        # Read today's predictions and schedule a one-off pre-match alert per
+        # fixture at kickoff - lineup_alert_lead_minutes(competition) (PL 70,
+        # else 55). Runs at daemon start AND daily (05:00 UTC) so a long-running
+        # daemon keeps picking up newly-scored fixtures. Jobs are idempotent
+        # (replace_existing on a per-fixture id). Never crashes.
         try:
             _s = get_settings()
             now = datetime.now(timezone.utc)
             start, end, _day = nairobi_day_bounds(now)
             preds = predictions_for_kickoff_range(start, end)
-            lead = timedelta(minutes=_s.kickoff_alert_lead_minutes)
             scheduled = 0
             for p in preds:
-                run_at = p.kickoff - lead
+                lead = timedelta(
+                    minutes=_s.lineup_alert_lead_minutes(p.competition_code)
+                )
+                ko = p.kickoff
+                if ko.tzinfo is None:
+                    ko = ko.replace(tzinfo=timezone.utc)
+                run_at = ko - lead
                 if run_at <= now:
-                    continue  # kickoff-60m already past — skip
+                    continue  # firing time already past — skip
                 fid = p.fixture_id
 
                 async def _fire(fixture_id=fid) -> None:
-                    try:
-                        await send_fixture_alert(get_settings(), fixture_id)
-                    except Exception as e:  # noqa: BLE001 — never crash
-                        get_logger(__name__).warning(
-                            "kickoff_alert_failed", fixture_id=fixture_id,
-                            error=str(e),
-                        )
+                    await _fire_prediction_alert(fixture_id)
 
                 scheduler.add_job(
                     _fire,
                     trigger=DateTrigger(run_date=run_at, timezone=timezone.utc),
-                    id=f"kickoff_{fid}",
+                    id=f"predict_{fid}",
                     replace_existing=True,
                 )
                 scheduled += 1
             get_logger(__name__).info(
-                "kickoff_alerts_scheduled", scheduled=scheduled,
+                "prematch_alerts_scheduled", scheduled=scheduled,
             )
         except Exception as e:  # noqa: BLE001 — never crash the daemon
             get_logger(__name__).warning("schedule_kickoff_alerts_failed", error=str(e))
+
+    async def _player_minutes_refresh_tick() -> None:
+        # Weekly: refresh the api-football player-minutes cache (R4a importance
+        # data) so the lineup adjustment stays warm. Subprocess (not import),
+        # mirroring _club_refresh_tick — isolation + never crash the daemon.
+        # Budget-safe: once/week.
+        import subprocess
+
+        _s = get_settings()
+
+        def _run() -> None:
+            args = [".venv/bin/python", "scripts/fetch_player_minutes.py",
+                    "--season", str(_s.api_football_season)]
+            subprocess.run(
+                args, cwd=str(_REPO_ROOT), timeout=1800, check=True,
+                capture_output=True,
+            )
+        try:
+            await asyncio.to_thread(_run)
+            get_logger(__name__).info("player_minutes_refreshed")
+        except Exception as e:  # noqa: BLE001 — never crash the daemon
+            get_logger(__name__).warning("player_minutes_refresh_failed", error=str(e))
 
     async def _main() -> None:
         s = get_settings()
@@ -571,20 +672,28 @@ def run_daemon(
             trigger=CronTrigger.from_crontab("0 6 * * 1", timezone=timezone.utc),
             id="club_data_refresh",
         )
-        register_daily_jobs(scheduler, s, matchday_alert=_matchday_alert_tick)
+        register_daily_jobs(scheduler, s, matchday_notice=_matchday_notice_tick)
         # Re-scan for today's fixtures daily so the daemon keeps scheduling
-        # kickoff reminders as new fixtures get scored.
+        # pre-match alerts as new fixtures get scored.
         scheduler.add_job(
             lambda: _schedule_kickoff_alerts(scheduler),
             trigger=CronTrigger.from_crontab("0 5 * * *", timezone=timezone.utc),
             id="reschedule_kickoff_alerts",
+        )
+        # Weekly (Mon 05:30 UTC): refresh the player-minutes importance cache so
+        # the lineup adjustment stays warm. Budget-safe (once/week).
+        scheduler.add_job(
+            _player_minutes_refresh_tick,
+            trigger=CronTrigger.from_crontab("30 5 * * 1", timezone=timezone.utc),
+            id="player_minutes_refresh",
         )
         scheduler.start()
         log.info(
             "daemon_started",
             cron=cron_expr,
             matchday_alert_hour_nairobi=s.matchday_alert_hour,
-            kickoff_alert_lead_minutes=s.kickoff_alert_lead_minutes,
+            pl_lineup_lead_min=s.pl_lineup_alert_lead_minutes,
+            lineup_lead_min_default=s.lineup_alert_lead_minutes_default,
         )
         await _tick()  # immediate first run
         await _schedule_kickoff_alerts(scheduler)  # schedule today's reminders now
