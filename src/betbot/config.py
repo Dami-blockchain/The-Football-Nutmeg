@@ -35,6 +35,28 @@ class Settings(BaseSettings):
         default=10, alias="FOOTBALL_DATA_RATE_LIMIT_PER_MIN"
     )
 
+    # ---- api-football (api-sports.io) FREE tier -----------------------
+    # FREE-tier resource for confirmed starting lineups, injuries and
+    # season player-minutes (R4a). 100 requests/day, ~10/min. Season is the
+    # START year (2025/26 -> 2025). Key already lives in .env.
+    api_football_key: str = Field(default="", alias="API_FOOTBALL_KEY")
+    api_football_base_url: str = Field(
+        default="https://v3.football.api-sports.io",
+        alias="API_FOOTBALL_BASE_URL",
+    )
+    api_football_rate_limit_per_min: int = Field(
+        default=10, alias="API_FOOTBALL_RATE_LIMIT_PER_MIN"
+    )
+    api_football_season: int = Field(default=2026, alias="BETBOT_AF_SEASON")
+
+    # ---- Lineup-adjusted scoring (R4a) --------------------------------
+    # Max Glicko-point penalty when a team's entire expected first XI is
+    # absent from the confirmed starting XI. Scales linearly with the
+    # minutes-weighted share of missing regulars.
+    lineup_max_penalty: float = Field(
+        default=120.0, alias="BETBOT_LINEUP_MAX_PENALTY"
+    )
+
     # League scope (immutable for v1).
     leagues: tuple[str, ...] = LEAGUE_CODES
 

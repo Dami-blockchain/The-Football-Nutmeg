@@ -94,3 +94,26 @@ def test_dc_component_lifts_strong_team_when_enabled():
     with_dc = _engine(snap, dc_params=params).predict(_ff("Ajax", "Porto"))
     without_dc = _engine(snap, dc_params=None).predict(_ff("Ajax", "Porto"))
     assert with_dc.p_home > without_dc.p_home
+
+
+def test_lineup_adjustment_default_reproduces_current_output():
+    snap = {"Strong FC": 1900.0, "Weak FC": 1500.0}
+    eng = _engine(snap)
+    base = eng.predict(_ff("Strong FC", "Weak FC"))
+    zeroed = eng.predict(
+        _ff("Strong FC", "Weak FC"), home_rating_adj=0.0, away_rating_adj=0.0
+    )
+    assert zeroed.p_home == base.p_home
+    assert zeroed.p_draw == base.p_draw
+    assert zeroed.p_away == base.p_away
+    assert zeroed.home_score == base.home_score
+
+
+def test_negative_home_rating_adj_lowers_p_home():
+    snap = {"Strong FC": 1800.0, "Weak FC": 1600.0}
+    eng = _engine(snap)
+    base = eng.predict(_ff("Strong FC", "Weak FC"))
+    weakened = eng.predict(_ff("Strong FC", "Weak FC"), home_rating_adj=-120.0)
+    assert weakened.p_home < base.p_home
+    # eh is stored (adjusted) for transparency.
+    assert weakened.home_score == base.home_score - 120.0

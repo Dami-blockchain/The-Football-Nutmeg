@@ -113,7 +113,13 @@ class ClubStrategyEngine:
         n = normalize(name)
         return self._name_map.get(n, n)
 
-    def predict(self, fixture_form: FixtureForm) -> Prediction:
+    def predict(
+        self,
+        fixture_form: FixtureForm,
+        *,
+        home_rating_adj: float = 0.0,
+        away_rating_adj: float = 0.0,
+    ) -> Prediction:
         s = self._settings
         fx = fixture_form.fixture
         home_name, away_name = fx.home_team.name, fx.away_team.name
@@ -125,6 +131,13 @@ class ClubStrategyEngine:
         # would be guessing, so defer to the form-based naive engine.
         if rh.rd >= s.glicko_default_rd or ra.rd >= s.glicko_default_rd:
             return self._base.predict(fixture_form)
+
+        # Optional lineup-adjusted rating shift (R4a). Default 0.0 leaves the
+        # ratings — and thus every downstream number — byte-identical.
+        if home_rating_adj:
+            rh = dataclasses.replace(rh, rating=rh.rating + home_rating_adj)
+        if away_rating_adj:
+            ra = dataclasses.replace(ra, rating=ra.rating + away_rating_adj)
 
         glicko_probs = match_probabilities(
             rh, ra, home_field_mu=s.glicko_club_home_mu, draw_rho=s.glicko_club_draw_rho

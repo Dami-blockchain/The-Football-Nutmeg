@@ -295,3 +295,23 @@ def register_daily_jobs(scheduler, settings, *, matchday_alert) -> None:
         ),
         id="matchday_alert",
     )
+
+
+# TODO(R4b): register the weekly player-minutes refresh here. R4a ships the
+# fetcher (scripts/fetch_player_minutes.py::run) + this hook; R4b wires the
+# CronTrigger schedule (e.g. Monday 05:00 Nairobi) and the never-crash wrapper.
+async def refresh_player_minutes_job(settings) -> None:
+    """Weekly refresh of the api-football player-minutes cache (R4a fetcher).
+
+    Kept dependency-light and best-effort: any failure is logged, never raised,
+    so a scheduler tick can't crash the daemon. R4b decides the cadence.
+    """
+    from scripts.fetch_player_minutes import run as _refresh
+
+    try:
+        written = await _refresh(
+            list(settings.leagues), settings.api_football_season
+        )
+        log.info("player_minutes_refreshed", written=written)
+    except Exception as exc:  # noqa: BLE001 - never crash the scheduler
+        log.warning("player_minutes_refresh_failed", error=str(exc))

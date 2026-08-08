@@ -190,7 +190,13 @@ class EuropeanStrategyEngine:
         n = normalize(name)
         return self._name_map.get(n, n)
 
-    def predict(self, fixture_form: FixtureForm) -> Prediction:
+    def predict(
+        self,
+        fixture_form: FixtureForm,
+        *,
+        home_rating_adj: float = 0.0,
+        away_rating_adj: float = 0.0,
+    ) -> Prediction:
         s = self._settings
         fx = fixture_form.fixture
         home_name, away_name = fx.home_team.name, fx.away_team.name
@@ -203,8 +209,14 @@ class EuropeanStrategyEngine:
         if hit_h is None or hit_a is None:
             return self._base.predict(fixture_form)
 
+        # Optional lineup-adjusted rating shift (R4a). ClubElo ratings are plain
+        # floats, so the adjustment is added directly to eh/ea. Default 0.0
+        # leaves the Elo edge — and every downstream number — byte-identical.
+        eh = self._snapshot[hit_h] + home_rating_adj
+        ea = self._snapshot[hit_a] + away_rating_adj
+
         elo_probs = _elo_probs(
-            self._snapshot[hit_h], self._snapshot[hit_a],
+            eh, ea,
             s.cl_elo_home_adv, s.cl_elo_draw_rho,
         )
         components: list[tuple[float, tuple[float, float, float]]] = [
@@ -233,8 +245,8 @@ class EuropeanStrategyEngine:
             p_home=p_home,
             p_draw=p_draw,
             p_away=p_away,
-            home_score=self._snapshot[hit_h],  # store Elo ratings for transparency
-            away_score=self._snapshot[hit_a],
+            home_score=eh,  # store (possibly lineup-adjusted) Elo for transparency
+            away_score=ea,
             draw_score=0.0,
             home_xg=home_xg,
             away_xg=away_xg,
