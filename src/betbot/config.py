@@ -139,9 +139,18 @@ class Settings(BaseSettings):
         default=True, alias="TELEGRAM_OPEN_REGISTRATION"
     )
 
-    # ---- LLM assistant (free-text Telegram Q&A via Anthropic) ---------
-    # No SDK dependency by design — llm_agent.py calls the Messages API with
-    # httpx directly. Empty key = graceful fallback (commands still work).
+    # ---- Interactive chat assistant (free-text Telegram, via Groq) ----
+    # The chat runs on the FREE Groq API (OpenAI-compatible). No SDK by design —
+    # llm_agent.py calls /openai/v1/chat/completions with httpx directly. Empty
+    # key = graceful fallback (commands still work). The legacy anthropic_api_key
+    # field is retained (harmless) but no longer drives the chat path.
+    groq_api_key: str = Field(default="", alias="GROQ_API_KEY")
+    groq_model: str = Field(
+        default="llama-3.3-70b-versatile", alias="BETBOT_GROQ_MODEL"
+    )
+    groq_base_url: str = Field(
+        default="https://api.groq.com/openai/v1", alias="BETBOT_GROQ_BASE_URL"
+    )
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
     llm_model: str = Field(
         default="claude-haiku-4-5-20251001", alias="BETBOT_LLM_MODEL"

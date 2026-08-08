@@ -101,7 +101,8 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/balance – your USDC balance + credits\n"
         "/status – trial / credits\n"
         "/help – this guide\n\n"
-        "You can also just *ask me anything* in plain text.\n\n"
+        "You can also just *message me* — ask me anything about today's "
+        "matches.\n\n"
         "⚠️ *Not financial advice.* Predictions can be wrong and betting can "
         "lose money — only ever stake what you can afford to lose. Past results "
         "never guarantee future ones.",
@@ -198,10 +199,11 @@ async def chat_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """
     if update.message is None or not (update.message.text or "").strip():
         return
-    _register(update)
-    reply = await _get_llm_agent().answer(
-        update.effective_user.id, update.message.text.strip()
-    )
+    user = _register(update)
+    # Chat is FREE and READ-ONLY: it discusses only predictions the user is
+    # entitled to (paywall enforced in the agent's context builder) and never
+    # charges a credit or records a reveal.
+    reply = await _get_llm_agent().answer(user, update.message.text.strip())
     await update.message.reply_text(reply)
 
 
