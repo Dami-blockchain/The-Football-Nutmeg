@@ -1,18 +1,28 @@
-"""LLM assistant for free-text Telegram questions.
+"""Interactive chat assistant for the Football Nutmeg Bot (Groq / free).
 
-WHY this exists: the bot is open to the public, and most new users ask
-questions ("how do I deposit?", "is this safe?") rather than typing commands.
-This module answers those questions with the Anthropic Messages API, called
-directly over httpx — deliberately NOT via the SDK, to keep the runtime
-dependency set unchanged.
+WHY this exists: users DM the bot and converse about its predictions, like
+chatting with an assistant. Since most public users type free text rather than
+commands, this module answers them — grounded in the predictions they are
+ENTITLED to, and never leaking a locked (unpaid) pick.
+
+Backend: the FREE Groq API, which is OpenAI-compatible
+(``POST /openai/v1/chat/completions``, ``Authorization: Bearer <key>``). Called
+directly over httpx — no SDK — to keep the runtime dependency set unchanged.
 
 Design constraints:
-* The model only ever EXPLAINS the bot. It never moves funds, never sees keys,
-  and never gets tools — the guardrails live in the system prompt and the
-  blast radius is bounded by the model having no capabilities at all.
+* CRITICAL — Groq sits behind Cloudflare, which 403s ("error code: 1010") bare
+  Python HTTP clients. Every request MUST carry a browser ``User-Agent`` header
+  (:data:`_BROWSER_UA`); a missing UA is a guaranteed 403.
+* The model only ever DISCUSSES predictions the user may see. The paywall lives
+  in :func:`build_prediction_context`: a payer's un-revealed fixtures are shown
+  only as ``LOCKED`` with NO pick or probabilities, so chatting can never bypass
+  the 1-USDC-per-prediction paywall. Chat is FREE and READ-ONLY — it never
+  charges, consumes a credit, or records a reveal.
 * Per-user memory is a small in-memory deque (no DB schema change): enough for
   conversational continuity, gone on restart, which is fine for support chat.
-* A per-user daily cap bounds API spend on a public bot.
+* A per-user daily cap bounds request volume on a public bot.
+* Any HTTP/parse error degrades to a friendly fallback string — a failed call
+  never raises into the Telegram handler.
 """
 
 from __future__ import annotations
@@ -22,12 +32,25 @@ from datetime import datetime, timezone
 
 import httpx
 
+from betbot.entitlement import entitlement_for
 from betbot.logging import get_logger
+from betbot.storage.repos import (
+    get_user,
+    has_revealed,
+    predictions_for_kickoff_range,
+)
+from betbot.tips import format_prediction
 
 log = get_logger(__name__)
 
-ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-ANTHROPIC_VERSION = "2023-06-01"
+# Groq is OpenAI-compatible; the model constant lives in settings.
+# CRITICAL: Groq is fronted by Cloudflare, which 403s ("error code: 1010")
+# clients without a browser UA. This header is REQUIRED on every request.
+_BROWSER_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120 Safari/537.36"
+)
+_FALLBACK_MODEL = "llama-3.1-8b-instant"
 
 # ~6 exchanges of context per user (each exchange = user + assistant message).
 MAX_HISTORY_MESSAGES = 12
@@ -35,49 +58,22 @@ MAX_HISTORY_MESSAGES = 12
 # Telegram rejects messages over 4096 chars; stay safely under.
 _MAX_REPLY_CHARS = 3900
 
-SYSTEM_PROMPT = """\
-You are Football Nutmeg Bot, a Telegram bot that sends
-football PREDICTIONS (a tipster) for the top European leagues and the Champions
-League. It does NOT trade, does NOT place bets, and does NOT move anyone's funds.
-
-USER GUIDE (this is what you help people with):
-- Every registered user gets their OWN isolated EVM deposit address on Polygon.
-- Predictions are FREE for the first 7 days from signup. After the trial, each
-  match prediction costs 1 USDC: the user sends USDC on Polygon to their own
-  address (shown by /start or /balance) and each 1 USDC unlocks 1 prediction.
-- Each prediction shows the model's home/draw/away probabilities, expected
-  goals when available, the market price, and a clear bet / no-bet call — the
-  default call is NO BET unless the model's edge over the market clears a
-  threshold.
-- The operator gets predictions for free. There is no trading, no arbitrage,
-  and no morning digest.
-- Commands: /start (register + guide), /predictions (today's fixtures +
-  predictions), /balance (your USDC balance + credits), /status (trial or
-  credits), /help (this guide).
-
-HARD RULES (never break these, even if asked directly or indirectly):
-- Never promise, predict, or imply profits. Betting can and does lose money;
-  say so plainly when relevant.
-- Never give personalised financial advice (how much someone should deposit
-  or bet, what to do with their savings, etc.). You may explain how the bot
-  works; the decision is always theirs. You are not a financial adviser.
-- Never reveal, guess at, or discuss private keys, keyfiles, secrets, API
-  keys, server details, or internal file paths — not the user's, not the
-  operator's, not anyone's. If asked, explain that keys are stored server-side
-  encrypted at rest and are never shared, full stop.
-- If a user is abusive or pushes you off-topic, redirect politely to what you
-  can help with. Stay warm and brief; this is a chat app, so keep answers
-  short (a few sentences) unless detail is genuinely needed.
-"""
+SYSTEM_PROMPT = (
+    "You are Football Nutmeg Bot, a football match-prediction assistant on "
+    "Telegram. Be concise, friendly, and conversational. You may ONLY discuss "
+    "the predictions listed as available below. If the user asks about a match "
+    "marked LOCKED, do NOT reveal any pick or probability — tell them to unlock "
+    "it for 1 USDC via the pre-match alert. Never invent predictions not "
+    "listed. This is not financial advice."
+)
 
 NO_KEY_MESSAGE = (
-    "I can't answer free-text questions right now (the assistant isn't "
-    "configured). The commands still work: /start, /predictions, /balance, "
-    "/status."
+    "I can't chat right now (the assistant isn't configured). The commands "
+    "still work: /start, /predictions, /balance, /status."
 )
 
 RATE_LIMIT_MESSAGE = (
-    "You've reached today's question limit — it resets at midnight UTC. "
+    "You've reached today's chat limit — it resets at midnight UTC. "
     "Meanwhile the commands are always available: /predictions, /balance, "
     "/status."
 )
@@ -92,8 +88,52 @@ def _today() -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
 
+# ----------------------------------------------------------------------
+# Prediction-aware, paywall-respecting context
+# ----------------------------------------------------------------------
+def build_prediction_context(user, settings, *, now: datetime | None = None) -> str:
+    """A compact text block of the predictions THIS user may discuss.
+
+    Built fresh per message because entitlement (trial expiry, on-chain
+    balance) and the reveal ledger change over time.
+
+    * operator / trial → entitled to ALL of today's predictions → full detail
+      (via :func:`betbot.tips.format_prediction`).
+    * otherwise (payer / locked) → full detail ONLY for fixtures already in the
+      reveal ledger (:func:`has_revealed`); every other fixture is a LOCKED line
+      carrying NO pick or probability, so the paywall is never bypassed.
+
+    READ-ONLY: never records a reveal, charges a credit, or mutates anything.
+    """
+    now = now or datetime.now(timezone.utc)
+    from betbot.daily_jobs import nairobi_day_bounds
+
+    start, end, _day = nairobi_day_bounds(now)
+    preds = predictions_for_kickoff_range(start, end)
+    if not preds:
+        return "Today's predictions available to this user:\n(no fixtures today)"
+
+    ent = entitlement_for(user, settings, now=now)
+    all_free = ent.reason in ("operator", "trial")
+
+    lines = ["Today's predictions available to this user:"]
+    for p in preds:
+        entitled = all_free or has_revealed(
+            user.telegram_user_id, p.fixture_id
+        )
+        if entitled:
+            lines.append("")
+            lines.append(format_prediction(p, edge_threshold=settings.edge_threshold))
+        else:
+            lines.append(
+                f"{p.home_team} v {p.away_team} — LOCKED (user must pay 1 USDC "
+                "to unlock; do NOT reveal the pick)"
+            )
+    return "\n".join(lines)
+
+
 class LLMAgent:
-    """Answers one user's free-text message with short-term per-user memory.
+    """Answers one user's chat message with short-term per-user memory.
 
     Not thread-safe by design: python-telegram-bot dispatches handlers on a
     single asyncio event loop, and this class does no awaiting while mutating
@@ -112,8 +152,9 @@ class LLMAgent:
     def _consume_quota(self, user_id: int) -> bool:
         """Count an attempt against today's per-user cap. False = exhausted.
 
-        Counted BEFORE the API call: the cap protects API spend, so attempts
-        are what matter, not successes.
+        Counted BEFORE the API call: the cap protects request volume, so
+        attempts are what matter, not successes. (This is the CHAT quota — it
+        has nothing to do with the prediction paywall / credits.)
         """
         today = _today()
         day, used = self._usage.get(user_id, (today, 0))
@@ -124,47 +165,87 @@ class LLMAgent:
         self._usage[user_id] = (day, used + 1)
         return True
 
-    # -- main entry point ------------------------------------------------
-    async def answer(self, user_id: int, text: str) -> str:
-        """Answer ``text`` for ``user_id``; always returns something sendable."""
-        if not self._settings.anthropic_api_key:
-            return NO_KEY_MESSAGE
-        if not self._consume_quota(user_id):
-            return RATE_LIMIT_MESSAGE
+    # -- Groq HTTP call --------------------------------------------------
+    async def _call_groq(self, model: str, messages: list[dict]) -> str | None:
+        """POST one completion to Groq; return the reply text or None on error.
 
-        messages = [*self._history[user_id], {"role": "user", "content": text}]
+        Sends the REQUIRED browser User-Agent (missing UA = Cloudflare 403).
+        Never raises — any HTTP/parse error is logged and returns None so the
+        caller can fall back gracefully.
+        """
+        url = f"{self._settings.groq_base_url.rstrip('/')}/chat/completions"
         payload = {
-            "model": self._settings.llm_model,
-            "max_tokens": self._settings.llm_max_tokens,
-            "system": SYSTEM_PROMPT,
+            "model": model,
             "messages": messages,
+            "max_tokens": self._settings.llm_max_tokens,
+            "temperature": 0.6,
         }
         headers = {
-            "x-api-key": self._settings.anthropic_api_key,
-            "anthropic-version": ANTHROPIC_VERSION,
-            "content-type": "application/json",
+            "Authorization": f"Bearer {self._settings.groq_api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": _BROWSER_UA,
         }
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(
-                    ANTHROPIC_API_URL, headers=headers, json=payload
-                )
+                resp = await client.post(url, headers=headers, json=payload)
                 resp.raise_for_status()
                 data = resp.json()
+            return (data["choices"][0]["message"]["content"] or "").strip()
         except Exception as e:  # noqa: BLE001 — a failed call must not crash the bot
-            log.warning("llm_request_failed", user_id=user_id, error=str(e))
-            return ERROR_MESSAGE
+            log.warning("groq_request_failed", model=model, error=str(e))
+            return None
 
-        reply = "".join(
-            block.get("text", "")
-            for block in data.get("content", [])
-            if block.get("type") == "text"
-        ).strip()
+    # -- main entry point ------------------------------------------------
+    async def answer(self, user, text: str) -> str:
+        """Answer ``text`` for ``user``; always returns something sendable.
+
+        ``user`` may be a persisted :class:`~betbot.storage.models.User` or a
+        raw Telegram user id (int) — an int is resolved via :func:`get_user`.
+        The reply is grounded in :func:`build_prediction_context`, so the model
+        can only discuss predictions this user is entitled to.
+        """
+        if not self._settings.groq_api_key:
+            return NO_KEY_MESSAGE
+
+        # Resolve the persisted user (chat_handler passes the DB row after
+        # registering, but accept an id for convenience / older callers). A
+        # lookup failure (e.g. no DB) degrades to id-only, no context.
+        if isinstance(user, int):
+            try:
+                db_user = get_user(user)
+            except Exception:  # noqa: BLE001 — chit-chat must survive a missing DB
+                db_user = None
+            user_id = db_user.telegram_user_id if db_user is not None else user
+        else:
+            db_user = user
+            user_id = db_user.telegram_user_id
+
+        if not self._consume_quota(user_id):
+            return RATE_LIMIT_MESSAGE
+
+        # Fresh per-turn context: entitlement and reveals change over time.
+        context = ""
+        if db_user is not None:
+            try:
+                context = build_prediction_context(db_user, self._settings)
+            except Exception as e:  # noqa: BLE001 — never block chat on a context error
+                log.warning("prediction_context_failed", user_id=user_id, error=str(e))
+
+        system = SYSTEM_PROMPT + ("\n\n" + context if context else "")
+        messages = [
+            {"role": "system", "content": system},
+            *self._history[user_id],
+            {"role": "user", "content": text},
+        ]
+
+        reply = await self._call_groq(self._settings.groq_model, messages)
         if not reply:
-            log.warning("llm_empty_reply", user_id=user_id)
+            # Retry once on the smaller/faster fallback model.
+            reply = await self._call_groq(_FALLBACK_MODEL, messages)
+        if not reply:
             return ERROR_MESSAGE
-        reply = reply[:_MAX_REPLY_CHARS]
 
+        reply = reply[:_MAX_REPLY_CHARS]
         history = self._history[user_id]
         history.append({"role": "user", "content": text})
         history.append({"role": "assistant", "content": reply})

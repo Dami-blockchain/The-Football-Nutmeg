@@ -35,6 +35,28 @@ class Settings(BaseSettings):
         default=10, alias="FOOTBALL_DATA_RATE_LIMIT_PER_MIN"
     )
 
+    # ---- api-football (api-sports.io) FREE tier -----------------------
+    # FREE-tier resource for confirmed starting lineups, injuries and
+    # season player-minutes (R4a). 100 requests/day, ~10/min. Season is the
+    # START year (2025/26 -> 2025). Key already lives in .env.
+    api_football_key: str = Field(default="", alias="API_FOOTBALL_KEY")
+    api_football_base_url: str = Field(
+        default="https://v3.football.api-sports.io",
+        alias="API_FOOTBALL_BASE_URL",
+    )
+    api_football_rate_limit_per_min: int = Field(
+        default=10, alias="API_FOOTBALL_RATE_LIMIT_PER_MIN"
+    )
+    api_football_season: int = Field(default=2026, alias="BETBOT_AF_SEASON")
+
+    # ---- Lineup-adjusted scoring (R4a) --------------------------------
+    # Max Glicko-point penalty when a team's entire expected first XI is
+    # absent from the confirmed starting XI. Scales linearly with the
+    # minutes-weighted share of missing regulars.
+    lineup_max_penalty: float = Field(
+        default=120.0, alias="BETBOT_LINEUP_MAX_PENALTY"
+    )
+
     # League scope (immutable for v1).
     leagues: tuple[str, ...] = LEAGUE_CODES
 
@@ -117,9 +139,18 @@ class Settings(BaseSettings):
         default=True, alias="TELEGRAM_OPEN_REGISTRATION"
     )
 
-    # ---- LLM assistant (free-text Telegram Q&A via Anthropic) ---------
-    # No SDK dependency by design — llm_agent.py calls the Messages API with
-    # httpx directly. Empty key = graceful fallback (commands still work).
+    # ---- Interactive chat assistant (free-text Telegram, via Groq) ----
+    # The chat runs on the FREE Groq API (OpenAI-compatible). No SDK by design —
+    # llm_agent.py calls /openai/v1/chat/completions with httpx directly. Empty
+    # key = graceful fallback (commands still work). The legacy anthropic_api_key
+    # field is retained (harmless) but no longer drives the chat path.
+    groq_api_key: str = Field(default="", alias="GROQ_API_KEY")
+    groq_model: str = Field(
+        default="llama-3.3-70b-versatile", alias="BETBOT_GROQ_MODEL"
+    )
+    groq_base_url: str = Field(
+        default="https://api.groq.com/openai/v1", alias="BETBOT_GROQ_BASE_URL"
+    )
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
     llm_model: str = Field(
         default="claude-haiku-4-5-20251001", alias="BETBOT_LLM_MODEL"
@@ -159,9 +190,27 @@ class Settings(BaseSettings):
     matchday_alert_hour: int = Field(
         default=8, alias="BETBOT_MATCHDAY_ALERT_HOUR"
     )
-    kickoff_alert_lead_minutes: int = Field(
-        default=60, alias="BETBOT_KICKOFF_ALERT_LEAD_MIN"
+    # Per-competition lead for the pre-match lineup-adjusted alert. Confirmed
+    # XIs post ~1h before KO; PL posts earliest (~75m) so we fire at KO-70,
+    # every other competition at KO-55. The morning heads-up quotes the SAME
+    # lead so its stated "prediction at HH:MM" == the actual firing time.
+    pl_lineup_alert_lead_minutes: int = Field(
+        default=70, alias="BETBOT_PL_LINEUP_ALERT_LEAD_MIN"
     )
+    lineup_alert_lead_minutes_default: int = Field(
+        default=55, alias="BETBOT_LINEUP_ALERT_LEAD_MIN"
+    )
+
+    def lineup_alert_lead_minutes(self, competition_code: str | None) -> int:
+        """Minutes before kickoff to fire the pre-match lineup alert.
+
+        Premier League (``PL``) -> 70; every other competition -> 55. Used by
+        BOTH the morning heads-up (to state "prediction at HH:MM") and the
+        scheduler (to fire the alert), so the two can never drift apart.
+        """
+        if (competition_code or "").upper() == "PL":
+            return self.pl_lineup_alert_lead_minutes
+        return self.lineup_alert_lead_minutes_default
 
     # ---- Glicko-2 defaults (shared by the club rating machinery) ------
     glicko_tau: float = Field(default=0.5, alias="BETBOT_GLICKO_TAU")

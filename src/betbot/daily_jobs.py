@@ -1,19 +1,25 @@
-"""Scheduled tipster Telegram jobs.
+"""Scheduled tipster Telegram jobs — the two-alert model (R4b).
 
-Two alerts replace the old 21:00 report:
+Because the prediction can CHANGE once the confirmed XI is out, the morning
+alert must not carry a prediction — only a heads-up. So:
 
-* **matchday-morning** — one message per registered user with today's
-  predictions, entitlement-gated (operator/trial reveal all; payers reveal up
-  to their credits, the rest are locked teasers). Fires on the **Africa/Nairobi
-  wall clock** via ``CronTrigger(timezone="Africa/Nairobi")`` at
-  ``BETBOT_MATCHDAY_ALERT_HOUR`` (default 8).
-* **~60-min-before-kickoff** — a per-fixture reminder scheduled by
-  :mod:`betbot.main` (one-off DateTrigger jobs), sending that fixture's
-  prediction to entitled users.
+* **morning heads-up** (``run_matchday_notice``) — one FREE, ungated broadcast
+  listing today's fixtures: ``Home (H) v Away (A) — KO HH:MM · 🔮 prediction at
+  HH:MM``. NO probabilities, NO entitlement, NO credit charge. The stated
+  prediction time is ``kickoff - lineup_alert_lead_minutes(competition)``. Fires
+  on the **Africa/Nairobi wall clock** at ``BETBOT_MATCHDAY_ALERT_HOUR``.
+* **pre-match lineup-adjusted prediction** (``send_prediction_alert``) — the
+  PAID product, fired per-fixture at ``kickoff - lead(competition)`` (once the
+  confirmed XI is out) by :mod:`betbot.main`'s one-off DateTrigger jobs. It
+  fetches the confirmed lineup, RE-SCORES the fixture lineup-adjusted (R4a), and
+  delivers the XI + adjusted prediction — ENTITLEMENT-GATED through the existing
+  reveal ledger (operator/trial free; payers spend 1 credit; locked users get a
+  teaser). This is where the paywall now lives.
 
-Side effects (balance-gated reveals, Telegram sends) are injected as callables
-so jobs are unit-testable with fixture data and no network. ``betbot.wallet``
-(web3) and the entitlement wrapper stay behind lazy imports / injected fns.
+Side effects (balance-gated reveals, Telegram sends, lineup fetch, re-scoring)
+are injected as callables so jobs are unit-testable with fixture data and no
+network. ``betbot.wallet`` (web3) and the entitlement wrapper stay behind lazy
+imports / injected fns.
 """
 
 from __future__ import annotations
@@ -33,8 +39,13 @@ from betbot.storage.repos import (
     predictions_for_kickoff_range,
     prediction_for_fixture,
     record_reveal,
+    upsert_prediction,
 )
-from betbot.tips import format_locked, format_prediction
+from betbot.tips import (
+    format_locked,
+    format_prediction,
+    format_prediction_with_lineup,
+)
 
 log = get_logger(__name__)
 
@@ -173,96 +184,210 @@ def commit_reveals(user, reveals: list[tuple[int, bool]]) -> None:
 
 
 # ----------------------------------------------------------------------
-# Matchday-morning alert
+# Morning heads-up notice (FREE, ungated) — NO prediction, only a schedule
 # ----------------------------------------------------------------------
-async def run_matchday_alert(
+def render_matchday_notice(settings, fixtures, day) -> str | None:
+    """Build the FREE morning heads-up body, or ``None`` when there are none.
+
+    One line per fixture: ``*Home (H) v Away (A)* — KO HH:MM · 🔮 prediction at
+    HH:MM``. Times are the **Africa/Nairobi wall clock** (EAT). The prediction
+    time is ``kickoff - lineup_alert_lead_minutes(competition)`` — the SAME lead
+    the scheduler uses to fire the pre-match alert, so the stated time is the
+    real one. Deliberately carries NO probabilities/edge/xG: the prediction can
+    still change once the confirmed XI is out.
+    """
+    if not fixtures:
+        return None
+    tz = ZoneInfo(REPORT_TZ)
+    lines = [f"*⚽ Today's fixtures — {day.isoformat()}*", ""]
+    for f in fixtures:
+        ko = f.kickoff
+        if ko.tzinfo is None:
+            ko = ko.replace(tzinfo=timezone.utc)
+        lead = settings.lineup_alert_lead_minutes(
+            getattr(f, "competition_code", None)
+        )
+        pred_at = ko - timedelta(minutes=lead)
+        ko_local = ko.astimezone(tz)
+        pred_local = pred_at.astimezone(tz)
+        lines.append(
+            f"*{f.home_team} (H) v {f.away_team} (A)* — "
+            f"KO {ko_local:%H:%M} · 🔮 prediction at {pred_local:%H:%M} "
+            f"(once the lineup is confirmed)"
+        )
+    lines.append("")
+    lines.append("_Times EAT. Predictions are sent per match once the "
+                 "confirmed XI is out._")
+    return "\n".join(lines)
+
+
+async def run_matchday_notice(
     settings,
     *,
     send_fn: SendFn | None = None,
     now: datetime | None = None,
-    fixtures_fn: Callable[[datetime, datetime], Sequence[object]] | None = None,
-    entitlement_fn=entitlement_for,
+    fixtures_source: Callable[[datetime, datetime], Sequence[object]] | None = None,
     users_fn=list_users,
 ) -> int:
-    """Send each registered user today's entitlement-gated predictions.
+    """Broadcast today's FREE heads-up (fixture list) to every registered user.
 
-    Pure-ish: ``send_fn`` (Telegram), ``fixtures_fn`` (prediction source),
-    ``entitlement_fn`` and ``users_fn`` are all injectable. Returns messages
-    delivered. A user with no fixtures today still gets a short "no matches"
-    note (the operator always sees the full list). Never raises for one bad
-    send — the caller's tick wrapper is the last line of defence, but per-user
-    isolation here keeps one failure from dropping the rest.
+    Pure-ish: ``send_fn`` (Telegram), ``fixtures_source`` (fixture rows) and
+    ``users_fn`` are injectable. NO entitlement, NO reveal ledger, NO credit
+    charge — this is a schedule, not a prediction. Returns messages delivered.
+    With no fixtures today, nothing is sent (the day is simply quiet). One bad
+    send never drops the rest.
     """
     from betbot.notify import send_telegram_to
 
     send = send_fn or send_telegram_to
     start, end, day = nairobi_day_bounds(now)
     fixtures = (
-        list(fixtures_fn(start, end))
-        if fixtures_fn is not None
+        list(fixtures_source(start, end))
+        if fixtures_source is not None
         else predictions_for_kickoff_range(start, end)
     )
 
+    body = render_matchday_notice(settings, fixtures, day)
+    if body is None:
+        log.info("matchday_notice_no_fixtures", day=day.isoformat())
+        return 0
+
     sent = 0
-    for user in users_fn():
-        text, reveals = render_user_predictions(
-            user, fixtures, settings, now=now, entitlement_fn=entitlement_fn
-        )
-        body = f"*⚽ Matchday — {day.isoformat()}*\n\n{text}"
+    for uid in broadcast_chat_ids(settings, users_fn()):
         try:
-            if await send(settings, user.telegram_user_id, body):
+            if await send(settings, uid, body):
                 sent += 1
-                # Charge + record ONLY after a confirmed send.
-                commit_reveals(user, reveals)
         except Exception as e:  # noqa: BLE001 — one bad send must not drop the rest
             log.warning(
-                "matchday_alert_send_failed",
-                telegram_user_id=user.telegram_user_id, error=str(e),
+                "matchday_notice_send_failed",
+                telegram_user_id=uid, error=str(e),
             )
 
     log.info(
-        "matchday_alert_sent",
+        "matchday_notice_sent",
         day=day.isoformat(), fixtures=len(fixtures), delivered=sent,
     )
     return sent
 
 
 # ----------------------------------------------------------------------
-# Per-fixture kickoff-60m alert (scheduled one-off by betbot.main)
+# Pre-match lineup-adjusted prediction alert (scheduled one-off by betbot.main)
 # ----------------------------------------------------------------------
-async def send_fixture_alert(
+def render_user_lineup_prediction(
+    user,
+    pred,
+    lineup,
+    settings,
+    *,
+    now: datetime | None = None,
+    adj_note: str | None = None,
+    absences: str | None = None,
+    entitlement_fn=entitlement_for,
+    already_revealed_fn=has_revealed,
+    edge_threshold: float | None = None,
+) -> tuple[str, list[tuple[int, bool]]]:
+    """One user's gated body for a SINGLE fixture's lineup-adjusted prediction.
+
+    Same entitlement + reveal-ledger semantics as
+    :func:`render_user_predictions` (operator/trial free & recorded, payer
+    charged once per NEW fixture, locked -> teaser), but the revealed body
+    carries the confirmed XIs via :func:`format_prediction_with_lineup`. Pure —
+    no DB writes; the caller commits reveals only after a confirmed send.
+    """
+    if edge_threshold is None:
+        edge_threshold = settings.edge_threshold
+    ent = entitlement_fn(user, settings, now=now)
+    header = _entitlement_header(ent)
+    fid = pred.fixture_id
+
+    def _revealed_body() -> str:
+        return format_prediction_with_lineup(
+            pred, lineup, edge_threshold=edge_threshold,
+            adj_note=adj_note, absences=absences,
+        )
+
+    # Already paid for on a prior path/repeat — always free, never re-charged.
+    if already_revealed_fn(user.telegram_user_id, fid):
+        return header + "\n\n" + _revealed_body(), []
+    if ent.reason in ("operator", "trial"):
+        return header + "\n\n" + _revealed_body(), [(fid, False)]
+    if ent.reason == "credit" and ent.credits_remaining >= 1:
+        return header + "\n\n" + _revealed_body(), [(fid, True)]
+    # Locked: teaser only, nothing revealed or charged.
+    return header + "\n\n" + format_locked(pred), []
+
+
+async def send_prediction_alert(
     settings,
     fixture_id: int,
     *,
     send_fn: SendFn | None = None,
     now: datetime | None = None,
     prediction_fn=prediction_for_fixture,
+    lineup_fn: Callable | None = None,
+    rescore_fn: Callable | None = None,
     entitlement_fn=entitlement_for,
     users_fn=list_users,
 ) -> int:
-    """Send one fixture's prediction to entitled users (~60m before kickoff).
+    """Pre-match: fetch the confirmed XI, re-score lineup-adjusted, send gated.
 
-    The freshest STORED prediction is re-sent — no confirmed-XI data exists on
-    a free source, so a caveat line is appended. Returns messages delivered.
+    Steps (each side-effecting bit is injectable so tests need no network):
+
+    1. Load the STORED baseline prediction (``prediction_fn``). None -> skip.
+    2. Fetch the confirmed lineup + ``(home_adj, away_adj)`` via
+       ``lineup_fn(baseline) -> (lineup, home_adj, away_adj, absences)``.
+    3. If the adjustment is nonzero, RE-SCORE via ``rescore_fn(fixture_id,
+       home_adj, away_adj) -> (Prediction, kickoff)`` and persist it
+       (``upsert_prediction``) so the record reflects the lineup-adjusted call.
+       If lineups aren't out (adj == 0,0) the baseline is sent with a caveat.
+    4. Per user, build ``(text, reveals)`` via
+       :func:`render_user_lineup_prediction` and, ONLY after a confirmed send,
+       ``commit_reveals`` — so the EXISTING ledger prevents double-charge across
+       repeat views. Returns messages delivered.
     """
     from betbot.notify import send_telegram_to
 
     send = send_fn or send_telegram_to
-    pred = prediction_fn(fixture_id)
-    if pred is None:
-        log.info("kickoff_alert_no_prediction", fixture_id=fixture_id)
+    baseline = prediction_fn(fixture_id)
+    if baseline is None:
+        log.info("prematch_alert_no_prediction", fixture_id=fixture_id)
         return 0
 
-    caveat = (
-        "⚠️ lineup-confirmed data unavailable — model prediction as of "
-        "kickoff-60m."
-    )
+    # --- confirmed lineup + adjustments (default: production lineup service) ---
+    lineup = None
+    home_adj = away_adj = 0.0
+    absences: str | None = None
+    if lineup_fn is None:
+        lineup_fn = _default_lineup_fn(settings)
+    try:
+        lineup, home_adj, away_adj, absences = await lineup_fn(baseline)
+    except Exception as e:  # noqa: BLE001 — lineup data is best-effort
+        log.warning("prematch_lineup_failed", fixture_id=fixture_id, error=str(e))
+
+    # --- re-score lineup-adjusted (or fall back to the baseline) --------------
+    pred = baseline
+    adj_note: str | None = None
+    if (home_adj or away_adj) and rescore_fn is not None:
+        try:
+            rescored, kickoff = await rescore_fn(fixture_id, home_adj, away_adj)
+            if rescored is not None:
+                upsert_prediction(rescored, kickoff=kickoff)
+                # Re-read so the persisted row (with any paper_bet) drives the
+                # standing format; fall back to the stored baseline on a miss.
+                pred = prediction_fn(fixture_id) or baseline
+        except Exception as e:  # noqa: BLE001 — re-score is best-effort
+            log.warning("prematch_rescore_failed", fixture_id=fixture_id, error=str(e))
+    if not lineup:
+        adj_note = "⚠️ lineup not yet confirmed — model prediction"
+
     sent = 0
     for user in users_fn():
-        text, reveals = render_user_predictions(
-            user, [pred], settings, now=now, entitlement_fn=entitlement_fn
+        text, reveals = render_user_lineup_prediction(
+            user, pred, lineup, settings, now=now,
+            adj_note=adj_note, absences=absences,
+            entitlement_fn=entitlement_fn,
         )
-        body = f"*⏰ Kickoff soon*\n\n{text}\n\n{caveat}"
+        body = f"*⏰ Pre-match — confirmed lineup*\n\n{text}"
         try:
             if await send(settings, user.telegram_user_id, body):
                 sent += 1
@@ -270,28 +395,100 @@ async def send_fixture_alert(
                 commit_reveals(user, reveals)
         except Exception as e:  # noqa: BLE001
             log.warning(
-                "kickoff_alert_send_failed",
+                "prematch_alert_send_failed",
                 telegram_user_id=user.telegram_user_id,
                 fixture_id=fixture_id, error=str(e),
             )
-    log.info("kickoff_alert_sent", fixture_id=fixture_id, delivered=sent)
+    log.info("prematch_alert_sent", fixture_id=fixture_id, delivered=sent)
     return sent
+
+
+def _default_lineup_fn(settings):
+    """Build the production ``lineup_fn`` closure over a shared LineupService.
+
+    Returns ``async (baseline) -> (lineup, home_adj, away_adj, absences)``.
+    Injuries are fetched too (cheap, optional) to fold late scratches into the
+    absence list. Any gap yields ``(None, 0.0, 0.0, None)`` — the caller then
+    sends the baseline with a "lineup not yet confirmed" caveat.
+    """
+    async def _fn(baseline):
+        from betbot.data.lineup_service import LineupService
+
+        svc = LineupService(settings)
+        try:
+            code = baseline.competition_code
+            ko = baseline.kickoff
+            ko_date = (ko.date().isoformat() if ko is not None else "")
+            af_id = await svc.resolve_fixture_id(
+                code, baseline.home_team, baseline.away_team, ko_date
+            )
+            if af_id is None:
+                return None, 0.0, 0.0, None
+            lineup = await svc._client.get_lineups(af_id)
+            home_adj, away_adj = await svc.adjustments_for_fixture(
+                code, baseline.home_team, baseline.away_team, ko_date,
+                af_fixture_id=af_id,
+            )
+            absences = _absence_summary(lineup, home_adj, away_adj)
+            return lineup, home_adj, away_adj, absences
+        finally:
+            await svc.close()
+
+    return _fn
+
+
+def _absence_summary(lineup, home_adj: float, away_adj: float) -> str | None:
+    """Short 'who is notably out' line, only when a side is materially weakened.
+
+    We don't have a per-player importance readout at the message layer (the
+    penalty is aggregate), so this states WHICH SIDE is weakened and by how much
+    in Glicko points — enough for the user to gauge the adjustment without
+    leaking the model internals.
+    """
+    if not (home_adj or away_adj):
+        return None
+    parts: list[str] = []
+    if home_adj:
+        parts.append(f"home {home_adj:+.0f}")
+    if away_adj:
+        parts.append(f"away {away_adj:+.0f}")
+    return "rating shift " + ", ".join(parts) if parts else None
 
 
 # ----------------------------------------------------------------------
 # Scheduling
 # ----------------------------------------------------------------------
-def register_daily_jobs(scheduler, settings, *, matchday_alert) -> None:
-    """Register the one Nairobi-local matchday-morning cron on the daemon's
-    scheduler.
+def register_daily_jobs(scheduler, settings, *, matchday_notice) -> None:
+    """Register the Nairobi-local morning heads-up cron on the daemon's scheduler.
 
     The job callable is passed in (rather than imported) so the daemon can wrap
     it in its own never-crash error handling.
     """
     scheduler.add_job(
-        matchday_alert,
+        matchday_notice,
         trigger=CronTrigger(
             hour=settings.matchday_alert_hour, minute=0, timezone=REPORT_TZ
         ),
-        id="matchday_alert",
+        id="matchday_notice",
     )
+
+
+# The weekly player-minutes refresh is wired in betbot.main.run_daemon as a
+# Monday cron running scripts/fetch_player_minutes.py via subprocess (mirroring
+# _club_refresh_tick), so a bad refresh can never corrupt the daemon. This hook
+# remains as an in-process alternative / for manual invocation.
+async def refresh_player_minutes_job(settings) -> None:
+    """Weekly refresh of the api-football player-minutes cache (R4a fetcher).
+
+    Kept dependency-light and best-effort: any failure is logged, never raised,
+    so a scheduler tick can't crash the daemon.
+    """
+    from scripts.fetch_player_minutes import run as _refresh
+
+    try:
+        written = await _refresh(
+            list(settings.leagues), settings.api_football_season
+        )
+        log.info("player_minutes_refreshed", written=written)
+    except Exception as exc:  # noqa: BLE001 - never crash the scheduler
+        log.warning("player_minutes_refresh_failed", error=str(exc))

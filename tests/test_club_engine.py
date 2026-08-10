@@ -103,3 +103,33 @@ def test_decide_anchors_towards_market():
     # With no edge over a market that agrees, require_edge should veto.
     d = eng.decide_with_market(pred, Outcome.HOME, pred.p_home, require_edge=True)
     assert d is None
+
+
+def test_lineup_adjustment_default_reproduces_current_output():
+    ratings = {
+        "Strong FC": Glicko2Rating(1800.0, 60.0, 0.06),
+        "Weak FC": Glicko2Rating(1400.0, 60.0, 0.06),
+    }
+    eng = _engine(ratings)
+    base = eng.predict(_ff("Strong FC", "Weak FC"))
+    zeroed = eng.predict(
+        _ff("Strong FC", "Weak FC"), home_rating_adj=0.0, away_rating_adj=0.0
+    )
+    # Default kwargs must be byte-identical to the unadjusted call.
+    assert zeroed.p_home == base.p_home
+    assert zeroed.p_draw == base.p_draw
+    assert zeroed.p_away == base.p_away
+    assert zeroed.home_score == base.home_score
+
+
+def test_negative_home_rating_adj_lowers_p_home():
+    ratings = {
+        "Strong FC": Glicko2Rating(1700.0, 60.0, 0.06),
+        "Weak FC": Glicko2Rating(1500.0, 60.0, 0.06),
+    }
+    eng = _engine(ratings)
+    base = eng.predict(_ff("Strong FC", "Weak FC"))
+    weakened = eng.predict(_ff("Strong FC", "Weak FC"), home_rating_adj=-120.0)
+    assert weakened.p_home < base.p_home
+    # The adjusted (lower) rating is stored for transparency.
+    assert weakened.home_score == base.home_score - 120.0
