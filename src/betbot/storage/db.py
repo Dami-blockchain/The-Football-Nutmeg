@@ -12,6 +12,7 @@ from typing import Iterator
 
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
 from betbot.storage.models import Base
@@ -66,7 +67,17 @@ def init_engine(db_path: Path) -> Engine:
         future=True,
         connect_args={"check_same_thread": False},
     )
-    Base.metadata.create_all(engine)
+    # ``create_all`` (checkfirst=True) is not atomic ACROSS PROCESSES: the api,
+    # bot and daemon are launched simultaneously by deploy/start-services.sh and
+    # each calls init_engine, so two can both see a table missing and race to
+    # CREATE it — the loser raised "table already exists" and crashed (it took
+    # down the Telegram bot on the first deploy). Swallow that specific race:
+    # the table exists either way, which is all we need.
+    try:
+        Base.metadata.create_all(engine)
+    except OperationalError as e:
+        if "already exists" not in str(e).lower():
+            raise
     _apply_additive_migrations(engine)
     _engine = engine
     _SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, future=True)
