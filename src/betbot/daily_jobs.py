@@ -336,10 +336,11 @@ async def send_prediction_alert(
     1. Load the STORED baseline prediction (``prediction_fn``). None -> skip.
     2. Fetch the confirmed lineup + ``(home_adj, away_adj)`` via
        ``lineup_fn(baseline) -> (lineup, home_adj, away_adj, absences)``.
-    3. If the adjustment is nonzero, RE-SCORE via ``rescore_fn(fixture_id,
-       home_adj, away_adj) -> (Prediction, kickoff)`` and persist it
-       (``upsert_prediction``) so the record reflects the lineup-adjusted call.
-       If lineups aren't out (adj == 0,0) the baseline is sent with a caveat.
+    3. ALWAYS RE-SCORE fresh via ``rescore_fn(fixture_id, home_adj, away_adj)
+       -> (Prediction, kickoff)`` (the adjustment may be 0) and persist it
+       (``upsert_prediction``) so the alert never ships a stale stored row. On a
+       re-score failure we fall back to the stored baseline. If lineups aren't
+       out the fresh (adj == 0) prediction is still sent, with a caveat.
     4. Per user, build ``(text, reveals)`` via
        :func:`render_user_lineup_prediction` and, ONLY after a confirmed send,
        ``commit_reveals`` — so the EXISTING ledger prevents double-charge across
@@ -364,10 +365,17 @@ async def send_prediction_alert(
     except Exception as e:  # noqa: BLE001 — lineup data is best-effort
         log.warning("prematch_lineup_failed", fixture_id=fixture_id, error=str(e))
 
-    # --- re-score lineup-adjusted (or fall back to the baseline) --------------
+    # --- ALWAYS re-score fresh at alert time (or fall back to the baseline) ----
+    # Previously this only re-scored when the lineup adjustment was nonzero, so
+    # when the player-minutes cache was empty (adj == 0) we shipped the STALE
+    # stored row (observed live: Celta stored H87/D8/A6 while a fresh score gave
+    # H50/D23/A27). We now re-score unconditionally — the adjustment may be 0 —
+    # so the freshest ratings/DC/market drive the alert. If re-scoring fails
+    # (e.g. network), we gracefully keep the stored baseline rather than skipping
+    # the alert, and the money path (entitlement + reveal ledger) is untouched.
     pred = baseline
     adj_note: str | None = None
-    if (home_adj or away_adj) and rescore_fn is not None:
+    if rescore_fn is not None:
         try:
             rescored, kickoff = await rescore_fn(fixture_id, home_adj, away_adj)
             if rescored is not None:

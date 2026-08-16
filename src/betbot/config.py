@@ -243,7 +243,11 @@ class Settings(BaseSettings):
     # Log-pool weights for the club ensemble components + market anchoring.
     club_weight_glicko: float = Field(default=1.0, alias="BETBOT_CLUB_W_GLICKO")
     club_weight_dc: float = Field(default=1.0, alias="BETBOT_CLUB_W_DC")
-    club_weight_form: float = Field(default=0.5, alias="BETBOT_CLUB_W_FORM")
+    # Form component disabled — the live FormService scale degrades the
+    # log-pooled draw; re-enable only after a proper per-game rescale + club
+    # backtest re-validates it. (The naive engine's own per-game fix, used for
+    # the unrated-team fallback, is separate and still active.)
+    club_weight_form: float = Field(default=0.0, alias="BETBOT_CLUB_W_FORM")
     club_weight_market: float = Field(default=1.0, alias="BETBOT_CLUB_W_MARKET")
 
     # ---- Cross-league Elo engine (Champions League only, R2) -----------

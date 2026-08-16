@@ -15,8 +15,12 @@ cap is hit.
 Usage:
     python scripts/fetch_player_minutes.py                # all leagues, configured season
     python scripts/fetch_player_minutes.py --codes PL PD  # subset
-    python scripts/fetch_player_minutes.py --season 2025  # override season
+    python scripts/fetch_player_minutes.py --season 2024  # override season
     python scripts/fetch_player_minutes.py --budget 60    # stop after ~60 calls
+
+NOTE: the api-football FREE tier only serves seasons ~2022-2024. At the 2026
+season start we backfill the newest accessible completed season (2024) as the
+prior-season minutes source; the LineupService walks back to it automatically.
 
 The weekly refresh job (daily_jobs) will call ``run`` — R4b wires scheduling.
 """
@@ -26,6 +30,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
 
 from betbot.config import get_settings
 from betbot.data.api_football import ApiFootballClient
@@ -138,8 +143,15 @@ def main() -> None:
     args = p.parse_args()
     # CL squads are the domestic clubs already cached under their leagues, and
     # api-football's league=2 player minutes are CL-only (tiny); skip by default
-    # unless explicitly requested.
+    # unless CL was explicitly named on the command line. This keeps the free-tier
+    # budget for the domestic top-5, where the LineupService actually reads.
     codes = [c.upper() for c in args.codes]
+    explicit = "--codes" in sys.argv
+    if not explicit:
+        skipped = [c for c in codes if c == "CL"]
+        codes = [c for c in codes if c != "CL"]
+        if skipped:
+            print(f"skipping CL by default (teams overlap domestic leagues): {skipped}")
     result = asyncio.run(run(codes, args.season, budget=args.budget))
     print(f"minutes written per league: {result}")
 

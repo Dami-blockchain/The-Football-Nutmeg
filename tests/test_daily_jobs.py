@@ -75,6 +75,9 @@ class _Pred:
     p_home: float = 0.39
     p_draw: float = 0.31
     p_away: float = 0.30
+    home_score: float = 0.0
+    away_score: float = 0.0
+    draw_score: float = 0.0
     home_xg: float | None = 1.44
     away_xg: float | None = 1.17
     kickoff: datetime = datetime(2026, 8, 1, 19, 30, tzinfo=timezone.utc)
@@ -363,6 +366,86 @@ async def test_prematch_alert_send_failure_never_charges(db, tmp_path):
     )
     assert has_revealed(813, 77) is False
     assert get_user(813).predictions_consumed == 0
+
+
+async def test_prematch_alert_always_rescores_fresh_even_when_adj_zero(db, tmp_path):
+    """Freshness fix: even with a ZERO lineup adjustment (empty minutes cache) the
+    alert must re-score fresh and send the FRESH probs, not the STALE stored row.
+
+    Mirrors the observed live bug where Celta shipped stale H87/D8/A6 while a
+    fresh score gave H50/D23/A27. Here the stored baseline is H87 and the fresh
+    re-score is H50 — the delivered body must read H 50%, not H 87%.
+    """
+    s = _tg_settings(tmp_path)
+    sent: list[str] = []
+
+    async def ok_send(settings, chat_id, text):
+        sent.append(text)
+        return True
+
+    stale = _Pred(fixture_id=70, p_home=0.87, p_draw=0.08, p_away=0.05)
+    fresh = _Pred(fixture_id=70, p_home=0.50, p_draw=0.23, p_away=0.27)
+
+    # prediction_fn returns STALE on the first (baseline) read and FRESH on the
+    # post-upsert re-read — modelling upsert_prediction having persisted fresh.
+    calls = {"n": 0}
+
+    def prediction_fn(fid):
+        calls["n"] += 1
+        return stale if calls["n"] == 1 else fresh
+
+    async def rescore_fresh(fixture_id, home_adj, away_adj):
+        # adjustment is 0.0 here — the whole point is we still re-score.
+        assert home_adj == 0.0 and away_adj == 0.0
+        return fresh, datetime(2026, 8, 1, 19, 30, tzinfo=timezone.utc)
+
+    # Lineup not out -> adj (0.0, 0.0). Old code would have skipped re-score.
+    async def no_lineup(baseline):
+        return None, 0.0, 0.0, None
+
+    delivered = await send_prediction_alert(
+        s, 70, send_fn=ok_send,
+        prediction_fn=prediction_fn,
+        lineup_fn=no_lineup,
+        rescore_fn=rescore_fresh,
+        entitlement_fn=lambda u, se, now=None: _ent("operator"),
+        users_fn=lambda: [_User(111)],
+    )
+    assert delivered == 1
+    assert "H 50%" in sent[0]  # FRESH values delivered
+    assert "H 87%" not in sent[0]  # NOT the stale stored row
+
+
+async def test_prematch_alert_rescore_failure_falls_back_no_double_charge(db, tmp_path):
+    """If re-scoring raises, the alert falls back to the STORED baseline (still
+    delivered) and the payer is charged EXACTLY ONCE — the money path never
+    regresses on a re-score failure.
+    """
+    s = _tg_settings(tmp_path)
+    u = _paying_user(tmp_path, tid=815)
+    sent: list[str] = []
+
+    async def ok_send(settings, chat_id, text):
+        sent.append(text)
+        return True
+
+    stored = _Pred(fixture_id=71, p_home=0.42, p_draw=0.26, p_away=0.32)
+
+    async def boom(fixture_id, home_adj, away_adj):
+        raise RuntimeError("network down")
+
+    ent = lambda usr, se, now=None: _ent("credit", credits=1)  # noqa: E731
+    delivered = await send_prediction_alert(
+        s, 71, send_fn=ok_send,
+        prediction_fn=lambda fid: stored,
+        lineup_fn=_lineup_fn_stub(home_adj=40.0),  # nonzero, forces rescore attempt
+        rescore_fn=boom,
+        entitlement_fn=ent, users_fn=lambda: [u],
+    )
+    assert delivered == 1
+    assert "H 42%" in sent[0]  # stored baseline delivered, not skipped
+    assert has_revealed(815, 71) is True
+    assert get_user(815).predictions_consumed == 1  # charged exactly once
 
 
 async def test_prematch_alert_no_lineup_sends_baseline_caveat(db, tmp_path):

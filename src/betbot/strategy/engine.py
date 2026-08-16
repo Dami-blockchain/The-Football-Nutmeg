@@ -69,11 +69,41 @@ class StrategyEngine:
         self._settings = settings
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _per_game(form) -> float:
+        """Collapse FormService's summed weighted_points onto a per-game (0-3ish)
+        scale so it is commensurate with ``draw_score`` (~2.4) and ``softmax_temp``.
+
+        ``weighted_points`` is a recency-weighted SUM over the team's last N
+        finished matches (verified live at ~11-12 for N=5), which — fed raw into
+        the softmax against draw_score=2.4 — collapses the draw to ~0 and flips
+        home/away. Dividing by the number of matches considered restores a clean
+        points-per-game scale. When no matches are available (season start,
+        matches_considered=0) we return 0.0 so both sides sit near draw_score and
+        the softmax yields a sane near-uniform prior (home nudged by
+        home_advantage) rather than H0/D0/A100 garbage.
+        """
+        n = max(getattr(form, "matches_considered", 0), 1)
+        return form.weighted_points / n
+
     def predict(self, fixture_form: FixtureForm) -> Prediction:
         s = self._settings
-        home_score = fixture_form.home_form.weighted_points + s.home_advantage
-        away_score = fixture_form.away_form.weighted_points
-        draw_score = s.draw_score
+        home_pg = self._per_game(fixture_form.home_form)
+        away_pg = self._per_game(fixture_form.away_form)
+        home_score = home_pg + s.home_advantage
+        away_score = away_pg
+
+        # Anchor the draw on the SAME per-game scale as the two sides. The stored
+        # ``draw_score`` (default 2.4) was tuned for the old summed form scale
+        # (~11-12); on a 0-3 per-game scale a fixed 2.4 anchor would swamp the
+        # softmax and hand every match to the draw. We instead float the draw
+        # anchor at the fixture's mean per-game level plus a bias derived from
+        # ``draw_score`` (``draw_score - 2.9`` => a modest -0.5 by default). This
+        # keeps ``draw_score`` as the draw-propensity tuning knob, stays
+        # scale-invariant, and — crucially for the season-start / unrated-team
+        # fallback where both sides are 0 — can NEVER produce H0/D0/A100.
+        mean_pg = (home_pg + away_pg) / 2.0
+        draw_score = mean_pg + (s.draw_score - 2.9)
 
         probs = softmax([home_score, draw_score, away_score], s.softmax_temp)
         return Prediction(
