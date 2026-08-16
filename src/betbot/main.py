@@ -317,6 +317,40 @@ async def _score_and_log_one(
 
 
 # ----------------------------------------------------------------------
+# Two-alert pre-match scheduling plan (pure — unit-testable)
+# ----------------------------------------------------------------------
+def plan_kickoff_alert_jobs(settings, preds, now):
+    """Return the per-fixture DateTrigger job plan for the two-alert model.
+
+    For each prediction in ``preds`` this yields UP TO two entries:
+      ``predict_early_<fid>`` at ``KO - early_alert_lead_minutes(competition)``
+      ``predict_late_<fid>``  at ``KO - lineup_confirm_lead_minutes()``
+    A fire time already at/before ``now`` is DROPPED (past-time skip). Pure and
+    offline: no scheduler, no network — just ``[(job_id, run_at_utc), ...]`` in
+    schedule order, so ``_schedule_kickoff_alerts`` and its test share one source
+    of truth for the offsets.
+    """
+    plan: list[tuple[str, datetime]] = []
+    for p in preds:
+        early_lead = timedelta(
+            minutes=settings.early_alert_lead_minutes(p.competition_code)
+        )
+        late_lead = timedelta(minutes=settings.lineup_confirm_lead_minutes())
+        ko = p.kickoff
+        if ko.tzinfo is None:
+            ko = ko.replace(tzinfo=timezone.utc)
+        fid = p.fixture_id
+        for tag, run_at in (
+            ("early", ko - early_lead),
+            ("late", ko - late_lead),
+        ):
+            if run_at <= now:
+                continue  # firing time already past — skip
+            plan.append((f"predict_{tag}_{fid}", run_at))
+    return plan
+
+
+# ----------------------------------------------------------------------
 # Per-fixture re-scoring (pre-match lineup-adjusted alert, R4b)
 # ----------------------------------------------------------------------
 def _build_engines(settings, form_service):
@@ -614,28 +648,34 @@ def run_daemon(
             )
 
     async def _schedule_kickoff_alerts(scheduler) -> None:
-        # Read today's predictions and schedule a one-off pre-match alert per
-        # fixture at kickoff - lineup_alert_lead_minutes(competition) (PL 70,
-        # else 55). Runs at daemon start AND daily (05:00 UTC) so a long-running
-        # daemon keeps picking up newly-scored fixtures. Jobs are idempotent
-        # (replace_existing on a per-fixture id). Never crashes.
+        # TWO-alert pre-match model. For each of today's scored fixtures schedule
+        # TWO one-off DateTrigger jobs, BOTH calling send_prediction_alert:
+        #   predict_early_<fid> at KO - early_alert_lead(competition) (PL 70,
+        #     else 55) — the XI isn't posted yet -> fresh MODEL prediction with
+        #     the "lineups not yet confirmed" note;
+        #   predict_late_<fid>  at KO - lineup_confirm_lead_minutes() (default
+        #     10, all leagues) — the XI is now posted -> confirmed XI + lineup-
+        #     adjusted prediction.
+        # Runs at daemon start AND daily (05:00 UTC) so a long-running daemon
+        # keeps picking up newly-scored fixtures. Jobs are idempotent
+        # (replace_existing on per-fixture ids); a fire time already in the past
+        # is skipped. Every tick is try/excepted so a failure can't crash the
+        # daemon.
+        #
+        # MONEY INVARIANT: both alerts hit send_prediction_alert, which gates
+        # via the reveal ledger, so the fixture is charged EXACTLY ONCE — the
+        # early alert reveals+charges; the late alert finds it already-revealed
+        # and re-shows it FREE with the updated lineup-adjusted content.
         try:
             _s = get_settings()
             now = datetime.now(timezone.utc)
             start, end, _day = nairobi_day_bounds(now)
             preds = predictions_for_kickoff_range(start, end)
             scheduled = 0
-            for p in preds:
-                lead = timedelta(
-                    minutes=_s.lineup_alert_lead_minutes(p.competition_code)
-                )
-                ko = p.kickoff
-                if ko.tzinfo is None:
-                    ko = ko.replace(tzinfo=timezone.utc)
-                run_at = ko - lead
-                if run_at <= now:
-                    continue  # firing time already past — skip
-                fid = p.fixture_id
+            for job_id, run_at in plan_kickoff_alert_jobs(_s, preds, now):
+                # job_id is predict_early_<fid> / predict_late_<fid>; recover the
+                # fixture id (last underscore-delimited token) for the closure.
+                fid = int(job_id.rsplit("_", 1)[1])
 
                 async def _fire(fixture_id=fid) -> None:
                     await _fire_prediction_alert(fixture_id)
@@ -643,7 +683,7 @@ def run_daemon(
                 scheduler.add_job(
                     _fire,
                     trigger=DateTrigger(run_date=run_at, timezone=timezone.utc),
-                    id=f"predict_{fid}",
+                    id=job_id,
                     replace_existing=True,
                 )
                 scheduled += 1
@@ -705,8 +745,9 @@ def run_daemon(
             "daemon_started",
             cron=cron_expr,
             matchday_alert_hour_nairobi=s.matchday_alert_hour,
-            pl_lineup_lead_min=s.pl_lineup_alert_lead_minutes,
-            lineup_lead_min_default=s.lineup_alert_lead_minutes_default,
+            early_pl_lead_min=s.pl_lineup_alert_lead_minutes,
+            early_lead_min_default=s.lineup_alert_lead_minutes_default,
+            late_confirm_lead_min=s.lineup_confirm_lead_minutes(),
         )
         await _tick()  # immediate first run
         await _schedule_kickoff_alerts(scheduler)  # schedule today's reminders now

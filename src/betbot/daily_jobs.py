@@ -5,12 +5,18 @@ alert must not carry a prediction — only a heads-up. So:
 
 * **morning heads-up** (``run_matchday_notice``) — one FREE, ungated broadcast
   listing today's fixtures: ``Home (H) v Away (A) — KO HH:MM · 🔮 prediction at
-  HH:MM``. NO probabilities, NO entitlement, NO credit charge. The stated
-  prediction time is ``kickoff - lineup_alert_lead_minutes(competition)``. Fires
-  on the **Africa/Nairobi wall clock** at ``BETBOT_MATCHDAY_ALERT_HOUR``.
-* **pre-match lineup-adjusted prediction** (``send_prediction_alert``) — the
-  PAID product, fired per-fixture at ``kickoff - lead(competition)`` (once the
-  confirmed XI is out) by :mod:`betbot.main`'s one-off DateTrigger jobs. It
+  HH:MM, confirmed-lineup update ~HH:MM``. NO probabilities, NO entitlement, NO
+  credit charge. The stated early time is
+  ``kickoff - early_alert_lead_minutes(competition)`` and the confirmed-lineup
+  time is ``kickoff - lineup_confirm_lead_minutes()``. Fires on the
+  **Africa/Nairobi wall clock** at ``BETBOT_MATCHDAY_ALERT_HOUR``.
+* **pre-match prediction alerts** (``send_prediction_alert``) — the PAID
+  product, fired per-fixture TWICE by :mod:`betbot.main`'s one-off DateTrigger
+  jobs (the two-alert model): an EARLY model prediction at
+  ``kickoff - early_alert_lead(competition)`` (XI not yet posted -> model note)
+  and a LATE confirmed-XI update at ``kickoff - lineup_confirm_lead()`` (XI now
+  out). Both hit the SAME function; the reveal ledger charges the fixture EXACTLY
+  ONCE (early charges, late re-shows free with the updated lineup content). It
   fetches the confirmed lineup, RE-SCORES the fixture lineup-adjusted (R4a), and
   delivers the XI + adjusted prediction — ENTITLEMENT-GATED through the existing
   reveal ledger (operator/trial free; payers spend 1 credit; locked users get a
@@ -189,11 +195,14 @@ def commit_reveals(user, reveals: list[tuple[int, bool]]) -> None:
 def render_matchday_notice(settings, fixtures, day) -> str | None:
     """Build the FREE morning heads-up body, or ``None`` when there are none.
 
-    One line per fixture: ``*Home (H) v Away (A)* — KO HH:MM · 🔮 prediction at
-    HH:MM``. Times are the **Africa/Nairobi wall clock** (EAT). The prediction
-    time is ``kickoff - lineup_alert_lead_minutes(competition)`` — the SAME lead
-    the scheduler uses to fire the pre-match alert, so the stated time is the
-    real one. Deliberately carries NO probabilities/edge/xG: the prediction can
+    One line per fixture, stating BOTH pre-match alert times (the two-alert
+    model): ``*Home (H) v Away (A)* — KO HH:MM · 🔮 prediction at HH:MM,
+    confirmed-lineup update ~HH:MM``. Times are the **Africa/Nairobi wall
+    clock** (EAT). The early prediction time is
+    ``kickoff - early_alert_lead_minutes(competition)`` and the confirmed-lineup
+    time is ``kickoff - lineup_confirm_lead_minutes()`` — the SAME leads the
+    scheduler uses to fire the two alerts, so the stated times are the real
+    ones. Deliberately carries NO probabilities/edge/xG: the prediction can
     still change once the confirmed XI is out.
     """
     if not fixtures:
@@ -204,20 +213,20 @@ def render_matchday_notice(settings, fixtures, day) -> str | None:
         ko = f.kickoff
         if ko.tzinfo is None:
             ko = ko.replace(tzinfo=timezone.utc)
-        lead = settings.lineup_alert_lead_minutes(
-            getattr(f, "competition_code", None)
-        )
-        pred_at = ko - timedelta(minutes=lead)
+        code = getattr(f, "competition_code", None)
+        early_lead = settings.early_alert_lead_minutes(code)
+        late_lead = settings.lineup_confirm_lead_minutes()
         ko_local = ko.astimezone(tz)
-        pred_local = pred_at.astimezone(tz)
+        early_local = (ko - timedelta(minutes=early_lead)).astimezone(tz)
+        late_local = (ko - timedelta(minutes=late_lead)).astimezone(tz)
         lines.append(
             f"*{f.home_team} (H) v {f.away_team} (A)* — "
-            f"KO {ko_local:%H:%M} · 🔮 prediction at {pred_local:%H:%M} "
-            f"(once the lineup is confirmed)"
+            f"KO {ko_local:%H:%M} · 🔮 prediction at {early_local:%H:%M}, "
+            f"confirmed-lineup update ~{late_local:%H:%M}"
         )
     lines.append("")
-    lines.append("_Times EAT. Predictions are sent per match once the "
-                 "confirmed XI is out._")
+    lines.append("_Times EAT. An early model prediction is sent per match, then "
+                 "a confirmed-XI update once the lineup is out._")
     return "\n".join(lines)
 
 

@@ -245,31 +245,63 @@ class Settings(BaseSettings):
     # The cron triggers pin timezone="Africa/Nairobi" (NOT a UTC offset), so
     # the alert hour stays true to the operator's wall clock even if the zone's
     # rules ever change. The matchday-morning alert fires at this hour; the
-    # per-fixture kickoff reminder fires kickoff_alert_lead_minutes before KO.
+    # per-fixture kickoff reminders fire before KO (see the two-alert model).
     matchday_alert_hour: int = Field(
         default=8, alias="BETBOT_MATCHDAY_ALERT_HOUR"
     )
-    # Per-competition lead for the pre-match lineup-adjusted alert. Confirmed
-    # XIs post ~1h before KO; PL posts earliest (~75m) so we fire at KO-70,
-    # every other competition at KO-55. The morning heads-up quotes the SAME
-    # lead so its stated "prediction at HH:MM" == the actual firing time.
+
+    # ---- TWO-alert pre-match model ------------------------------------
+    # Highlightly's FREE tier posts confirmed XIs only ~6-15 min before KO
+    # (verified: a La Liga XI absent at KO-17 was present at KO-6), NOT the
+    # official ~60 min. So a single ~55-min alert never carries the lineup.
+    # Instead we fire TWO one-off alerts per fixture:
+    #   (1) EARLY model-prediction alert — lead time, XI not yet posted;
+    #   (2) LATE confirmed-XI + lineup-adjusted alert — once the XI drops.
+    #
+    # EARLY (model) lead: per-competition. Confirmed XIs post ~1h before KO;
+    # PL posts earliest so we fire at KO-70, every other competition at KO-55.
+    # The morning heads-up quotes the SAME early lead so its stated "prediction
+    # at HH:MM" == the actual early firing time.
     pl_lineup_alert_lead_minutes: int = Field(
         default=70, alias="BETBOT_PL_LINEUP_ALERT_LEAD_MIN"
     )
     lineup_alert_lead_minutes_default: int = Field(
         default=55, alias="BETBOT_LINEUP_ALERT_LEAD_MIN"
     )
+    # LATE (lineup-confirm) lead: same for every league, KO-minus this many
+    # minutes. 10 is a STARTING value — Highlightly free posts the XI ~6-15 min
+    # pre-KO, so this may need tuning as more matches are observed. Kept easily
+    # tunable via BETBOT_LINEUP_CONFIRM_LEAD_MIN.
+    lineup_confirm_lead_minutes_value: int = Field(
+        default=10, alias="BETBOT_LINEUP_CONFIRM_LEAD_MIN"
+    )
 
-    def lineup_alert_lead_minutes(self, competition_code: str | None) -> int:
-        """Minutes before kickoff to fire the pre-match lineup alert.
+    def early_alert_lead_minutes(self, competition_code: str | None) -> int:
+        """Minutes before kickoff to fire the EARLY (model-prediction) alert.
 
         Premier League (``PL``) -> 70; every other competition -> 55. Used by
         BOTH the morning heads-up (to state "prediction at HH:MM") and the
-        scheduler (to fire the alert), so the two can never drift apart.
+        scheduler (to fire the early alert), so the two can never drift apart.
         """
         if (competition_code or "").upper() == "PL":
             return self.pl_lineup_alert_lead_minutes
         return self.lineup_alert_lead_minutes_default
+
+    # Back-compat alias: existing callers/tests still reference this name for
+    # the early (model) lead. Kept pointing at early_alert_lead_minutes so the
+    # two never diverge.
+    def lineup_alert_lead_minutes(self, competition_code: str | None) -> int:
+        """Alias for :meth:`early_alert_lead_minutes` (the EARLY model lead)."""
+        return self.early_alert_lead_minutes(competition_code)
+
+    def lineup_confirm_lead_minutes(self) -> int:
+        """Minutes before kickoff to fire the LATE confirmed-XI alert.
+
+        Same for every league. Default 10 (tunable via
+        BETBOT_LINEUP_CONFIRM_LEAD_MIN) — Highlightly free posts the XI ~6-15
+        min pre-KO, so this may need tuning as more matches are observed.
+        """
+        return self.lineup_confirm_lead_minutes_value
 
     # ---- Glicko-2 defaults (shared by the club rating machinery) ------
     glicko_tau: float = Field(default=0.5, alias="BETBOT_GLICKO_TAU")
