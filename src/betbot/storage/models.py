@@ -387,6 +387,48 @@ class ModelPrediction(Base):
     )
 
 
+class PredictionOutcome(Base):
+    """One row per fixture — the model's prediction scored against the result.
+
+    Written by :class:`betbot.settlement.SettlementWatcher` at settlement for
+    EVERY stored prediction (not just bets), so the bot has a truthful rolling
+    accuracy record (hit rate, Brier, RPS, log-loss). ``fixture_id`` is unique:
+    a fixture is scored exactly once (idempotent settlement), which also gates
+    the one-shot per-match Glicko update and the one-shot result alert.
+
+    ``result_notified`` flips to True once the end-of-match RESULT ALERT has
+    been sent for this fixture, so results are never re-broadcast.
+    """
+
+    __tablename__ = "prediction_outcomes"
+    __table_args__ = (
+        UniqueConstraint("fixture_id", name="uq_prediction_outcomes_fixture"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    fixture_id: Mapped[int] = mapped_column(Integer, index=True)
+    competition_code: Mapped[str] = mapped_column(String(8))
+
+    predicted_home: Mapped[float] = mapped_column(Float)
+    predicted_draw: Mapped[float] = mapped_column(Float)
+    predicted_away: Mapped[float] = mapped_column(Float)
+    predicted_pick: Mapped[str] = mapped_column(String(4))  # HOME / DRAW / AWAY (argmax)
+    actual_outcome: Mapped[str] = mapped_column(String(4))  # HOME / DRAW / AWAY
+    correct: Mapped[bool] = mapped_column(default=False)
+
+    brier: Mapped[float] = mapped_column(Float)
+    rps: Mapped[float] = mapped_column(Float)
+    log_loss: Mapped[float] = mapped_column(Float)
+
+    home_goals: Mapped[int] = mapped_column(Integer, default=0)
+    away_goals: Mapped[int] = mapped_column(Integer, default=0)
+
+    result_notified: Mapped[bool] = mapped_column(default=False)
+    settled_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, index=True
+    )
+
+
 class ArbExecution(Base):
     """One cross-venue arbitrage execution attempt (armed executor only).
 

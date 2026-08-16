@@ -100,6 +100,7 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/predictions – today's fixtures + predictions\n"
         "/balance – your USDC balance + credits\n"
         "/status – trial / credits\n"
+        "/record – how accurate my predictions have been\n"
         "/help – this guide\n\n"
         "You can also just *message me* — ask me anything about today's "
         "matches.\n\n"
@@ -178,6 +179,33 @@ async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+@_authed
+async def record_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Rolling prediction accuracy (free). Accuracy — NOT a profit/edge claim."""
+    from betbot.storage.repos import track_record
+
+    tr = track_record(30)
+    if tr["n"] == 0:
+        body = (
+            "*Track record — last 30 days*\n\n"
+            "No settled predictions yet. Once matches finish I'll show how many "
+            "of my calls were right."
+        )
+    else:
+        small = (
+            "\n\n_Small sample so far — treat as provisional._"
+            if tr["n"] < 10 else ""
+        )
+        body = (
+            "*Track record — last 30 days*\n\n"
+            f"Correct: {tr['hits']}/{tr['n']} ({tr['hit_rate']:.0%})\n"
+            f"Mean RPS: {tr['mean_rps']:.2f}  ·  Mean Brier: {tr['mean_brier']:.2f}\n\n"
+            "_This is prediction accuracy, not proof of profit or betting edge._"
+            + small
+        )
+    await update.message.reply_text(body, parse_mode=ParseMode.MARKDOWN)
+
+
 # Lazily constructed so importing this module never needs settings; tests
 # inject their own agent by assigning to ``_llm_agent``.
 _llm_agent: LLMAgent | None = None
@@ -214,6 +242,7 @@ def build_application(settings) -> Application:
     app.add_handler(CommandHandler("predictions", predictions_cmd))
     app.add_handler(CommandHandler("balance", balance_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("record", record_cmd))
     # Free-text → LLM assistant. Added LAST so commands keep priority.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_handler))
     return app

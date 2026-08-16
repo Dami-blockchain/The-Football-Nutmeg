@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from betbot.tips import format_locked, format_prediction
+from betbot.tips import format_locked, format_prediction, format_result
 
 
 @dataclass
@@ -83,3 +83,29 @@ def test_format_locked_hides_probabilities():
     assert "%" not in text
     assert "Model" not in text
     assert "xG" not in text
+
+
+@dataclass
+class _Outcome:
+    predicted_home: float
+    predicted_draw: float
+    predicted_away: float
+    predicted_pick: str
+    correct: bool
+    home_goals: int
+    away_goals: int
+
+
+def test_format_result_correct_pick():
+    o = _Outcome(0.60, 0.25, 0.15, "HOME", True, 2, 0)
+    text = format_result(o, "Arsenal", "Chelsea")
+    assert "Full time: Arsenal 2-0 Chelsea" in text
+    assert "Our call: Arsenal (H) — ✅ correct" in text
+    assert "H 60% / D 25% / A 15%" in text
+
+
+def test_format_result_wrong_pick_away_label():
+    o = _Outcome(0.20, 0.30, 0.50, "AWAY", False, 1, 1)
+    text = format_result(o, "Home", "Away")
+    assert "Full time: Home 1-1 Away" in text
+    assert "Our call: Away (A) — ❌ wrong" in text

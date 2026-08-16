@@ -107,16 +107,33 @@ def build_prediction_context(user, settings, *, now: datetime | None = None) -> 
     """
     now = now or datetime.now(timezone.utc)
     from betbot.daily_jobs import nairobi_day_bounds
+    from betbot.storage.repos import track_record
+
+    # Rolling accuracy line so the assistant can answer "how accurate have you
+    # been?" truthfully. This is ACCURACY, not proof of profit/edge/CLV.
+    tr = track_record(30)
+    if tr["n"] == 0:
+        record_line = (
+            "Track record (last 30 days): no settled predictions yet — too small "
+            "a sample to quote an accuracy."
+        )
+    else:
+        small = " (small sample — treat as provisional)" if tr["n"] < 10 else ""
+        record_line = (
+            f"Track record (last 30 days): {tr['hits']}/{tr['n']} correct "
+            f"({tr['hit_rate']:.0%}), mean RPS {tr['mean_rps']:.2f}{small}. "
+            "This is prediction ACCURACY, not a profit/edge guarantee."
+        )
 
     start, end, _day = nairobi_day_bounds(now)
     preds = predictions_for_kickoff_range(start, end)
     if not preds:
-        return "Today's predictions available to this user:\n(no fixtures today)"
+        return record_line + "\n\nToday's predictions available to this user:\n(no fixtures today)"
 
     ent = entitlement_for(user, settings, now=now)
     all_free = ent.reason in ("operator", "trial")
 
-    lines = ["Today's predictions available to this user:"]
+    lines = [record_line, "", "Today's predictions available to this user:"]
     for p in preds:
         entitled = all_free or has_revealed(
             user.telegram_user_id, p.fixture_id

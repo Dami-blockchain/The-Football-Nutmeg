@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import date, datetime, timedelta, timezone
 
 from sqlalchemy import func, select
@@ -16,12 +17,14 @@ from betbot.storage.models import (
     GlickoRating,
     KillSwitch,
     PaperBet,
+    PredictionOutcome,
     PredictionReveal,
     PredictionRow,
     TreasuryBridge,
     User,
 )
 from betbot.strategy.engine import BetDecision, Outcome, Prediction
+from betbot.strategy.ensemble import ranked_probability_score
 from betbot.strategy.glicko import Glicko2Rating, update_rating
 
 log = get_logger(__name__)
@@ -214,6 +217,191 @@ def settled_pnl_window(days: int) -> tuple[float, float]:
     pnl = float(sum((r[0] or 0.0) for r in rows))
     staked = float(sum((r[1] or 0.0) for r in rows))
     return pnl, staked
+
+
+# ----------------------------------------------------------------------
+# Prediction-vs-reality outcome ledger (R10a — accuracy tracking)
+# ----------------------------------------------------------------------
+_OUTCOME_INDEX = {"HOME": 0, "DRAW": 1, "AWAY": 2}
+
+
+def score_prediction(
+    p_home: float, p_draw: float, p_away: float, actual_outcome: str
+) -> tuple[str, bool, float, float, float]:
+    """Pure scoring: ``(pick, correct, brier, rps, log_loss)`` for one prediction.
+
+    ``pick`` is the argmax outcome (HOME/DRAW/AWAY). ``brier`` is the multi-class
+    Brier over the 3 outcomes; ``rps`` reuses the ensemble ranked-probability
+    score; ``log_loss`` is ``-log(p_actual)`` (clipped so a zero probability
+    can't produce an infinite loss).
+    """
+    probs = (float(p_home), float(p_draw), float(p_away))
+    pick = ("HOME", "DRAW", "AWAY")[max(range(3), key=lambda i: probs[i])]
+    idx = _OUTCOME_INDEX[actual_outcome]
+    y = [1.0 if i == idx else 0.0 for i in range(3)]
+    brier = sum((probs[i] - y[i]) ** 2 for i in range(3))
+    rps = ranked_probability_score(probs, idx)
+    p_actual = min(1.0, max(1e-12, probs[idx]))
+    log_loss = -math.log(p_actual)
+    return pick, pick == actual_outcome, brier, rps, log_loss
+
+
+def record_prediction_outcome(
+    *,
+    fixture_id: int,
+    competition_code: str,
+    p_home: float,
+    p_draw: float,
+    p_away: float,
+    actual_outcome: str,
+    home_goals: int,
+    away_goals: int,
+    settled_at: datetime,
+) -> bool:
+    """INSERT-OR-IGNORE one scored prediction. Returns True iff NEWLY inserted.
+
+    The unique constraint on ``fixture_id`` makes this idempotent: a re-run of
+    settlement over the same finished fixture returns False and writes nothing,
+    which is what gates the one-shot per-match rating update + result alert.
+    """
+    pick, correct, brier, rps, log_loss = score_prediction(
+        p_home, p_draw, p_away, actual_outcome
+    )
+    try:
+        with session_scope() as s:
+            s.add(
+                PredictionOutcome(
+                    fixture_id=fixture_id,
+                    competition_code=competition_code,
+                    predicted_home=float(p_home),
+                    predicted_draw=float(p_draw),
+                    predicted_away=float(p_away),
+                    predicted_pick=pick,
+                    actual_outcome=actual_outcome,
+                    correct=correct,
+                    brier=brier,
+                    rps=rps,
+                    log_loss=log_loss,
+                    home_goals=int(home_goals),
+                    away_goals=int(away_goals),
+                    settled_at=settled_at,
+                )
+            )
+        return True
+    except IntegrityError:
+        # Already scored (uq_prediction_outcomes_fixture) — safe no-op.
+        return False
+
+
+def prediction_outcomes_since(days: int) -> list[PredictionOutcome]:
+    """Scored predictions settled within the trailing window (newest first)."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    with session_scope() as s:
+        rows = list(
+            s.execute(
+                select(PredictionOutcome)
+                .where(PredictionOutcome.settled_at >= cutoff)
+                .order_by(PredictionOutcome.settled_at.desc())
+            ).scalars()
+        )
+        s.expunge_all()
+        return rows
+
+
+def track_record(days: int = 30) -> dict:
+    """Rolling accuracy over scored predictions in the trailing window.
+
+    ``{n, hits, hit_rate, mean_brier, mean_rps, mean_logloss}``. With no data
+    the rates are 0.0 — the caller is responsible for saying "sample too small"
+    honestly. This is ACCURACY, not CLV/profit.
+    """
+    rows = prediction_outcomes_since(days)
+    n = len(rows)
+    if n == 0:
+        return {
+            "n": 0, "hits": 0, "hit_rate": 0.0,
+            "mean_brier": 0.0, "mean_rps": 0.0, "mean_logloss": 0.0,
+        }
+    hits = sum(1 for r in rows if r.correct)
+    return {
+        "n": n,
+        "hits": hits,
+        "hit_rate": hits / n,
+        "mean_brier": sum(r.brier for r in rows) / n,
+        "mean_rps": sum(r.rps for r in rows) / n,
+        "mean_logloss": sum(r.log_loss for r in rows) / n,
+    }
+
+
+def outcome_result_notified(fixture_id: int) -> bool:
+    """True once the RESULT ALERT has been broadcast for this fixture."""
+    with session_scope() as s:
+        row = s.execute(
+            select(PredictionOutcome.result_notified)
+            .where(PredictionOutcome.fixture_id == fixture_id)
+            .limit(1)
+        ).scalar_one_or_none()
+        return bool(row)
+
+
+def mark_result_notified(fixture_id: int) -> None:
+    """Flag a fixture's result as broadcast so it is never re-sent."""
+    with session_scope() as s:
+        row = s.execute(
+            select(PredictionOutcome)
+            .where(PredictionOutcome.fixture_id == fixture_id)
+        ).scalar_one_or_none()
+        if row is not None:
+            row.result_notified = True
+
+
+def outcomes_pending_result_alert(days: int = 3) -> list[PredictionOutcome]:
+    """Recently-settled fixtures whose RESULT ALERT hasn't been sent yet."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    with session_scope() as s:
+        rows = list(
+            s.execute(
+                select(PredictionOutcome)
+                .where(PredictionOutcome.settled_at >= cutoff)
+                .where(PredictionOutcome.result_notified.is_(False))
+                .order_by(PredictionOutcome.settled_at.asc())
+            ).scalars()
+        )
+        s.expunge_all()
+        return rows
+
+
+def list_unsettled_predictions_due(
+    now: datetime, grace_minutes: int
+) -> list[PredictionRow]:
+    """Freshest prediction per fixture whose kickoff+grace has passed AND which
+    has NOT yet been scored into the outcome ledger.
+
+    Drives outcome scoring for EVERY prediction (not just those carrying a
+    paper bet). One row per fixture (latest run_date wins) so a fixture is
+    scored once.
+    """
+    cutoff = now - timedelta(minutes=grace_minutes)
+    with session_scope() as s:
+        scored = set(
+            s.execute(select(PredictionOutcome.fixture_id)).scalars()
+        )
+        rows = list(
+            s.execute(
+                select(PredictionRow)
+                .where(PredictionRow.kickoff <= cutoff)
+                .order_by(PredictionRow.kickoff.asc())
+            ).scalars()
+        )
+        s.expunge_all()
+    best: dict[int, PredictionRow] = {}
+    for r in rows:
+        if r.fixture_id in scored:
+            continue
+        cur = best.get(r.fixture_id)
+        if cur is None or (r.run_date, r.id) > (cur.run_date, cur.id):
+            best[r.fixture_id] = r
+    return list(best.values())
 
 
 def list_recent_predictions(days: int = 7) -> list[PredictionRow]:

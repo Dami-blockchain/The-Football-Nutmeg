@@ -21,13 +21,18 @@ from datetime import datetime, timezone
 from betbot.data.football_data import FootballDataClient
 from betbot.logging import get_logger
 from betbot.storage.repos import (
+    get_rating,
     is_kill_switch_tripped,
     list_unsettled_bets_due,
+    list_unsettled_predictions_due,
+    record_prediction_outcome,
     record_settlement,
     settled_pnl_window,
     trip_kill_switch,
+    upsert_rating,
 )
 from betbot.strategy.engine import Outcome
+from betbot.strategy.glicko import update_rating
 
 log = get_logger(__name__)
 
@@ -40,6 +45,51 @@ _WINNER_TO_OUTCOME = {
     "AWAY_TEAM": Outcome.AWAY,
     "DRAW": Outcome.DRAW,
 }
+
+# Competitions whose per-match Glicko ratings we nudge from the result between
+# the weekly full re-seed: the five domestic top leagues + the Champions League.
+# (The weekly re-seed rebuilds from full history and stays authoritative; these
+# per-match updates just keep ratings responsive in between.)
+_RATED_COMPETITIONS = frozenset({"PL", "PD", "BL1", "SA", "FL1", "CL"})
+
+
+def _final_goals(match: dict) -> tuple[int, int]:
+    """``(home_goals, away_goals)`` from a finished football-data match dict.
+
+    Reads ``score.fullTime`` (the real API shape); falls back to 0-0 when the
+    score block is absent (e.g. a winner-only test fixture), which never
+    corrupts scoring because the OUTCOME is derived from ``score.winner``.
+    """
+    ft = (match.get("score") or {}).get("fullTime") or {}
+    try:
+        hg = int(ft.get("home") or 0)
+        ag = int(ft.get("away") or 0)
+    except (TypeError, ValueError):
+        return 0, 0
+    return hg, ag
+
+
+def _update_ratings_for_result(
+    competition_code: str, home_team: str, away_team: str, outcome: str, period: str
+) -> None:
+    """Nudge the two teams' Glicko ratings from one finished result.
+
+    Both updates use the opponents' PRE-match ratings (correct Glicko-2
+    semantics). Best-effort: any failure is swallowed by the caller so a rating
+    error never aborts settlement.
+    """
+    home_rating = get_rating(home_team)
+    away_rating = get_rating(away_team)
+    sh = 1.0 if outcome == "HOME" else (0.5 if outcome == "DRAW" else 0.0)
+    sa = 1.0 if outcome == "AWAY" else (0.5 if outcome == "DRAW" else 0.0)
+    new_home = update_rating(
+        home_rating, [(away_rating.rating, away_rating.rd, sh)], period=period
+    )
+    new_away = update_rating(
+        away_rating, [(home_rating.rating, home_rating.rd, sa)], period=period
+    )
+    upsert_rating(home_team, new_home)
+    upsert_rating(away_team, new_away)
 
 
 def compute_pnl(
@@ -113,6 +163,12 @@ class SettlementWatcher:
                 pnl_usd=round(pnl, 2),
             )
 
+        # --- Outcome ledger + per-match rating learning (ALL predictions) -----
+        # Runs independently of bets: every finished fixture with a stored
+        # prediction is scored vs reality (idempotent on fixture_id) and, for
+        # rated competitions, nudges the two teams' Glicko ratings ONCE.
+        await self._score_outcomes(now)
+
         tripped, pnl_w, staked_w = self._evaluate_kill_switch()
         log.info(
             "settlement_done",
@@ -124,6 +180,71 @@ class SettlementWatcher:
             kill_switch_tripped=tripped,
         )
         return SettlementSummary(settled, in_play, no_result, tripped, pnl_w, staked_w)
+
+    async def _score_outcomes(self, now: datetime) -> int:
+        """Score every finished, un-scored prediction vs its result.
+
+        For each fixture: fetch the match, if final derive the outcome from
+        ``score.winner``, INSERT-OR-IGNORE the scored outcome (idempotent), and
+        — only on a NEWLY-inserted row for a rated competition — nudge the two
+        teams' Glicko ratings once. Returns the count newly scored. Best-effort
+        throughout: neither a fetch nor a rating error aborts settlement.
+        """
+        due = list_unsettled_predictions_due(now, self._settings.settle_grace_minutes)
+        scored = 0
+        for pred in due:
+            try:
+                match = await self._client.get_match(pred.fixture_id)
+            except Exception as e:  # noqa: BLE001 — one bad fetch mustn't stop the run
+                log.warning("outcome_fetch_failed", fixture_id=pred.fixture_id, error=str(e))
+                continue
+            if match is None or match.get("status") not in SETTLED_STATUSES:
+                continue
+            outcome = _WINNER_TO_OUTCOME.get((match.get("score") or {}).get("winner"))
+            if outcome is None:
+                continue  # final status but winner not populated yet — retry
+            hg, ag = _final_goals(match)
+            newly = record_prediction_outcome(
+                fixture_id=pred.fixture_id,
+                competition_code=pred.competition_code,
+                p_home=pred.p_home,
+                p_draw=pred.p_draw,
+                p_away=pred.p_away,
+                actual_outcome=outcome.value,
+                home_goals=hg,
+                away_goals=ag,
+                settled_at=now,
+            )
+            if not newly:
+                continue  # already scored — idempotent (no double rating update)
+            scored += 1
+            log.info(
+                "prediction_scored",
+                fixture_id=pred.fixture_id,
+                pick=("HOME", "DRAW", "AWAY")[
+                    max(range(3), key=lambda i: (pred.p_home, pred.p_draw, pred.p_away)[i])
+                ],
+                result=outcome.value,
+            )
+            if (pred.competition_code or "").upper() in _RATED_COMPETITIONS:
+                try:
+                    period = now.date().isoformat()
+                    _update_ratings_for_result(
+                        pred.competition_code, pred.home_team, pred.away_team,
+                        outcome.value, period,
+                    )
+                    log.info(
+                        "rating_updated",
+                        fixture_id=pred.fixture_id,
+                        home=pred.home_team, away=pred.away_team,
+                        result=outcome.value,
+                    )
+                except Exception as e:  # noqa: BLE001 — never abort settlement
+                    log.warning(
+                        "rating_update_failed",
+                        fixture_id=pred.fixture_id, error=str(e),
+                    )
+        return scored
 
     def _evaluate_kill_switch(self) -> tuple[bool, float, float]:
         s = self._settings

@@ -18,6 +18,7 @@ import typer
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from betbot.config import get_settings
 from betbot.data.football_data import FootballDataClient, FootballDataError
@@ -31,6 +32,7 @@ from betbot.daily_jobs import (
     nairobi_day_bounds,
     register_daily_jobs,
     run_matchday_notice,
+    run_result_alerts,
     send_prediction_alert,
 )
 from betbot.gate import evaluate_gate
@@ -621,6 +623,21 @@ def run_daemon(
         except Exception as e:  # noqa: BLE001 — never crash the daemon
             get_logger(__name__).warning("matchday_notice_failed", error=str(e))
 
+    async def _settle_and_results_tick() -> None:
+        # Periodic (every ~2h): settle finished fixtures (score outcomes, update
+        # ratings) then broadcast end-of-match RESULT ALERTS. This is what lands
+        # results within ~2h of full time instead of waiting for the 08:00 tick.
+        # Both steps are independently try/excepted so neither can crash the
+        # daemon. Result alerts are FREE (no reveal-ledger write, no charge).
+        try:
+            await _settle_once()
+        except Exception as e:  # noqa: BLE001 — never crash the daemon
+            get_logger(__name__).warning("periodic_settle_failed", error=str(e))
+        try:
+            await run_result_alerts(get_settings())
+        except Exception as e:  # noqa: BLE001 — never crash the daemon
+            get_logger(__name__).warning("result_alerts_failed", error=str(e))
+
     async def _fire_prediction_alert(fixture_id: int) -> None:
         # Pre-match lineup-adjusted, gated. Wire the re-scoring helper so the
         # alert re-scores off the confirmed XI; lineup_fn defaults to the
@@ -740,6 +757,13 @@ def run_daemon(
             trigger=CronTrigger.from_crontab("30 5 * * 1", timezone=timezone.utc),
             id="player_minutes_refresh",
         )
+        # Periodic (every 2h): settle finished fixtures + fire RESULT ALERTS, so
+        # results land within ~2h of full time rather than at the next 08:00 tick.
+        scheduler.add_job(
+            _settle_and_results_tick,
+            trigger=IntervalTrigger(hours=2, timezone=timezone.utc),
+            id="settle_and_results",
+        )
         scheduler.start()
         log.info(
             "daemon_started",
@@ -750,6 +774,7 @@ def run_daemon(
             late_confirm_lead_min=s.lineup_confirm_lead_minutes(),
         )
         await _tick()  # immediate first run
+        await run_result_alerts(s)  # fire any pending result alerts on startup
         await _schedule_kickoff_alerts(scheduler)  # schedule today's reminders now
         try:
             await asyncio.Event().wait()

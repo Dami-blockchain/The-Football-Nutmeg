@@ -423,40 +423,137 @@ async def send_prediction_alert(
     return sent
 
 
-def _default_lineup_fn(settings):
-    """Build the production ``lineup_fn`` closure over a shared LineupService.
+# Process-wide shared LineupService (budget fix). Each pre-match alert used to
+# build a FRESH LineupService, whose per-(league,date) /matches cache started
+# empty every time — so N alerts for the same league+day fired N /matches calls
+# (~4 calls/fixture/day), and a heavy Saturday neared the 100/day Highlightly
+# cap. One long-lived instance shares that cache across the whole alert batch:
+# 1 /matches per league/day + 1 /lineups per fixture. Rebuilt only if settings
+# change (never in production; only tests inject a new settings object).
+_LINEUP_SERVICE = None
+_LINEUP_SERVICE_SETTINGS = None
 
-    Returns ``async (baseline) -> (lineup, home_adj, away_adj, absences)``.
-    Injuries are fetched too (cheap, optional) to fold late scratches into the
-    absence list. Any gap yields ``(None, 0.0, 0.0, None)`` — the caller then
-    sends the baseline with a "lineup not yet confirmed" caveat.
+
+def _lineup_service(settings):
+    """Return the shared :class:`LineupService`, creating it once and reusing it.
+
+    The instance's ``/matches``-per-(league,date) cache is what makes repeated
+    fixtures on the same day reuse a SINGLE ``/matches`` fetch. Keyed by the
+    settings object so a test with a different settings gets its own service.
     """
-    async def _fn(baseline):
+    global _LINEUP_SERVICE, _LINEUP_SERVICE_SETTINGS
+    if _LINEUP_SERVICE is None or _LINEUP_SERVICE_SETTINGS is not settings:
         from betbot.data.lineup_service import LineupService
 
-        svc = LineupService(settings)
-        try:
-            code = baseline.competition_code
-            ko = baseline.kickoff
-            ko_date = (ko.date().isoformat() if ko is not None else "")
-            match_id = await svc.resolve_match_id(
-                code, baseline.home_team, baseline.away_team, ko_date
-            )
-            if match_id is None:
-                return None, 0.0, 0.0, None
-            # One /lineups call, reused for both the display XI and the adj.
-            lineup = await svc.get_confirmed_xi(
-                code, baseline.home_team, baseline.away_team, ko_date,
-                match_id=match_id,
-            )
-            home_adj, away_adj = await svc.adjustments_for_fixture(
-                code, baseline.home_team, baseline.away_team, ko_date,
-                match_id=match_id, lineups=lineup,
-            )
-            absences = _absence_summary(lineup, home_adj, away_adj)
-            return lineup, home_adj, away_adj, absences
-        finally:
-            await svc.close()
+        _LINEUP_SERVICE = LineupService(settings)
+        _LINEUP_SERVICE_SETTINGS = settings
+    return _LINEUP_SERVICE
+
+
+# ----------------------------------------------------------------------
+# End-of-match RESULT ALERT (free; sent only to users who saw the prediction)
+# ----------------------------------------------------------------------
+async def run_result_alerts(
+    settings,
+    *,
+    send_fn: SendFn | None = None,
+    now: datetime | None = None,
+    outcomes_fn=None,
+    prediction_fn=prediction_for_fixture,
+    users_fn=list_users,
+    already_revealed_fn=has_revealed,
+    mark_notified_fn=None,
+) -> int:
+    """Broadcast full-time RESULT ALERTS for recently-settled fixtures.
+
+    FREE and READ-ONLY on the money path: no reveal ledger write, no credit
+    charge. For each un-notified scored outcome it sends
+    :func:`betbot.tips.format_result` ONLY to users who had that fixture's
+    prediction REVEALED (``has_revealed`` True) — the operator always. After the
+    batch for a fixture completes it is flagged ``result_notified`` so it never
+    re-sends. Returns total messages delivered. Injected fns keep it testable.
+    """
+    from betbot.notify import send_telegram_to
+    from betbot.storage.repos import (
+        mark_result_notified,
+        outcomes_pending_result_alert,
+    )
+    from betbot.tips import format_result
+
+    send = send_fn or send_telegram_to
+    outcomes_fn = outcomes_fn or outcomes_pending_result_alert
+    mark_notified_fn = mark_notified_fn or mark_result_notified
+
+    pending = list(outcomes_fn())
+    if not pending:
+        return 0
+
+    users = users_fn()
+    operator_id = settings.telegram_allowed_user_id
+    sent = 0
+    for row in pending:
+        pred = prediction_fn(row.fixture_id)
+        home = pred.home_team if pred is not None else "Home"
+        away = pred.away_team if pred is not None else "Away"
+        body = "*⚽ Result*\n\n" + format_result(row, home, away)
+
+        # Audience: the operator (always) + every user who saw this prediction.
+        audience: list[int] = []
+        if operator_id:
+            audience.append(operator_id)
+        for u in users:
+            if u.telegram_user_id in audience:
+                continue
+            if already_revealed_fn(u.telegram_user_id, row.fixture_id):
+                audience.append(u.telegram_user_id)
+
+        for uid in audience:
+            try:
+                if await send(settings, uid, body):
+                    sent += 1
+            except Exception as e:  # noqa: BLE001 — one bad send mustn't drop the rest
+                log.warning(
+                    "result_alert_send_failed",
+                    telegram_user_id=uid, fixture_id=row.fixture_id, error=str(e),
+                )
+        # Flag AFTER attempting the whole audience so a fixture is broadcast once.
+        mark_notified_fn(row.fixture_id)
+        log.info(
+            "result_alert_sent", fixture_id=row.fixture_id, delivered=len(audience),
+        )
+    return sent
+
+
+def _default_lineup_fn(settings):
+    """Build the production ``lineup_fn`` closure over the SHARED LineupService.
+
+    Returns ``async (baseline) -> (lineup, home_adj, away_adj, absences)``.
+    Reuses the process-wide :func:`_lineup_service` so its per-(league,date)
+    ``/matches`` cache spans the whole alert batch (the budget fix — no fresh
+    caches, no per-alert re-fetch). Any gap yields ``(None, 0.0, 0.0, None)`` —
+    the caller then sends the baseline with a "lineup not yet confirmed" caveat.
+    """
+    async def _fn(baseline):
+        svc = _lineup_service(settings)
+        code = baseline.competition_code
+        ko = baseline.kickoff
+        ko_date = (ko.date().isoformat() if ko is not None else "")
+        match_id = await svc.resolve_match_id(
+            code, baseline.home_team, baseline.away_team, ko_date
+        )
+        if match_id is None:
+            return None, 0.0, 0.0, None
+        # One /lineups call, reused for both the display XI and the adj.
+        lineup = await svc.get_confirmed_xi(
+            code, baseline.home_team, baseline.away_team, ko_date,
+            match_id=match_id,
+        )
+        home_adj, away_adj = await svc.adjustments_for_fixture(
+            code, baseline.home_team, baseline.away_team, ko_date,
+            match_id=match_id, lineups=lineup,
+        )
+        absences = _absence_summary(lineup, home_adj, away_adj)
+        return lineup, home_adj, away_adj, absences
 
     return _fn
 
