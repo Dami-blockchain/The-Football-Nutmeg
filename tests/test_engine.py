@@ -121,6 +121,71 @@ def test_opponent_factor_inflated_form_is_clamped_to_points_scale():
     assert p.p_draw >= 0.05, p.p_draw
 
 
+def test_shrinkage_makes_low_n_more_conservative_than_high_n():
+    # Same per-game form (3.0 pg home, 0.0 pg away) but n=1 vs n=5. With
+    # sample-size shrinkage the favourite's probability must be STRICTLY LOWER
+    # at n=1 (one game of evidence is trusted less), and the draw stays alive.
+    s = get_settings()
+    eng = StrategyEngine(s)
+    # n=1: one win = 1.5 recency-weight * 3 pts = 4.5 weighted => 3.0 pg raw.
+    p_low = eng.predict(_ff(home_pts=4.5, away_pts=0.0, home_n=1, away_n=1))
+    # n=5: same 3.0 pg raw => weighted_points = 3.0 * recency_weight_sum(5).
+    from betbot.data.form import recency_weight_sum
+
+    hi_pts = 3.0 * recency_weight_sum(5)
+    p_high = eng.predict(_ff(home_pts=hi_pts, away_pts=0.0, home_n=5, away_n=5))
+    _probs_sane(p_low)
+    _probs_sane(p_high)
+    assert p_low.p_home < p_high.p_home, (p_low.p_home, p_high.p_home)
+    assert p_low.p_draw >= 0.10, p_low.p_draw
+
+
+def test_shrinkage_n0_unchanged_near_uniform_prior():
+    # n=0 both sides: shrinkage must NOT change the season-start prior behaviour
+    # (already fully-prior at 0.0 pg). All three near-uniform, home >= away.
+    s = get_settings()
+    p = StrategyEngine(s).predict(_ff(home_pts=0.0, away_pts=0.0, home_n=0, away_n=0))
+    _probs_sane(p)
+    for v in (p.p_home, p.p_draw, p.p_away):
+        assert 0.15 <= v <= 0.55, (v, p)
+    assert p.p_home >= p.p_away
+
+
+def test_shrinkage_large_n_approaches_unshrunk():
+    # As n grows the data weight n/(n+K) -> 1, so a large-n prediction must
+    # approach the K=0 (un-shrunk) value for the SAME per-game form.
+    from betbot.data.form import recency_weight_sum
+
+    big_n = 200
+    pg = 2.5
+    pts = pg * recency_weight_sum(big_n)
+    ff = _ff(home_pts=pts, away_pts=0.0, home_n=big_n, away_n=big_n)
+
+    # model_copy => independent instances (get_settings is lru_cache singleton).
+    base = get_settings()
+    shrunk = StrategyEngine(base.model_copy(update={"form_shrinkage_k": 4.0})).predict(ff)
+    unshrunk = StrategyEngine(base.model_copy(update={"form_shrinkage_k": 0.0})).predict(ff)
+    _probs_sane(shrunk)
+    assert abs(shrunk.p_home - unshrunk.p_home) < 0.01, (
+        shrunk.p_home,
+        unshrunk.p_home,
+    )
+
+
+def test_shrinkage_never_degenerate_across_n():
+    # No NaN / 0 / 1 at any small n for a strong-vs-weak matchup; draws alive.
+    import math
+
+    s = get_settings()
+    eng = StrategyEngine(s)
+    for n in (1, 2, 3, 4, 5):
+        p = eng.predict(_ff(home_pts=4.5 * n, away_pts=0.0, home_n=n, away_n=n))
+        _probs_sane(p)
+        for v in (p.p_home, p.p_draw, p.p_away):
+            assert not math.isnan(v)
+        assert p.p_draw >= 0.10, (n, p.p_draw)
+
+
 def test_club_engine_unrated_fallback_not_degenerate():
     # The Racing-Santander case: away side has default RD (no rating history),
     # so the club engine defers to the naive engine. Must NOT be 0/0/100.

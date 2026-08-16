@@ -5,8 +5,35 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Obvious ``.env`` placeholder values that must be treated as "unset".
+_PLACEHOLDER_KEYS: frozenset[str] = frozenset({"YOURKEY", "YOUR_KEY", "CHANGEME", ""})
+
+
+def _first_real_env_value(env_var: str, env_file: str = ".env") -> str:
+    """First non-placeholder value for ``env_var`` in ``env_file`` ('' if none).
+
+    python-dotenv (used by pydantic-settings) resolves a DUPLICATE key to the
+    LAST occurrence. The production ``.env`` carries a real HIGHLIGHTLY_API_KEY
+    followed by a leftover ``=YOURKEY`` placeholder line, so the loaded value is
+    the placeholder. Rather than edit ``.env`` (off-limits), we scan for the
+    FIRST real value. Missing file / no real value -> ''.
+    """
+    try:
+        lines = Path(env_file).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    prefix = f"{env_var}="
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#") or not stripped.startswith(prefix):
+            continue
+        value = stripped[len(prefix):].strip().strip("'\"")
+        if value and value.upper() not in _PLACEHOLDER_KEYS:
+            return value
+    return ""
 
 # Top-5 European leagues + UCL. Codes are football-data.org competition IDs.
 LEAGUE_CODES: tuple[str, ...] = ("PL", "PD", "BL1", "SA", "FL1", "CL")
@@ -49,6 +76,16 @@ class Settings(BaseSettings):
     )
     api_football_season: int = Field(default=2026, alias="BETBOT_AF_SEASON")
 
+    # ---- Highlightly Soccer FREE tier (confirmed lineups, CURRENT season) ---
+    # api-football's FREE tier blocks the current season, so the confirmed-XI
+    # source is Highlightly (serves the current season). Behind Cloudflare — the
+    # client always sends a browser User-Agent + the key (x-rapidapi-key).
+    highlightly_api_key: str = Field(default="", alias="HIGHLIGHTLY_API_KEY")
+    highlightly_base_url: str = Field(
+        default="https://soccer.highlightly.net",
+        alias="HIGHLIGHTLY_BASE_URL",
+    )
+
     # ---- Lineup-adjusted scoring (R4a) --------------------------------
     # Max Glicko-point penalty when a team's entire expected first XI is
     # absent from the confirmed starting XI. Scales linearly with the
@@ -64,6 +101,11 @@ class Settings(BaseSettings):
     home_advantage: float = Field(default=0.3, alias="BETBOT_HOME_ADVANTAGE")
     draw_score: float = Field(default=2.4, alias="BETBOT_DRAW_SCORE")
     softmax_temp: float = Field(default=1.0, alias="BETBOT_SOFTMAX_TEMP")
+    # Sample-size shrinkage for the naive engine's per-game form. Each side's
+    # per-game score is pulled toward the neutral prior (0.0) with data weight
+    # n / (n + form_shrinkage_k): n=1 => 20% data, n=5 => 56%, large n => ~raw.
+    # Bigger K = more conservative at season start. K=0 disables shrinkage.
+    form_shrinkage_k: float = Field(default=4.0, alias="BETBOT_FORM_SHRINKAGE_K")
     opp_strength_weight: float = Field(
         default=0.5, alias="BETBOT_OPP_STRENGTH_WEIGHT"
     )
@@ -162,6 +204,23 @@ class Settings(BaseSettings):
         default=20, alias="BETBOT_LLM_DAILY_LIMIT_PER_USER"
     )
 
+    @model_validator(mode="after")
+    def _repair_placeholder_highlightly_key(self) -> "Settings":
+        """Recover the real HIGHLIGHTLY key when a duplicate ``.env`` line wins.
+
+        See :func:`_first_real_env_value`: a leftover ``HIGHLIGHTLY_API_KEY=YOURKEY``
+        placeholder line shadows the real key under python-dotenv's last-wins rule.
+        If the loaded value is empty or a known placeholder, fall back to the FIRST
+        real value in the env file so the confirmed-lineup path works live.
+        """
+        current = (self.highlightly_api_key or "").strip()
+        if not current or current.upper() in _PLACEHOLDER_KEYS:
+            env_file = (self.model_config.get("env_file") or ".env")
+            recovered = _first_real_env_value("HIGHLIGHTLY_API_KEY", str(env_file))
+            if recovered:
+                object.__setattr__(self, "highlightly_api_key", recovered)
+        return self
+
     @property
     def allowed_telegram_ids(self) -> set[int]:
         ids: set[int] = set()
@@ -186,31 +245,63 @@ class Settings(BaseSettings):
     # The cron triggers pin timezone="Africa/Nairobi" (NOT a UTC offset), so
     # the alert hour stays true to the operator's wall clock even if the zone's
     # rules ever change. The matchday-morning alert fires at this hour; the
-    # per-fixture kickoff reminder fires kickoff_alert_lead_minutes before KO.
+    # per-fixture kickoff reminders fire before KO (see the two-alert model).
     matchday_alert_hour: int = Field(
         default=8, alias="BETBOT_MATCHDAY_ALERT_HOUR"
     )
-    # Per-competition lead for the pre-match lineup-adjusted alert. Confirmed
-    # XIs post ~1h before KO; PL posts earliest (~75m) so we fire at KO-70,
-    # every other competition at KO-55. The morning heads-up quotes the SAME
-    # lead so its stated "prediction at HH:MM" == the actual firing time.
+
+    # ---- TWO-alert pre-match model ------------------------------------
+    # Highlightly's FREE tier posts confirmed XIs only ~6-15 min before KO
+    # (verified: a La Liga XI absent at KO-17 was present at KO-6), NOT the
+    # official ~60 min. So a single ~55-min alert never carries the lineup.
+    # Instead we fire TWO one-off alerts per fixture:
+    #   (1) EARLY model-prediction alert — lead time, XI not yet posted;
+    #   (2) LATE confirmed-XI + lineup-adjusted alert — once the XI drops.
+    #
+    # EARLY (model) lead: per-competition. Confirmed XIs post ~1h before KO;
+    # PL posts earliest so we fire at KO-70, every other competition at KO-55.
+    # The morning heads-up quotes the SAME early lead so its stated "prediction
+    # at HH:MM" == the actual early firing time.
     pl_lineup_alert_lead_minutes: int = Field(
         default=70, alias="BETBOT_PL_LINEUP_ALERT_LEAD_MIN"
     )
     lineup_alert_lead_minutes_default: int = Field(
         default=55, alias="BETBOT_LINEUP_ALERT_LEAD_MIN"
     )
+    # LATE (lineup-confirm) lead: same for every league, KO-minus this many
+    # minutes. 10 is a STARTING value — Highlightly free posts the XI ~6-15 min
+    # pre-KO, so this may need tuning as more matches are observed. Kept easily
+    # tunable via BETBOT_LINEUP_CONFIRM_LEAD_MIN.
+    lineup_confirm_lead_minutes_value: int = Field(
+        default=10, alias="BETBOT_LINEUP_CONFIRM_LEAD_MIN"
+    )
 
-    def lineup_alert_lead_minutes(self, competition_code: str | None) -> int:
-        """Minutes before kickoff to fire the pre-match lineup alert.
+    def early_alert_lead_minutes(self, competition_code: str | None) -> int:
+        """Minutes before kickoff to fire the EARLY (model-prediction) alert.
 
         Premier League (``PL``) -> 70; every other competition -> 55. Used by
         BOTH the morning heads-up (to state "prediction at HH:MM") and the
-        scheduler (to fire the alert), so the two can never drift apart.
+        scheduler (to fire the early alert), so the two can never drift apart.
         """
         if (competition_code or "").upper() == "PL":
             return self.pl_lineup_alert_lead_minutes
         return self.lineup_alert_lead_minutes_default
+
+    # Back-compat alias: existing callers/tests still reference this name for
+    # the early (model) lead. Kept pointing at early_alert_lead_minutes so the
+    # two never diverge.
+    def lineup_alert_lead_minutes(self, competition_code: str | None) -> int:
+        """Alias for :meth:`early_alert_lead_minutes` (the EARLY model lead)."""
+        return self.early_alert_lead_minutes(competition_code)
+
+    def lineup_confirm_lead_minutes(self) -> int:
+        """Minutes before kickoff to fire the LATE confirmed-XI alert.
+
+        Same for every league. Default 10 (tunable via
+        BETBOT_LINEUP_CONFIRM_LEAD_MIN) — Highlightly free posts the XI ~6-15
+        min pre-KO, so this may need tuning as more matches are observed.
+        """
+        return self.lineup_confirm_lead_minutes_value
 
     # ---- Glicko-2 defaults (shared by the club rating machinery) ------
     glicko_tau: float = Field(default=0.5, alias="BETBOT_GLICKO_TAU")

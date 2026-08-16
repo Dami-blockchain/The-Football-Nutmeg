@@ -133,6 +133,11 @@ def main() -> None:
         help="Internal competition codes (default: all configured leagues).",
     )
     p.add_argument(
+        "--league", default=None,
+        help="Fetch a SINGLE league by internal code (e.g. PL). Overrides --codes; "
+             "used by the daily budget-paced prior-season backfill.",
+    )
+    p.add_argument(
         "--season", type=int, default=settings.api_football_season,
         help="Season START year (2025/26 -> 2025).",
     )
@@ -145,6 +150,12 @@ def main() -> None:
     # api-football's league=2 player minutes are CL-only (tiny); skip by default
     # unless CL was explicitly named on the command line. This keeps the free-tier
     # budget for the domestic top-5, where the LineupService actually reads.
+    # --league is the single-league fast path (daily backfill); it wins over
+    # --codes and never triggers the CL-skip default (an explicit code is honoured).
+    if args.league:
+        result = asyncio.run(run([args.league.upper()], args.season, budget=args.budget))
+        print(f"minutes written per league: {result}")
+        return
     codes = [c.upper() for c in args.codes]
     explicit = "--codes" in sys.argv
     if not explicit:

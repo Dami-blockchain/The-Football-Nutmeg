@@ -178,6 +178,23 @@ def test_lineup_alert_lead_minutes_per_competition():
     assert s.lineup_alert_lead_minutes(None) == 55  # unknown -> default
 
 
+def test_early_alert_lead_minutes_alias_matches_legacy():
+    # early_alert_lead_minutes is the canonical EARLY (model) lead; the legacy
+    # lineup_alert_lead_minutes name aliases it 1:1 so nothing drifts.
+    s = _tg_settings_stub()
+    for code in ("PL", "pl", "PD", "BL1", "SA", "FL1", "CL", None):
+        assert s.early_alert_lead_minutes(code) == s.lineup_alert_lead_minutes(code)
+    assert s.early_alert_lead_minutes("PL") == 70
+    assert s.early_alert_lead_minutes("SA") == 55
+
+
+def test_lineup_confirm_lead_minutes_default_and_env_override():
+    # LATE (confirmed-XI) lead: same for every league, default 10, tunable.
+    assert _tg_settings_stub().lineup_confirm_lead_minutes() == 10
+    tuned = Settings(FOOTBALL_DATA_API_KEY="x", BETBOT_LINEUP_CONFIRM_LEAD_MIN=8)
+    assert tuned.lineup_confirm_lead_minutes() == 8
+
+
 # ----------------------------------------------------------------------
 # run_matchday_notice — FREE heads-up, no prediction, no ledger
 # ----------------------------------------------------------------------
@@ -186,17 +203,25 @@ def _fixt(fid, home, away, ko, code):
                  kickoff=ko, competition_code=code)
 
 
-def test_matchday_notice_states_prediction_time_and_hides_probs():
+def test_matchday_notice_states_both_alert_times_and_hides_probs():
     s = _tg_settings_stub()
-    # PL KO 19:30 UTC -> pred at KO-70 = 18:20 UTC; SA KO 17:00 UTC -> KO-55.
+    # Two-alert model. PL KO 19:30 UTC -> early KO-70 = 18:20 UTC, late KO-10 =
+    # 19:20 UTC; SA KO 17:00 UTC -> early KO-55 = 16:05 UTC, late KO-10 = 16:50.
     pl = _fixt(1, "Man City", "Arsenal",
                datetime(2026, 8, 1, 19, 30, tzinfo=timezone.utc), "PL")
     sa = _fixt(2, "Inter", "Milan",
                datetime(2026, 8, 1, 17, 0, tzinfo=timezone.utc), "SA")
     text = render_matchday_notice(s, [pl, sa], date(2026, 8, 1))
-    # Times are EAT (+3): PL KO 22:30, pred 21:20; SA KO 20:00, pred 19:05.
-    assert "KO 22:30 · 🔮 prediction at 21:20" in text  # PL, KO-70
-    assert "KO 20:00 · 🔮 prediction at 19:05" in text  # SA, KO-55
+    # Times are EAT (+3): PL KO 22:30, early 21:20, late 22:20; SA KO 20:00,
+    # early 19:05, late 19:50.
+    assert (
+        "KO 22:30 · 🔮 prediction at 21:20, confirmed-lineup update ~22:20"
+        in text
+    )  # PL: early KO-70, late KO-10
+    assert (
+        "KO 20:00 · 🔮 prediction at 19:05, confirmed-lineup update ~19:50"
+        in text
+    )  # SA: early KO-55, late KO-10
     assert "Man City (H) v Arsenal (A)" in text
     assert "Inter (H) v Milan (A)" in text
     # NO probability / edge / xG leakage.
@@ -472,6 +497,92 @@ async def test_prematch_alert_no_lineup_sends_baseline_caveat(db, tmp_path):
     assert "Model:" in sent[0]  # baseline prediction still delivered
 
 
+async def test_prematch_alert_with_production_rescore_closure_shape(db, tmp_path):
+    """Regression for the live 'score_fixture_adjusted() takes 2 positional
+    arguments but 3 were given' TypeError.
+
+    send_prediction_alert calls rescore_fn(fixture_id, home_adj, away_adj), but
+    score_fixture_adjusted's REAL signature is
+    (settings, fixture_id, *, home_rating_adj, away_rating_adj). The production
+    wiring must be a closure adapting that shape. Here we build the SAME closure
+    main.py uses over the REAL score_fixture_adjusted (with football-data stubbed
+    to avoid network) and assert the alert re-scores fresh — no TypeError.
+    """
+    import betbot.main as main_mod
+
+    s = _tg_settings(tmp_path)
+    sent: list[str] = []
+
+    async def ok_send(settings, chat_id, text):
+        sent.append(text)
+        return True
+
+    # Capture the (fid, home_adj, away_adj) the closure is invoked with, proving
+    # the arity send_prediction_alert uses maps onto score_fixture_adjusted's
+    # keyword-only home_rating_adj/away_rating_adj.
+    seen: dict = {}
+
+    async def fake_score_fixture_adjusted(
+        settings, fixture_id, *, home_rating_adj=0.0, away_rating_adj=0.0
+    ):
+        seen["fid"] = fixture_id
+        seen["home"] = home_rating_adj
+        seen["away"] = away_rating_adj
+        return _Pred(fixture_id=fixture_id, p_home=0.55, p_draw=0.25, p_away=0.20), \
+            datetime(2026, 8, 1, 19, 30, tzinfo=timezone.utc)
+
+    # Build the closure EXACTLY as main.py does, over the (stubbed) real fn.
+    async def _rescore(fid, home_adj, away_adj):
+        return await fake_score_fixture_adjusted(
+            s, fid, home_rating_adj=home_adj, away_rating_adj=away_adj
+        )
+
+    calls = {"n": 0}
+
+    def prediction_fn(fid):
+        calls["n"] += 1
+        # baseline (stale) then fresh after upsert.
+        return _Pred(fixture_id=fid, p_home=0.87, p_draw=0.08, p_away=0.05) \
+            if calls["n"] == 1 \
+            else _Pred(fixture_id=fid, p_home=0.55, p_draw=0.25, p_away=0.20)
+
+    delivered = await send_prediction_alert(
+        s, 501, send_fn=ok_send,
+        prediction_fn=prediction_fn,
+        lineup_fn=_lineup_fn_stub(home_adj=40.0, away_adj=-15.0),
+        rescore_fn=_rescore,
+        entitlement_fn=lambda u, se, now=None: _ent("operator"),
+        users_fn=lambda: [_User(111)],
+    )
+    assert delivered == 1
+    # The closure was invoked with the alert's positional shape and forwarded
+    # them to the keyword-only adjustment params — no TypeError raised.
+    assert seen == {"fid": 501, "home": 40.0, "away": -15.0}
+    assert "H 55%" in sent[0]  # FRESH re-scored values shipped
+    # And the REAL production fn is imported + wired as a closure, not bare.
+    assert callable(main_mod.score_fixture_adjusted)
+
+
+def test_main_wires_rescore_as_closure_not_bare_function():
+    """Static guard: main.py must NOT pass the bare score_fixture_adjusted as
+    rescore_fn (its signature mismatches). It must build an adapting closure.
+    """
+    import inspect
+
+    import betbot.main as main_mod
+
+    src = inspect.getsource(main_mod)
+    # The bare-function wiring that caused the production TypeError must be gone.
+    assert "rescore_fn=score_fixture_adjusted" not in src
+    # A closure that forwards to the keyword-only params must be present.
+    assert "home_rating_adj=" in src and "away_rating_adj=" in src
+
+    # score_fixture_adjusted keeps its keyword-only adjustment signature.
+    sig = inspect.signature(main_mod.score_fixture_adjusted)
+    assert sig.parameters["home_rating_adj"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert sig.parameters["away_rating_adj"].kind is inspect.Parameter.KEYWORD_ONLY
+
+
 async def test_send_prediction_alert_no_prediction_is_noop(tmp_path):
     s = _tg_settings(tmp_path)
     delivered = await send_prediction_alert(
@@ -501,13 +612,98 @@ async def _noop() -> None:  # pragma: no cover — never fired in tests
 def test_matchday_cron_registered_with_nairobi_timezone(settings):
     sched = FakeScheduler()
     register_daily_jobs(sched, settings, matchday_notice=_noop)
-    assert set(sched.jobs) == {"matchday_notice"}
+    assert set(sched.jobs) == {"matchday_notice", "player_minutes_backfill"}
     trig = sched.jobs["matchday_notice"]
     assert isinstance(trig, CronTrigger)
     assert str(trig.timezone) == "Africa/Nairobi"
     fields = {f.name: str(f) for f in trig.fields}
     assert fields["hour"] == "8"  # default matchday_alert_hour
     assert fields["minute"] == "0"
+
+
+def test_player_minutes_backfill_registered_daily_utc(settings):
+    sched = FakeScheduler()
+    register_daily_jobs(sched, settings, matchday_notice=_noop)
+    trig = sched.jobs["player_minutes_backfill"]
+    assert isinstance(trig, CronTrigger)
+    assert str(trig.timezone) in ("UTC", "utc")
+    fields = {f.name: str(f) for f in trig.fields}
+    assert fields["hour"] == "5"
+    assert fields["minute"] == "15"
+
+
+def test_pick_league_to_backfill_selects_missing_skips_populated(tmp_path):
+    # Only PD_2024 populated (mirrors the live cache): picker must skip PL? No —
+    # PL comes first and is missing, so it is chosen; a dir where all are
+    # populated returns None.
+    from betbot.daily_jobs import pick_league_to_backfill
+
+    # Fake cache dir: PD populated, others absent.
+    (tmp_path / "PD_2024.json").write_text('{"111": {"x": 90}}', encoding="utf-8")
+    picked = pick_league_to_backfill(2024, minutes_dir=tmp_path)
+    assert picked == "PL"  # first missing domestic league
+
+    # Empty (2-byte "{}") counts as unpopulated and is still picked.
+    (tmp_path / "PL_2024.json").write_text("{}", encoding="utf-8")
+    assert pick_league_to_backfill(2024, minutes_dir=tmp_path) == "PL"
+
+    # Populate every domestic league -> no-op (None).
+    for code in ("PL", "PD", "BL1", "SA", "FL1"):
+        (tmp_path / f"{code}_2024.json").write_text(
+            '{"1": {"p": 90}}', encoding="utf-8"
+        )
+    assert pick_league_to_backfill(2024, minutes_dir=tmp_path) is None
+
+
+def test_prior_minutes_season_is_two_back(settings):
+    from betbot.daily_jobs import prior_minutes_season
+
+    assert prior_minutes_season(settings) == settings.api_football_season - 2
+
+
+# ----------------------------------------------------------------------
+# Two-alert scheduler plan — TWO jobs per fixture at the right leads
+# ----------------------------------------------------------------------
+def test_plan_schedules_two_jobs_per_fixture_at_right_leads():
+    from betbot.main import plan_kickoff_alert_jobs
+
+    s = _tg_settings_stub()
+    now = datetime(2026, 8, 1, 6, 0, tzinfo=timezone.utc)  # well before both KOs
+    pl = _Pred(fixture_id=10, competition_code="PL",
+               kickoff=datetime(2026, 8, 1, 19, 30, tzinfo=timezone.utc))
+    pd = _Pred(fixture_id=20, competition_code="PD",  # La Liga
+               kickoff=datetime(2026, 8, 1, 17, 0, tzinfo=timezone.utc))
+    plan = dict(plan_kickoff_alert_jobs(s, [pl, pd], now))
+
+    # TWO jobs per fixture.
+    assert set(plan) == {
+        "predict_early_10", "predict_late_10",
+        "predict_early_20", "predict_late_20",
+    }
+    # PL: early = KO-70 = 18:20, late = KO-10 = 19:20 UTC.
+    assert plan["predict_early_10"] == datetime(2026, 8, 1, 18, 20, tzinfo=timezone.utc)
+    assert plan["predict_late_10"] == datetime(2026, 8, 1, 19, 20, tzinfo=timezone.utc)
+    # La Liga: early = KO-55 = 16:05, late = KO-10 = 16:50 UTC.
+    assert plan["predict_early_20"] == datetime(2026, 8, 1, 16, 5, tzinfo=timezone.utc)
+    assert plan["predict_late_20"] == datetime(2026, 8, 1, 16, 50, tzinfo=timezone.utc)
+
+
+def test_plan_skips_jobs_whose_fire_time_is_past():
+    from betbot.main import plan_kickoff_alert_jobs
+
+    s = _tg_settings_stub()
+    # KO 19:30; now = 19:25 -> early (18:20) is past & dropped, late (19:20) is
+    # ALSO past & dropped. Push now to 18:30: early past (dropped), late future.
+    pl = _Pred(fixture_id=10, competition_code="PL",
+               kickoff=datetime(2026, 8, 1, 19, 30, tzinfo=timezone.utc))
+
+    now_after_early = datetime(2026, 8, 1, 18, 30, tzinfo=timezone.utc)
+    plan = dict(plan_kickoff_alert_jobs(s, [pl], now_after_early))
+    assert set(plan) == {"predict_late_10"}  # early skipped, late kept
+
+    now_after_both = datetime(2026, 8, 1, 19, 25, tzinfo=timezone.utc)
+    plan2 = dict(plan_kickoff_alert_jobs(s, [pl], now_after_both))
+    assert plan2 == {}  # both fire times already past
 
 
 # ----------------------------------------------------------------------
@@ -633,6 +829,70 @@ async def test_repeat_prematch_same_fixture_charges_once(db, tmp_path):
         entitlement_fn=ent, users_fn=lambda: [u],
     )
     assert get_user(u.telegram_user_id).predictions_consumed == 1
+
+
+async def test_two_alerts_charge_once_late_shows_adjusted(db, tmp_path):
+    """The two-alert model money invariant. A payer with 1 credit gets:
+      early alert — NO lineup out -> fresh MODEL prediction, CHARGED once;
+      late alert  — lineup out -> confirmed XI + lineup-ADJUSTED prediction,
+                    already-revealed -> FREE (no second charge).
+    The SECOND (late) message must carry the fresh lineup-adjusted content.
+    """
+    u = _paying_user(tmp_path, tid=790)
+    s = _tg_settings(tmp_path)
+    sent: list[str] = []
+
+    async def ok_send(settings, chat_id, text):
+        sent.append(text)
+        return True
+
+    ent = lambda usr, se, now=None: _ent("credit", credits=1)  # noqa: E731
+
+    # EARLY: XI not yet posted -> model note, adj (0.0, 0.0).
+    async def early_no_lineup(baseline):
+        return None, 0.0, 0.0, None
+
+    early_pred = _Pred(fixture_id=88, p_home=0.50, p_draw=0.23, p_away=0.27)
+
+    async def early_rescore(fixture_id, home_adj, away_adj):
+        assert (home_adj, away_adj) == (0.0, 0.0)
+        return early_pred, datetime(2026, 8, 1, 19, 30, tzinfo=timezone.utc)
+
+    delivered_early = await send_prediction_alert(
+        s, 88, send_fn=ok_send,
+        prediction_fn=lambda fid: early_pred,
+        lineup_fn=early_no_lineup,
+        rescore_fn=early_rescore,
+        entitlement_fn=ent, users_fn=lambda: [u],
+    )
+    assert delivered_early == 1
+    assert get_user(790).predictions_consumed == 1  # charged on the EARLY alert
+    assert has_revealed(790, 88) is True
+    assert "lineup not yet confirmed" in sent[0]  # early = model note
+    assert "H 50%" in sent[0]
+
+    # LATE: XI now posted -> lineup-adjusted re-score (home +40) shifts the prob.
+    late_pred = _Pred(fixture_id=88, p_home=0.62, p_draw=0.20, p_away=0.18)
+
+    async def late_rescore(fixture_id, home_adj, away_adj):
+        assert home_adj == 40.0  # the lineup adjustment reached the re-score
+        return late_pred, datetime(2026, 8, 1, 19, 30, tzinfo=timezone.utc)
+
+    delivered_late = await send_prediction_alert(
+        s, 88, send_fn=ok_send,
+        prediction_fn=lambda fid: late_pred,
+        lineup_fn=_lineup_fn_stub(home_adj=40.0, away_adj=0.0),
+        rescore_fn=late_rescore,
+        entitlement_fn=ent, users_fn=lambda: [u],
+    )
+    assert delivered_late == 1
+    # CHARGED ONCE across BOTH alerts — the late alert is free.
+    assert get_user(790).predictions_consumed == 1
+    # The SECOND (late) message carries the confirmed XI + ADJUSTED prediction.
+    late_body = sent[1]
+    assert "Ederson" in late_body and "Saka" in late_body  # confirmed XI shown
+    assert "H 62%" in late_body  # lineup-adjusted probs
+    assert "lineup not yet confirmed" not in late_body  # XI IS confirmed now
 
 
 def test_operator_trial_reveals_recorded_but_never_charged(db, tmp_path):

@@ -5,12 +5,18 @@ alert must not carry a prediction — only a heads-up. So:
 
 * **morning heads-up** (``run_matchday_notice``) — one FREE, ungated broadcast
   listing today's fixtures: ``Home (H) v Away (A) — KO HH:MM · 🔮 prediction at
-  HH:MM``. NO probabilities, NO entitlement, NO credit charge. The stated
-  prediction time is ``kickoff - lineup_alert_lead_minutes(competition)``. Fires
-  on the **Africa/Nairobi wall clock** at ``BETBOT_MATCHDAY_ALERT_HOUR``.
-* **pre-match lineup-adjusted prediction** (``send_prediction_alert``) — the
-  PAID product, fired per-fixture at ``kickoff - lead(competition)`` (once the
-  confirmed XI is out) by :mod:`betbot.main`'s one-off DateTrigger jobs. It
+  HH:MM, confirmed-lineup update ~HH:MM``. NO probabilities, NO entitlement, NO
+  credit charge. The stated early time is
+  ``kickoff - early_alert_lead_minutes(competition)`` and the confirmed-lineup
+  time is ``kickoff - lineup_confirm_lead_minutes()``. Fires on the
+  **Africa/Nairobi wall clock** at ``BETBOT_MATCHDAY_ALERT_HOUR``.
+* **pre-match prediction alerts** (``send_prediction_alert``) — the PAID
+  product, fired per-fixture TWICE by :mod:`betbot.main`'s one-off DateTrigger
+  jobs (the two-alert model): an EARLY model prediction at
+  ``kickoff - early_alert_lead(competition)`` (XI not yet posted -> model note)
+  and a LATE confirmed-XI update at ``kickoff - lineup_confirm_lead()`` (XI now
+  out). Both hit the SAME function; the reveal ledger charges the fixture EXACTLY
+  ONCE (early charges, late re-shows free with the updated lineup content). It
   fetches the confirmed lineup, RE-SCORES the fixture lineup-adjusted (R4a), and
   delivers the XI + adjusted prediction — ENTITLEMENT-GATED through the existing
   reveal ledger (operator/trial free; payers spend 1 credit; locked users get a
@@ -189,11 +195,14 @@ def commit_reveals(user, reveals: list[tuple[int, bool]]) -> None:
 def render_matchday_notice(settings, fixtures, day) -> str | None:
     """Build the FREE morning heads-up body, or ``None`` when there are none.
 
-    One line per fixture: ``*Home (H) v Away (A)* — KO HH:MM · 🔮 prediction at
-    HH:MM``. Times are the **Africa/Nairobi wall clock** (EAT). The prediction
-    time is ``kickoff - lineup_alert_lead_minutes(competition)`` — the SAME lead
-    the scheduler uses to fire the pre-match alert, so the stated time is the
-    real one. Deliberately carries NO probabilities/edge/xG: the prediction can
+    One line per fixture, stating BOTH pre-match alert times (the two-alert
+    model): ``*Home (H) v Away (A)* — KO HH:MM · 🔮 prediction at HH:MM,
+    confirmed-lineup update ~HH:MM``. Times are the **Africa/Nairobi wall
+    clock** (EAT). The early prediction time is
+    ``kickoff - early_alert_lead_minutes(competition)`` and the confirmed-lineup
+    time is ``kickoff - lineup_confirm_lead_minutes()`` — the SAME leads the
+    scheduler uses to fire the two alerts, so the stated times are the real
+    ones. Deliberately carries NO probabilities/edge/xG: the prediction can
     still change once the confirmed XI is out.
     """
     if not fixtures:
@@ -204,20 +213,20 @@ def render_matchday_notice(settings, fixtures, day) -> str | None:
         ko = f.kickoff
         if ko.tzinfo is None:
             ko = ko.replace(tzinfo=timezone.utc)
-        lead = settings.lineup_alert_lead_minutes(
-            getattr(f, "competition_code", None)
-        )
-        pred_at = ko - timedelta(minutes=lead)
+        code = getattr(f, "competition_code", None)
+        early_lead = settings.early_alert_lead_minutes(code)
+        late_lead = settings.lineup_confirm_lead_minutes()
         ko_local = ko.astimezone(tz)
-        pred_local = pred_at.astimezone(tz)
+        early_local = (ko - timedelta(minutes=early_lead)).astimezone(tz)
+        late_local = (ko - timedelta(minutes=late_lead)).astimezone(tz)
         lines.append(
             f"*{f.home_team} (H) v {f.away_team} (A)* — "
-            f"KO {ko_local:%H:%M} · 🔮 prediction at {pred_local:%H:%M} "
-            f"(once the lineup is confirmed)"
+            f"KO {ko_local:%H:%M} · 🔮 prediction at {early_local:%H:%M}, "
+            f"confirmed-lineup update ~{late_local:%H:%M}"
         )
     lines.append("")
-    lines.append("_Times EAT. Predictions are sent per match once the "
-                 "confirmed XI is out._")
+    lines.append("_Times EAT. An early model prediction is sent per match, then "
+                 "a confirmed-XI update once the lineup is out._")
     return "\n".join(lines)
 
 
@@ -395,7 +404,10 @@ async def send_prediction_alert(
             adj_note=adj_note, absences=absences,
             entitlement_fn=entitlement_fn,
         )
-        body = f"*⏰ Pre-match — confirmed lineup*\n\n{text}"
+        # Honest header: the EARLY alert fires before the XI is posted, so
+        # only claim "confirmed lineup" when one is actually attached.
+        label = "confirmed lineup" if lineup else "model prediction"
+        body = f"*⏰ Pre-match — {label}*\n\n{text}"
         try:
             if await send(settings, user.telegram_user_id, body):
                 sent += 1
@@ -427,15 +439,19 @@ def _default_lineup_fn(settings):
             code = baseline.competition_code
             ko = baseline.kickoff
             ko_date = (ko.date().isoformat() if ko is not None else "")
-            af_id = await svc.resolve_fixture_id(
+            match_id = await svc.resolve_match_id(
                 code, baseline.home_team, baseline.away_team, ko_date
             )
-            if af_id is None:
+            if match_id is None:
                 return None, 0.0, 0.0, None
-            lineup = await svc._client.get_lineups(af_id)
+            # One /lineups call, reused for both the display XI and the adj.
+            lineup = await svc.get_confirmed_xi(
+                code, baseline.home_team, baseline.away_team, ko_date,
+                match_id=match_id,
+            )
             home_adj, away_adj = await svc.adjustments_for_fixture(
                 code, baseline.home_team, baseline.away_team, ko_date,
-                af_fixture_id=af_id,
+                match_id=match_id, lineups=lineup,
             )
             absences = _absence_summary(lineup, home_adj, away_adj)
             return lineup, home_adj, away_adj, absences
@@ -466,6 +482,92 @@ def _absence_summary(lineup, home_adj: float, away_adj: float) -> str | None:
 # ----------------------------------------------------------------------
 # Scheduling
 # ----------------------------------------------------------------------
+# --- Prior-season player-minutes backfill (budget-paced, one league / day) ----
+#
+# Only the currently-fetched PRIOR season (the newest api-football FREE-tier
+# season, 2024) carries usable minutes; the current season (2026) is empty at
+# season start. Fetching all five domestic leagues at once would blow the
+# 100 req/day free budget, so instead a DAILY tick fills exactly ONE missing
+# domestic league's ``<CODE>_<PRIOR>.json`` per run — all four fill within ~4
+# days, each run well under the cap. Once every league is populated it no-ops.
+#
+# Prior season = api_football_season - 2 (2026 -> 2024): the immediate prior
+# (2025) is unavailable on the free tier, matching lineup_service's fallback.
+_PRIOR_SEASON_OFFSET = 2
+# Domestic top-5 only; CL squads overlap these leagues and its own minutes are
+# tiny, so it is excluded from the backfill (mirrors fetch_player_minutes' CL skip).
+_BACKFILL_LEAGUES = ("PL", "PD", "BL1", "SA", "FL1")
+# A cache file this small (``{}`` == 2 bytes, or absent) counts as unpopulated.
+_EMPTY_CACHE_MAX_BYTES = 2
+
+
+def prior_minutes_season(settings) -> int:
+    """The completed season we backfill player-minutes for (free tier: 2024)."""
+    return settings.api_football_season - _PRIOR_SEASON_OFFSET
+
+
+def pick_league_to_backfill(
+    season: int, *, minutes_dir=None, leagues: Sequence[str] = _BACKFILL_LEAGUES
+) -> str | None:
+    """Return the FIRST domestic league whose ``<CODE>_<season>.json`` cache is
+    missing or empty (<= 2 bytes), else ``None`` (all populated).
+
+    Pure/offline: only stats the filesystem, no network. Used by the daily tick
+    to pick a single league to fetch, and unit-tested against a temp dir.
+    """
+    from betbot.data.lineup_service import PLAYER_MINUTES_DIR
+
+    base = minutes_dir if minutes_dir is not None else PLAYER_MINUTES_DIR
+    for code in leagues:
+        path = base / f"{code.upper()}_{season}.json"
+        try:
+            populated = path.exists() and path.stat().st_size > _EMPTY_CACHE_MAX_BYTES
+        except OSError:
+            populated = False
+        if not populated:
+            return code.upper()
+    return None
+
+
+async def backfill_one_league_minutes_tick(settings, *, repo_root=None) -> None:
+    """Daily: fetch ONE missing prior-season domestic league's player minutes.
+
+    Budget-paced — one league per run keeps each day well under the 100 req/day
+    api-football free cap; the four domestic leagues self-complete over ~4 days.
+    No-ops once every league is populated. Runs ``fetch_player_minutes.py`` in a
+    subprocess (isolation) and is best-effort: any failure is logged, never
+    raised, so a bad fetch can't crash the daemon.
+    """
+    import asyncio
+    import subprocess
+    from pathlib import Path
+
+    season = prior_minutes_season(settings)
+    code = pick_league_to_backfill(season)
+    if code is None:
+        log.info("player_minutes_backfill_complete", season=season)
+        return
+
+    root = Path(repo_root) if repo_root is not None else Path(__file__).resolve().parents[2]
+
+    def _run() -> None:
+        args = [
+            ".venv/bin/python", "scripts/fetch_player_minutes.py",
+            "--league", code, "--season", str(season),
+        ]
+        subprocess.run(
+            args, cwd=str(root), timeout=1800, check=True, capture_output=True,
+        )
+
+    try:
+        await asyncio.to_thread(_run)
+        log.info("player_minutes_backfilled", code=code, season=season)
+    except Exception as exc:  # noqa: BLE001 — never crash the daemon
+        log.warning(
+            "player_minutes_backfill_failed", code=code, season=season, error=str(exc)
+        )
+
+
 def register_daily_jobs(scheduler, settings, *, matchday_notice) -> None:
     """Register the Nairobi-local morning heads-up cron on the daemon's scheduler.
 
@@ -478,6 +580,14 @@ def register_daily_jobs(scheduler, settings, *, matchday_notice) -> None:
             hour=settings.matchday_alert_hour, minute=0, timezone=REPORT_TZ
         ),
         id="matchday_notice",
+    )
+    # Daily 05:15 UTC (before the 05:xx alert reschedule / scoring): fill ONE
+    # missing prior-season domestic league's player-minutes cache. Budget-paced;
+    # no-ops once all four are populated. Self-contained + best-effort.
+    scheduler.add_job(
+        lambda: backfill_one_league_minutes_tick(settings),
+        trigger=CronTrigger.from_crontab("15 5 * * *", timezone=timezone.utc),
+        id="player_minutes_backfill",
     )
 
 
