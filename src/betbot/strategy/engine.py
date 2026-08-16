@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from betbot.data.models import FixtureForm, MatchOutcome
 from betbot.logging import get_logger
+from betbot.data.form import recency_weight_sum
 from betbot.strategy.probabilities import edge, softmax
 
 if TYPE_CHECKING:
@@ -83,8 +84,16 @@ class StrategyEngine:
         the softmax yields a sane near-uniform prior (home nudged by
         home_advantage) rather than H0/D0/A100 garbage.
         """
-        n = max(getattr(form, "matches_considered", 0), 1)
-        return form.weighted_points / n
+        n = getattr(form, "matches_considered", 0)
+        if n <= 0:
+            return 0.0
+        pg = form.weighted_points / recency_weight_sum(n)
+        # Hard-bound to the true points-per-game scale. weighted_points folds in
+        # an opponent-strength factor of up to 1.5x, so the normalised value can
+        # still exceed 3.0 (max 4.5); left unclamped that re-opens sub-1% tails
+        # (H95/D4/A<1) the whole per-game fix exists to prevent. Clamping caps
+        # the softmax spread at 3.0 + home_advantage => min outcome prob ~3%.
+        return min(max(pg, 0.0), 3.0)
 
     def predict(self, fixture_form: FixtureForm) -> Prediction:
         s = self._settings

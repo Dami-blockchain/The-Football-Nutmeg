@@ -45,9 +45,11 @@ AF_LEAGUE_IDS: dict[str, int] = {
 
 # A team whose current-season minutes total falls below this is treated as
 # "not enough data yet" (season just started) -> fall back to the prior season.
-# ~900 min ≈ 10 full player-games; below that the current season is too thin to
-# rank expected regulars, so the prior completed season's minutes are used.
-_MIN_SEASON_MINUTES = 900
+# One team match produces ~990 player-minutes (11 starters x 90), so a threshold
+# in the hundreds would flip to current-season data after a SINGLE match — far
+# too thin to rank expected regulars. 4500 ≈ 5 team matches (mirroring the
+# last-5 form window); below that the prior completed season's minutes win.
+_MIN_SEASON_MINUTES = 4500
 
 # How many prior seasons to walk back looking for a populated minutes cache. The
 # free api-football tier only serves ~2022-2024, so with a 2026 current season

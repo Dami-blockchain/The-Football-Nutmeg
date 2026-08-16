@@ -91,6 +91,36 @@ def test_strong_home_weak_away_favours_home_but_others_alive():
     assert p.p_draw > 0.03, p.p_draw
 
 
+def test_single_match_form_uses_recency_normaliser_not_match_count():
+    # REAL FormService scale: one win = 1.5 (recency weight) * 3 pts = 4.5
+    # weighted_points with matches_considered=1. Dividing by the match count
+    # (the original hotfix) yields 4.5 "per game" -> H95/D4/A<1 on ONE match of
+    # evidence. Normalised by the weight sum it is 3.0 pg, and the away/draw
+    # tails must stay above ~3%.
+    s = get_settings()
+    p = StrategyEngine(s).predict(
+        _ff(home_pts=4.5, away_pts=0.0, home_n=1, away_n=1)
+    )
+    _probs_sane(p)
+    assert p.p_away >= 0.03, p.p_away
+    assert p.p_draw >= 0.05, p.p_draw
+    assert p.p_home <= 0.90, p.p_home
+
+
+def test_opponent_factor_inflated_form_is_clamped_to_points_scale():
+    # weighted_points folds in an opponent-strength factor up to 1.5x: a 5-win
+    # streak vs top sides can reach 5.8 * 3 * 1.5 = 26.1 summed. The per-game
+    # value must clamp to 3.0 so the softmax spread stays bounded and no outcome
+    # collapses below ~3%.
+    s = get_settings()
+    p = StrategyEngine(s).predict(
+        _ff(home_pts=26.1, away_pts=3.0, home_n=5, away_n=5)
+    )
+    _probs_sane(p)
+    assert p.p_away >= 0.03, p.p_away
+    assert p.p_draw >= 0.05, p.p_draw
+
+
 def test_club_engine_unrated_fallback_not_degenerate():
     # The Racing-Santander case: away side has default RD (no rating history),
     # so the club engine defers to the naive engine. Must NOT be 0/0/100.
