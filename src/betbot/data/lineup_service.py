@@ -149,7 +149,12 @@ class LineupService:
         if cached is not None:
             return cached
         matches = await self._highlightly.list_matches(league_name, date)
-        self._matches_cache[key] = matches
+        # Never cache an EMPTY list: list_matches returns [] on transient API
+        # errors too, and this service is now a process-wide singleton — a
+        # poisoned (league, date) entry would kill lineups for every later
+        # alert that day (including the confirmed-XI update). Retry next call.
+        if matches:
+            self._matches_cache[key] = matches
         return matches
 
     async def resolve_match_id(
@@ -196,7 +201,11 @@ class LineupService:
                 date=kickoff_date,
                 candidates=len(candidates),
             )
-        self._fixture_cache[key] = found
+        # Cache a NEGATIVE resolution only when the day's list actually had
+        # candidates (a real alias miss is stable); an empty/errored list must
+        # stay retryable — the singleton would otherwise pin None for good.
+        if found is not None or candidates:
+            self._fixture_cache[key] = found
         return found
 
     # Back-compat alias: callers (daily_jobs closure) used ``resolve_fixture_id``.

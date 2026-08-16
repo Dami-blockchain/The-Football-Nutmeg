@@ -19,13 +19,16 @@ from betbot.storage.models import PredictionOutcome
 from betbot.storage.repos import (
     get_rating,
     prediction_outcomes_since,
+    rating_exists,
     record_reveal,
     score_prediction,
     track_record,
     upsert_prediction,
+    upsert_rating,
 )
 from betbot.settlement import SettlementWatcher
 from betbot.strategy.engine import Prediction
+from betbot.strategy.glicko import Glicko2Rating
 
 NOW = datetime(2026, 6, 8, 12, 0, tzinfo=timezone.utc)
 
@@ -119,6 +122,10 @@ async def test_settlement_scores_without_a_bet(db, settings):
 async def test_home_win_nudges_ratings_and_is_idempotent(db, settings):
     past = NOW - timedelta(minutes=200)
     _seed_pred(303, "PL", "HomeFC", "AwayFC", 0.5, 0.3, 0.2, past)
+    # Both teams must have REAL rating rows (the weekly re-seed creates them);
+    # settlement only NUDGES existing ratings, never fabricates new ones.
+    upsert_rating("HomeFC", Glicko2Rating(1520.0, 80.0, 0.06, "2026-06-01"))
+    upsert_rating("AwayFC", Glicko2Rating(1480.0, 80.0, 0.06, "2026-06-01"))
     before_home = get_rating("HomeFC").rating
     before_away = get_rating("AwayFC").rating
 
@@ -136,6 +143,70 @@ async def test_home_win_nudges_ratings_and_is_idempotent(db, settings):
     await w.settle_due(now=NOW + timedelta(minutes=1))
     assert get_rating("HomeFC").rating == pytest.approx(after_home)
     assert get_rating("AwayFC").rating == pytest.approx(after_away)
+
+
+async def test_unknown_team_scores_but_never_fabricates_a_rating(db, settings):
+    # A just-promoted club with NO seeded rating: the outcome must be scored,
+    # but NO rating row may be created — a fabricated near-default row would
+    # defeat the club engine's unknown-team fallback to the form engine.
+    past = NOW - timedelta(minutes=200)
+    _seed_pred(313, "PL", "PromotedFC", "AwayFC", 0.5, 0.3, 0.2, past)
+    upsert_rating("AwayFC", Glicko2Rating(1480.0, 80.0, 0.06, "2026-06-01"))
+    away_before = get_rating("AwayFC").rating
+
+    w = SettlementWatcher(FakeFD({313: _finished("HOME_TEAM", 1, 0)}), settings)
+    await w.settle_due(now=NOW)
+
+    assert len(prediction_outcomes_since(365)) == 1  # still scored
+    assert not rating_exists("PromotedFC")  # no junk row
+    assert get_rating("AwayFC").rating == pytest.approx(away_before)  # untouched
+
+
+async def test_stale_backfill_is_silent_and_never_nudges_ratings(db, settings):
+    # A fixture that finished LONG ago (e.g. rows predating the outcome loop):
+    # scored into the ledger pre-notified (no result-alert blast on deploy) and
+    # ratings are NOT nudged (already inside the weekly re-seed's history).
+    from betbot import daily_jobs
+
+    old = NOW - timedelta(days=10)
+    _seed_pred(323, "PL", "HomeFC", "AwayFC", 0.6, 0.25, 0.15, old)
+    upsert_rating("HomeFC", Glicko2Rating(1520.0, 80.0, 0.06, "2026-06-01"))
+    upsert_rating("AwayFC", Glicko2Rating(1480.0, 80.0, 0.06, "2026-06-01"))
+    before = (get_rating("HomeFC").rating, get_rating("AwayFC").rating)
+
+    w = SettlementWatcher(FakeFD({323: _finished("HOME_TEAM", 2, 0)}), settings)
+    await w.settle_due(now=NOW)
+
+    rows = prediction_outcomes_since(365)
+    assert len(rows) == 1
+    assert rows[0].result_notified is True  # pre-notified: no alert ever
+    assert (get_rating("HomeFC").rating, get_rating("AwayFC").rating) == before
+
+    # And the result-alert job must find nothing to send.
+    object.__setattr__(settings, "telegram_allowed_user_id", 999)
+
+    async def _boom_send(s, chat_id, text):
+        raise AssertionError("stale backfill must not broadcast result alerts")
+
+    n = await daily_jobs.run_result_alerts(
+        settings, send_fn=_boom_send, users_fn=lambda: []
+    )
+    assert n == 0
+
+
+async def test_ancient_predictions_outside_lookback_are_ignored(db, settings):
+    # Kickoff beyond the 30-day lookback: never fetched, never scored — a first
+    # deploy must not replay months of history through the API.
+    ancient = NOW - timedelta(days=40)
+    _seed_pred(333, "WC", "OldA", "OldB", 0.4, 0.3, 0.3, ancient)
+
+    class ExplodingFD:
+        async def get_match(self, fixture_id):
+            raise AssertionError("ancient fixture must not be fetched")
+
+    w = SettlementWatcher(ExplodingFD(), settings)
+    await w.settle_due(now=NOW)
+    assert prediction_outcomes_since(365) == []
 
 
 # ----------------------------------------------------------------------
@@ -310,3 +381,40 @@ async def test_shared_lineup_service_one_matches_per_league_day(monkeypatch):
     # Clean up the module singleton so it can't leak into other tests.
     daily_jobs._LINEUP_SERVICE = None
     daily_jobs._LINEUP_SERVICE_SETTINGS = None
+
+
+async def test_lineup_service_does_not_cache_empty_day_list():
+    # list_matches returns [] on transient API errors; with the process-wide
+    # singleton an empty result must NOT be cached, or one failed fetch would
+    # poison every later alert that league-day (incl. the confirmed-XI update).
+    from betbot.config import Settings
+    from betbot.data.lineup_service import LineupService
+
+    s = Settings(
+        _env_file=None, FOOTBALL_DATA_API_KEY="x",
+        HIGHLIGHTLY_API_KEY="hl", API_FOOTBALL_KEY="af", BETBOT_AF_SEASON=2026,
+    )
+
+    class FlakyHighlightly:
+        def __init__(self):
+            self.calls = 0
+
+        async def list_matches(self, league_name, date):
+            self.calls += 1
+            if self.calls == 1:
+                return []  # transient failure shape
+            return [{"match_id": 7, "home_name": "A", "away_name": "B"}]
+
+        async def close(self):
+            pass
+
+    hl = FlakyHighlightly()
+    svc = LineupService(s, client=_FakeAf(), highlightly=hl)
+
+    assert await svc._day_matches("La Liga", "2026-08-16") == []
+    # Second call must RETRY (not serve the poisoned empty cache)…
+    assert len(await svc._day_matches("La Liga", "2026-08-16")) == 1
+    assert hl.calls == 2
+    # …and the good result IS cached.
+    assert len(await svc._day_matches("La Liga", "2026-08-16")) == 1
+    assert hl.calls == 2

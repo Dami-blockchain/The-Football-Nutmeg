@@ -257,12 +257,17 @@ def record_prediction_outcome(
     home_goals: int,
     away_goals: int,
     settled_at: datetime,
+    result_notified: bool = False,
 ) -> bool:
     """INSERT-OR-IGNORE one scored prediction. Returns True iff NEWLY inserted.
 
     The unique constraint on ``fixture_id`` makes this idempotent: a re-run of
     settlement over the same finished fixture returns False and writes nothing,
     which is what gates the one-shot per-match rating update + result alert.
+
+    ``result_notified=True`` records the row PRE-notified — used for STALE
+    backfill (fixtures that finished long ago), which must enter the accuracy
+    ledger without ever triggering an end-of-match RESULT ALERT.
     """
     pick, correct, brier, rps, log_loss = score_prediction(
         p_home, p_draw, p_away, actual_outcome
@@ -284,6 +289,7 @@ def record_prediction_outcome(
                     log_loss=log_loss,
                     home_goals=int(home_goals),
                     away_goals=int(away_goals),
+                    result_notified=result_notified,
                     settled_at=settled_at,
                 )
             )
@@ -371,6 +377,13 @@ def outcomes_pending_result_alert(days: int = 3) -> list[PredictionOutcome]:
         return rows
 
 
+# Outcome scoring only looks back this far. Bounds the every-tick /matches
+# re-fetch of fixtures that never reach a final status (postponed/abandoned)
+# AND stops a first deploy from backfilling months of pre-outcome-loop history
+# (109 fixtures in prod at review time) in one settle run.
+_OUTCOME_LOOKBACK_DAYS = 30
+
+
 def list_unsettled_predictions_due(
     now: datetime, grace_minutes: int
 ) -> list[PredictionRow]:
@@ -379,9 +392,12 @@ def list_unsettled_predictions_due(
 
     Drives outcome scoring for EVERY prediction (not just those carrying a
     paper bet). One row per fixture (latest run_date wins) so a fixture is
-    scored once.
+    scored once. Kickoffs older than ``_OUTCOME_LOOKBACK_DAYS`` are ignored
+    forever (never-final fixtures must not be re-fetched every tick for
+    eternity, and ancient history must not flood a first deploy).
     """
     cutoff = now - timedelta(minutes=grace_minutes)
+    floor = now - timedelta(days=_OUTCOME_LOOKBACK_DAYS)
     with session_scope() as s:
         scored = set(
             s.execute(select(PredictionOutcome.fixture_id)).scalars()
@@ -390,6 +406,7 @@ def list_unsettled_predictions_due(
             s.execute(
                 select(PredictionRow)
                 .where(PredictionRow.kickoff <= cutoff)
+                .where(PredictionRow.kickoff >= floor)
                 .order_by(PredictionRow.kickoff.asc())
             ).scalars()
         )
@@ -568,6 +585,25 @@ def get_rating(
         if row is None:
             return Glicko2Rating(default_rating, default_rd, default_vol)
         return Glicko2Rating(row.rating, row.rd, row.volatility, row.last_period)
+
+
+def rating_exists(team_name: str) -> bool:
+    """True iff a REAL Glicko row exists for this team.
+
+    Settlement's per-match nudge checks this so it never fabricates a
+    near-default rating row for a team the weekly re-seed doesn't know (e.g. a
+    just-promoted club) — such a row would defeat the club engine's
+    unknown-team fallback to the form engine.
+    """
+    with session_scope() as s:
+        return (
+            s.execute(
+                select(GlickoRating.id)
+                .where(GlickoRating.team_name == team_name)
+                .limit(1)
+            ).scalar_one_or_none()
+            is not None
+        )
 
 
 def upsert_rating(team_name: str, rating: Glicko2Rating, *, team_id: int | None = None) -> None:

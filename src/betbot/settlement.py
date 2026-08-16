@@ -16,7 +16,7 @@ equivalent and are excluded from the kill-switch signal.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from betbot.data.football_data import FootballDataClient
 from betbot.logging import get_logger
@@ -25,6 +25,7 @@ from betbot.storage.repos import (
     is_kill_switch_tripped,
     list_unsettled_bets_due,
     list_unsettled_predictions_due,
+    rating_exists,
     record_prediction_outcome,
     record_settlement,
     settled_pnl_window,
@@ -52,6 +53,13 @@ _WINNER_TO_OUTCOME = {
 # per-match updates just keep ratings responsive in between.)
 _RATED_COMPETITIONS = frozenset({"PL", "PD", "BL1", "SA", "FL1", "CL"})
 
+# A fixture that finished more than this long ago is STALE backfill: it is
+# scored into the accuracy ledger silently (pre-marked result_notified, so the
+# result-alert job never blasts old "Full time" messages) and its ratings are
+# NOT nudged — old results are already inside the weekly re-seed's history, so
+# nudging them again would double-count every backfilled match at once.
+_STALE_RESULT_HOURS = 48
+
 
 def _final_goals(match: dict) -> tuple[int, int]:
     """``(home_goals, away_goals)`` from a finished football-data match dict.
@@ -71,13 +79,24 @@ def _final_goals(match: dict) -> tuple[int, int]:
 
 def _update_ratings_for_result(
     competition_code: str, home_team: str, away_team: str, outcome: str, period: str
-) -> None:
+) -> bool:
     """Nudge the two teams' Glicko ratings from one finished result.
 
     Both updates use the opponents' PRE-match ratings (correct Glicko-2
     semantics). Best-effort: any failure is swallowed by the caller so a rating
     error never aborts settlement.
+
+    Skipped entirely unless BOTH teams already have a real rating row: the
+    weekly re-seed is the only writer allowed to CREATE ratings. Nudging a
+    team the re-seed doesn't know (e.g. a just-promoted club) would fabricate
+    a near-default row whose RD immediately drops below the club engine's
+    unknown-team threshold, silently defeating its fallback to the form engine.
     """
+    if not (rating_exists(home_team) and rating_exists(away_team)):
+        log.info(
+            "rating_update_skipped_unknown_team", home=home_team, away=away_team
+        )
+        return False
     home_rating = get_rating(home_team)
     away_rating = get_rating(away_team)
     sh = 1.0 if outcome == "HOME" else (0.5 if outcome == "DRAW" else 0.0)
@@ -90,6 +109,7 @@ def _update_ratings_for_result(
     )
     upsert_rating(home_team, new_home)
     upsert_rating(away_team, new_away)
+    return True
 
 
 def compute_pnl(
@@ -204,17 +224,30 @@ class SettlementWatcher:
             if outcome is None:
                 continue  # final status but winner not populated yet — retry
             hg, ag = _final_goals(match)
-            newly = record_prediction_outcome(
-                fixture_id=pred.fixture_id,
-                competition_code=pred.competition_code,
-                p_home=pred.p_home,
-                p_draw=pred.p_draw,
-                p_away=pred.p_away,
-                actual_outcome=outcome.value,
-                home_goals=hg,
-                away_goals=ag,
-                settled_at=now,
-            )
+            # STALE backfill guard: finished long ago (pre-outcome-loop rows or
+            # a long outage) -> ledger only, pre-notified, no rating nudge.
+            ko = pred.kickoff
+            if ko is not None and ko.tzinfo is None:
+                ko = ko.replace(tzinfo=timezone.utc)
+            stale = ko is None or ko < now - timedelta(hours=_STALE_RESULT_HOURS)
+            try:
+                newly = record_prediction_outcome(
+                    fixture_id=pred.fixture_id,
+                    competition_code=pred.competition_code,
+                    p_home=pred.p_home,
+                    p_draw=pred.p_draw,
+                    p_away=pred.p_away,
+                    actual_outcome=outcome.value,
+                    home_goals=hg,
+                    away_goals=ag,
+                    settled_at=now,
+                    result_notified=stale,
+                )
+            except Exception as e:  # noqa: BLE001 — one bad row mustn't stop the rest
+                log.warning(
+                    "outcome_score_failed", fixture_id=pred.fixture_id, error=str(e)
+                )
+                continue
             if not newly:
                 continue  # already scored — idempotent (no double rating update)
             scored += 1
@@ -226,19 +259,22 @@ class SettlementWatcher:
                 ],
                 result=outcome.value,
             )
+            if stale:
+                continue  # backfill: ledger only — no rating nudge, no alert
             if (pred.competition_code or "").upper() in _RATED_COMPETITIONS:
                 try:
                     period = now.date().isoformat()
-                    _update_ratings_for_result(
+                    updated = _update_ratings_for_result(
                         pred.competition_code, pred.home_team, pred.away_team,
                         outcome.value, period,
                     )
-                    log.info(
-                        "rating_updated",
-                        fixture_id=pred.fixture_id,
-                        home=pred.home_team, away=pred.away_team,
-                        result=outcome.value,
-                    )
+                    if updated:
+                        log.info(
+                            "rating_updated",
+                            fixture_id=pred.fixture_id,
+                            home=pred.home_team, away=pred.away_team,
+                            result=outcome.value,
+                        )
                 except Exception as e:  # noqa: BLE001 — never abort settlement
                     log.warning(
                         "rating_update_failed",
