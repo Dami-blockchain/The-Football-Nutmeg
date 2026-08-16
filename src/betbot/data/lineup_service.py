@@ -43,9 +43,18 @@ AF_LEAGUE_IDS: dict[str, int] = {
     "CL": 2,
 }
 
-# A team whose current-season minutes total falls at/below this is treated as
-# "no real data yet" (season just started) -> fall back to the prior season.
-_MIN_SEASON_MINUTES = 90
+# A team whose current-season minutes total falls below this is treated as
+# "not enough data yet" (season just started) -> fall back to the prior season.
+# One team match produces ~990 player-minutes (11 starters x 90), so a threshold
+# in the hundreds would flip to current-season data after a SINGLE match — far
+# too thin to rank expected regulars. 4500 ≈ 5 team matches (mirroring the
+# last-5 form window); below that the prior completed season's minutes win.
+_MIN_SEASON_MINUTES = 4500
+
+# How many prior seasons to walk back looking for a populated minutes cache. The
+# free api-football tier only serves ~2022-2024, so with a 2026 current season
+# the newest usable prior cache is 2024 (2 seasons back).
+_PRIOR_SEASON_LOOKBACK = 3
 
 PLAYER_MINUTES_DIR = Path("data/af_player_minutes")
 
@@ -164,15 +173,25 @@ class LineupService:
     def _minutes_for(
         self, competition_code: str, team_name: str
     ) -> dict[str, int]:
-        """Player-minutes for a team, with prior-season fallback at season start."""
+        """Player-minutes for a team, with prior-season fallback at season start.
+
+        At season start the current-season cache is empty (~0 minutes), so a team
+        below ``_MIN_SEASON_MINUTES`` (~10 full player-games) falls back to the
+        most recent PRIOR season that actually has minutes for it. We walk back a
+        few seasons because the api-football FREE tier only serves ~2022-2024, so
+        the immediate prior season (e.g. 2025) may be unavailable and the newest
+        backfilled cache is 2024.
+        """
         cur = _load_minutes_cache(competition_code, self._season)
         team_cur = _team_minutes(cur, team_name)
         if sum(team_cur.values()) > _MIN_SEASON_MINUTES:
             return team_cur
-        # Season just started (or no data): fall back to the prior season.
-        prev = _load_minutes_cache(competition_code, self._season - 1)
-        team_prev = _team_minutes(prev, team_name)
-        return team_prev or team_cur
+        for back in range(1, _PRIOR_SEASON_LOOKBACK + 1):
+            prev = _load_minutes_cache(competition_code, self._season - back)
+            team_prev = _team_minutes(prev, team_name)
+            if sum(team_prev.values()) > 0:
+                return team_prev
+        return team_cur
 
     async def adjustments_for_fixture(
         self,

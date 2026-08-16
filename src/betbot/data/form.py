@@ -26,6 +26,20 @@ log = get_logger(__name__)
 _RECENCY_WEIGHTS: tuple[float, ...] = (1.5, 1.3, 1.1, 1.0, 0.9)
 
 
+def recency_weight_sum(n: int) -> float:
+    """Sum of the recency weights FormService applies to ``n`` considered matches.
+
+    This is the correct normaliser for ``FormSnapshot.weighted_points``: dividing
+    by the raw match count leaves the recency weighting baked in (e.g. a single
+    win scores 1.5*3 = 4.5, not 3.0), which inflates the per-game scale by up to
+    50% at n=1. Matches past the weight table (defensive; FormService caps at 5)
+    weigh 1.0, mirroring ``_team_snapshot``.
+    """
+    n = max(int(n), 0)
+    known = sum(_RECENCY_WEIGHTS[: min(n, len(_RECENCY_WEIGHTS))])
+    return known + max(0, n - len(_RECENCY_WEIGHTS)) * 1.0
+
+
 def _parse_kickoff(s: str) -> datetime:
     """Parse an ISO-8601 string from football-data into an aware datetime."""
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
