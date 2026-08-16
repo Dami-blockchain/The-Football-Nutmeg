@@ -1,24 +1,32 @@
-"""Bridge our football-data.org fixtures to api-football lineups + minutes.
+"""Bridge our football-data.org fixtures to Highlightly lineups + api-football minutes.
 
 Two jobs:
 
-1. **Fixture id resolution** — given one of our fixtures (competition code,
-   home/away names, kickoff date) find the matching api-football fixture id via
-   ``list_fixtures`` + :class:`TeamAliasResolver` name matching. Resolutions are
-   cached in-process (they never change for a past/settled fixture).
+1. **Match id resolution** — given one of our fixtures (competition code,
+   home/away names, kickoff date) find the matching HIGHLIGHTLY match id via
+   ``list_matches`` (the day's league fixtures) + :class:`TeamAliasResolver` name
+   matching. Resolutions are cached in-process (they never change for a fixture).
 2. **Lineup adjustments** — :func:`adjustments_for_fixture` fetches the confirmed
-   XI (+ injuries, folded in as extra absences) and the on-disk player-minutes
-   cache, then delegates the pure math to
+   XI from Highlightly (+ injuries, folded in as extra absences) and the on-disk
+   player-minutes cache, then delegates the pure math to
    :func:`betbot.strategy.lineup.lineup_rating_adjustment`. Returns ``(0.0, 0.0)``
    gracefully whenever the lineup isn't out yet or any data is missing.
+
+Why Highlightly for the XI: api-football's FREE tier only serves seasons
+2022-2024 (it blocks the CURRENT season), so its live lineup path fails
+("Free plans do not have access to this season"). Highlightly's FREE tier serves
+the current season, so it is the confirmed-XI source. api-football is kept ONLY
+for the prior-season (2024) player-minutes cache (importance weighting), which
+still works on the free tier.
 
 The player-minutes cache lives at ``data/af_player_minutes/<CODE>_<season>.json``
 and is written by ``scripts/fetch_player_minutes.py``. At season start the new
 season has ~0 minutes, so a team whose current-season total is near zero falls
 back to the prior season's cache for "expected regular" importance.
 
-All network here is best-effort: the underlying :class:`ApiFootballClient` never
-raises, and this module treats any gap as "no adjustment".
+All network here is best-effort: the underlying :class:`HighlightlyClient` and
+:class:`ApiFootballClient` never raise, and this module treats any gap as
+"no adjustment".
 """
 
 from __future__ import annotations
@@ -27,6 +35,7 @@ import json
 from pathlib import Path
 
 from betbot.data.api_football import ApiFootballClient
+from betbot.data.highlightly import HighlightlyClient, highlightly_league_name
 from betbot.exchanges.matcher import TeamAliasResolver, normalize
 from betbot.logging import get_logger
 from betbot.strategy.lineup import lineup_rating_adjustment
@@ -34,6 +43,7 @@ from betbot.strategy.lineup import lineup_rating_adjustment
 log = get_logger(__name__)
 
 # Our internal competition codes -> api-football league ids (verified facts).
+# Retained ONLY for the player-minutes fetch script; the XI source is Highlightly.
 AF_LEAGUE_IDS: dict[str, int] = {
     "PL": 39,
     "PD": 140,
@@ -109,32 +119,54 @@ class LineupService:
         settings,
         *,
         client: ApiFootballClient | None = None,
+        highlightly: HighlightlyClient | None = None,
         resolver: TeamAliasResolver | None = None,
     ) -> None:
         self._settings = settings
+        # api-football kept ONLY for the (prior-season) minutes cache script.
         self._client = client or ApiFootballClient.from_settings(settings)
+        self._highlightly = highlightly or HighlightlyClient.from_settings(settings)
         self._resolver = (
             resolver if resolver is not None
             else TeamAliasResolver.from_yaml("config/team_aliases.yaml")
         )
         self._season = settings.api_football_season
-        # (code, home_norm, away_norm, date) -> af_fixture_id | None
-        self._fixture_cache: dict[tuple[str, str, str, str], int | None] = {}
+        # (code, home_norm, away_norm, date) -> highlightly_match_id | None
+        self._fixture_cache: dict[tuple[str, str, str, str], object | None] = {}
+        # (league_name, date) -> the day's matches (cached to stay budget-cheap:
+        # one /matches per league per alert batch).
+        self._matches_cache: dict[tuple[str, str], list[dict]] = {}
 
     async def close(self) -> None:
         await self._client.close()
+        await self._highlightly.close()
 
     # ------------------------------------------------------------------
-    async def resolve_fixture_id(
+    async def _day_matches(self, league_name: str, date: str) -> list[dict]:
+        """The league's matches for a date, cached across an alert batch."""
+        key = (league_name, date)
+        cached = self._matches_cache.get(key)
+        if cached is not None:
+            return cached
+        matches = await self._highlightly.list_matches(league_name, date)
+        self._matches_cache[key] = matches
+        return matches
+
+    async def resolve_match_id(
         self,
         competition_code: str,
         home_name: str,
         away_name: str,
         kickoff_date: str,
-    ) -> int | None:
-        """Find the api-football fixture id for one of our fixtures (cached)."""
-        league_id = af_league_id(competition_code)
-        if league_id is None:
+    ) -> object | None:
+        """Find the Highlightly match id for one of our fixtures (cached).
+
+        Resolves via the day's ``/matches`` list for the mapped ``leagueName``
+        plus :class:`TeamAliasResolver` on BOTH team names. Returns the match id
+        (opaque int) or ``None`` when unmapped / unmatched / no data.
+        """
+        league_name = highlightly_league_name(competition_code)
+        if league_name is None:
             return None
         key = (
             competition_code.upper(),
@@ -145,21 +177,19 @@ class LineupService:
         if key in self._fixture_cache:
             return self._fixture_cache[key]
 
-        candidates = await self._client.list_fixtures(
-            league_id, self._season, kickoff_date, kickoff_date
-        )
-        found: int | None = None
-        for fx in candidates:
-            af_home = fx.get("home_name") or ""
-            af_away = fx.get("away_name") or ""
-            if self._resolver.same_team(home_name, af_home) and self._resolver.same_team(
-                away_name, af_away
+        candidates = await self._day_matches(league_name, kickoff_date)
+        found: object | None = None
+        for m in candidates:
+            hl_home = m.get("home_name") or ""
+            hl_away = m.get("away_name") or ""
+            if self._resolver.same_team(home_name, hl_home) and self._resolver.same_team(
+                away_name, hl_away
             ):
-                found = fx.get("af_fixture_id")
+                found = m.get("match_id")
                 break
         if found is None and candidates:
             log.info(
-                "af_fixture_unresolved",
+                "highlightly_match_unresolved",
                 code=competition_code,
                 home=home_name,
                 away=away_name,
@@ -168,6 +198,18 @@ class LineupService:
             )
         self._fixture_cache[key] = found
         return found
+
+    # Back-compat alias: callers (daily_jobs closure) used ``resolve_fixture_id``.
+    async def resolve_fixture_id(
+        self,
+        competition_code: str,
+        home_name: str,
+        away_name: str,
+        kickoff_date: str,
+    ) -> object | None:
+        return await self.resolve_match_id(
+            competition_code, home_name, away_name, kickoff_date
+        )
 
     # ------------------------------------------------------------------
     def _minutes_for(
@@ -193,45 +235,65 @@ class LineupService:
                 return team_prev
         return team_cur
 
+    async def get_confirmed_xi(
+        self,
+        competition_code: str,
+        home_name: str,
+        away_name: str,
+        kickoff_date: str,
+        match_id: object | None = None,
+    ) -> dict | None:
+        """Confirmed XI + formation per side, or ``None`` when not posted yet.
+
+        -> ``{"home": {"formation", "xi": [names]}, "away": {...}}`` (the shape
+        :func:`betbot.tips.format_prediction_with_lineup` expects). Resolves the
+        Highlightly match id if not supplied. ``None`` on any gap (unmapped
+        league / unresolved fixture / XI not posted / error).
+        """
+        if match_id is None:
+            match_id = await self.resolve_match_id(
+                competition_code, home_name, away_name, kickoff_date
+            )
+        if match_id is None:
+            return None
+        return await self._highlightly.get_lineup(match_id)
+
     async def adjustments_for_fixture(
         self,
         competition_code: str,
         home_name: str,
         away_name: str,
         kickoff_date: str,
-        af_fixture_id: int | None = None,
+        match_id: object | None = None,
+        lineups: dict | None = None,
         home_injured: list[str] | None = None,
         away_injured: list[str] | None = None,
     ) -> tuple[float, float]:
         """(home_adj, away_adj) lineup rating shifts; (0.0, 0.0) when unavailable.
 
-        Injured players are folded in as extra absences: an injured player is
-        removed from the effective confirmed XI (via :func:`apply_injuries`) so a
-        late scratch still counts against the team even if the posted XI listed
-        them. Pass ``home_injured`` / ``away_injured`` (names from
-        :meth:`ApiFootballClient.get_injuries`); ``None`` skips that fetch to
-        protect the request budget.
+        Uses the Highlightly confirmed XI (resolved via ``match_id`` if not
+        supplied, or the pre-fetched ``lineups`` to avoid a duplicate call) and
+        the on-disk player-minutes cache. Injured players are folded in as extra
+        absences: an injured player is removed from the effective confirmed XI
+        (via :func:`apply_injuries`) so a late scratch still counts against the
+        team even if the posted XI listed them.
         """
         s = self._settings
-        if af_fixture_id is None:
-            af_fixture_id = await self.resolve_fixture_id(
-                competition_code, home_name, away_name, kickoff_date
+        if lineups is None:
+            lineups = await self.get_confirmed_xi(
+                competition_code, home_name, away_name, kickoff_date, match_id=match_id
             )
-        if af_fixture_id is None:
-            return (0.0, 0.0)
-
-        lineups = await self._client.get_lineups(af_fixture_id)
         if not lineups:
-            return (0.0, 0.0)  # not posted yet -> baseline prediction
+            return (0.0, 0.0)  # not posted yet / unresolved -> baseline
 
         home_mins = self._minutes_for(competition_code, home_name)
         away_mins = self._minutes_for(competition_code, away_name)
 
         home_xi = apply_injuries(
-            set(lineups.get("home", {}).get("xi") or []), home_injured or []
+            set((lineups.get("home") or {}).get("xi") or []), home_injured or []
         )
         away_xi = apply_injuries(
-            set(lineups.get("away", {}).get("xi") or []), away_injured or []
+            set((lineups.get("away") or {}).get("xi") or []), away_injured or []
         )
 
         home_adj = lineup_rating_adjustment(

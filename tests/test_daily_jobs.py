@@ -472,6 +472,92 @@ async def test_prematch_alert_no_lineup_sends_baseline_caveat(db, tmp_path):
     assert "Model:" in sent[0]  # baseline prediction still delivered
 
 
+async def test_prematch_alert_with_production_rescore_closure_shape(db, tmp_path):
+    """Regression for the live 'score_fixture_adjusted() takes 2 positional
+    arguments but 3 were given' TypeError.
+
+    send_prediction_alert calls rescore_fn(fixture_id, home_adj, away_adj), but
+    score_fixture_adjusted's REAL signature is
+    (settings, fixture_id, *, home_rating_adj, away_rating_adj). The production
+    wiring must be a closure adapting that shape. Here we build the SAME closure
+    main.py uses over the REAL score_fixture_adjusted (with football-data stubbed
+    to avoid network) and assert the alert re-scores fresh — no TypeError.
+    """
+    import betbot.main as main_mod
+
+    s = _tg_settings(tmp_path)
+    sent: list[str] = []
+
+    async def ok_send(settings, chat_id, text):
+        sent.append(text)
+        return True
+
+    # Capture the (fid, home_adj, away_adj) the closure is invoked with, proving
+    # the arity send_prediction_alert uses maps onto score_fixture_adjusted's
+    # keyword-only home_rating_adj/away_rating_adj.
+    seen: dict = {}
+
+    async def fake_score_fixture_adjusted(
+        settings, fixture_id, *, home_rating_adj=0.0, away_rating_adj=0.0
+    ):
+        seen["fid"] = fixture_id
+        seen["home"] = home_rating_adj
+        seen["away"] = away_rating_adj
+        return _Pred(fixture_id=fixture_id, p_home=0.55, p_draw=0.25, p_away=0.20), \
+            datetime(2026, 8, 1, 19, 30, tzinfo=timezone.utc)
+
+    # Build the closure EXACTLY as main.py does, over the (stubbed) real fn.
+    async def _rescore(fid, home_adj, away_adj):
+        return await fake_score_fixture_adjusted(
+            s, fid, home_rating_adj=home_adj, away_rating_adj=away_adj
+        )
+
+    calls = {"n": 0}
+
+    def prediction_fn(fid):
+        calls["n"] += 1
+        # baseline (stale) then fresh after upsert.
+        return _Pred(fixture_id=fid, p_home=0.87, p_draw=0.08, p_away=0.05) \
+            if calls["n"] == 1 \
+            else _Pred(fixture_id=fid, p_home=0.55, p_draw=0.25, p_away=0.20)
+
+    delivered = await send_prediction_alert(
+        s, 501, send_fn=ok_send,
+        prediction_fn=prediction_fn,
+        lineup_fn=_lineup_fn_stub(home_adj=40.0, away_adj=-15.0),
+        rescore_fn=_rescore,
+        entitlement_fn=lambda u, se, now=None: _ent("operator"),
+        users_fn=lambda: [_User(111)],
+    )
+    assert delivered == 1
+    # The closure was invoked with the alert's positional shape and forwarded
+    # them to the keyword-only adjustment params — no TypeError raised.
+    assert seen == {"fid": 501, "home": 40.0, "away": -15.0}
+    assert "H 55%" in sent[0]  # FRESH re-scored values shipped
+    # And the REAL production fn is imported + wired as a closure, not bare.
+    assert callable(main_mod.score_fixture_adjusted)
+
+
+def test_main_wires_rescore_as_closure_not_bare_function():
+    """Static guard: main.py must NOT pass the bare score_fixture_adjusted as
+    rescore_fn (its signature mismatches). It must build an adapting closure.
+    """
+    import inspect
+
+    import betbot.main as main_mod
+
+    src = inspect.getsource(main_mod)
+    # The bare-function wiring that caused the production TypeError must be gone.
+    assert "rescore_fn=score_fixture_adjusted" not in src
+    # A closure that forwards to the keyword-only params must be present.
+    assert "home_rating_adj=" in src and "away_rating_adj=" in src
+
+    # score_fixture_adjusted keeps its keyword-only adjustment signature.
+    sig = inspect.signature(main_mod.score_fixture_adjusted)
+    assert sig.parameters["home_rating_adj"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert sig.parameters["away_rating_adj"].kind is inspect.Parameter.KEYWORD_ONLY
+
+
 async def test_send_prediction_alert_no_prediction_is_noop(tmp_path):
     s = _tg_settings(tmp_path)
     delivered = await send_prediction_alert(

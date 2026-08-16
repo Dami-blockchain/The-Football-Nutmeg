@@ -427,15 +427,19 @@ def _default_lineup_fn(settings):
             code = baseline.competition_code
             ko = baseline.kickoff
             ko_date = (ko.date().isoformat() if ko is not None else "")
-            af_id = await svc.resolve_fixture_id(
+            match_id = await svc.resolve_match_id(
                 code, baseline.home_team, baseline.away_team, ko_date
             )
-            if af_id is None:
+            if match_id is None:
                 return None, 0.0, 0.0, None
-            lineup = await svc._client.get_lineups(af_id)
+            # One /lineups call, reused for both the display XI and the adj.
+            lineup = await svc.get_confirmed_xi(
+                code, baseline.home_team, baseline.away_team, ko_date,
+                match_id=match_id,
+            )
             home_adj, away_adj = await svc.adjustments_for_fixture(
                 code, baseline.home_team, baseline.away_team, ko_date,
-                af_fixture_id=af_id,
+                match_id=match_id, lineups=lineup,
             )
             absences = _absence_summary(lineup, home_adj, away_adj)
             return lineup, home_adj, away_adj, absences

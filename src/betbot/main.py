@@ -592,8 +592,21 @@ def run_daemon(
         # alert re-scores off the confirmed XI; lineup_fn defaults to the
         # production LineupService inside send_prediction_alert.
         try:
+            settings = get_settings()
+            # send_prediction_alert calls rescore_fn(fixture_id, home_adj,
+            # away_adj), but score_fixture_adjusted's real signature is
+            # (settings, fixture_id, *, home_rating_adj, away_rating_adj).
+            # Wire a closure that adapts the positional shape (and forwards the
+            # (Prediction, kickoff) return unchanged) so the alert re-scores
+            # instead of raising "takes 2 positional arguments but 3 were given".
+            async def _rescore(fid, home_adj, away_adj):
+                return await score_fixture_adjusted(
+                    settings, fid,
+                    home_rating_adj=home_adj, away_rating_adj=away_adj,
+                )
+
             await send_prediction_alert(
-                get_settings(), fixture_id, rescore_fn=score_fixture_adjusted,
+                settings, fixture_id, rescore_fn=_rescore,
             )
         except Exception as e:  # noqa: BLE001 — never crash
             get_logger(__name__).warning(

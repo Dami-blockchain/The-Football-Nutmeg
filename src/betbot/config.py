@@ -5,8 +5,35 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Obvious ``.env`` placeholder values that must be treated as "unset".
+_PLACEHOLDER_KEYS: frozenset[str] = frozenset({"YOURKEY", "YOUR_KEY", "CHANGEME", ""})
+
+
+def _first_real_env_value(env_var: str, env_file: str = ".env") -> str:
+    """First non-placeholder value for ``env_var`` in ``env_file`` ('' if none).
+
+    python-dotenv (used by pydantic-settings) resolves a DUPLICATE key to the
+    LAST occurrence. The production ``.env`` carries a real HIGHLIGHTLY_API_KEY
+    followed by a leftover ``=YOURKEY`` placeholder line, so the loaded value is
+    the placeholder. Rather than edit ``.env`` (off-limits), we scan for the
+    FIRST real value. Missing file / no real value -> ''.
+    """
+    try:
+        lines = Path(env_file).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    prefix = f"{env_var}="
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#") or not stripped.startswith(prefix):
+            continue
+        value = stripped[len(prefix):].strip().strip("'\"")
+        if value and value.upper() not in _PLACEHOLDER_KEYS:
+            return value
+    return ""
 
 # Top-5 European leagues + UCL. Codes are football-data.org competition IDs.
 LEAGUE_CODES: tuple[str, ...] = ("PL", "PD", "BL1", "SA", "FL1", "CL")
@@ -48,6 +75,16 @@ class Settings(BaseSettings):
         default=10, alias="API_FOOTBALL_RATE_LIMIT_PER_MIN"
     )
     api_football_season: int = Field(default=2026, alias="BETBOT_AF_SEASON")
+
+    # ---- Highlightly Soccer FREE tier (confirmed lineups, CURRENT season) ---
+    # api-football's FREE tier blocks the current season, so the confirmed-XI
+    # source is Highlightly (serves the current season). Behind Cloudflare — the
+    # client always sends a browser User-Agent + the key (x-rapidapi-key).
+    highlightly_api_key: str = Field(default="", alias="HIGHLIGHTLY_API_KEY")
+    highlightly_base_url: str = Field(
+        default="https://soccer.highlightly.net",
+        alias="HIGHLIGHTLY_BASE_URL",
+    )
 
     # ---- Lineup-adjusted scoring (R4a) --------------------------------
     # Max Glicko-point penalty when a team's entire expected first XI is
@@ -166,6 +203,23 @@ class Settings(BaseSettings):
     llm_daily_limit_per_user: int = Field(
         default=20, alias="BETBOT_LLM_DAILY_LIMIT_PER_USER"
     )
+
+    @model_validator(mode="after")
+    def _repair_placeholder_highlightly_key(self) -> "Settings":
+        """Recover the real HIGHLIGHTLY key when a duplicate ``.env`` line wins.
+
+        See :func:`_first_real_env_value`: a leftover ``HIGHLIGHTLY_API_KEY=YOURKEY``
+        placeholder line shadows the real key under python-dotenv's last-wins rule.
+        If the loaded value is empty or a known placeholder, fall back to the FIRST
+        real value in the env file so the confirmed-lineup path works live.
+        """
+        current = (self.highlightly_api_key or "").strip()
+        if not current or current.upper() in _PLACEHOLDER_KEYS:
+            env_file = (self.model_config.get("env_file") or ".env")
+            recovered = _first_real_env_value("HIGHLIGHTLY_API_KEY", str(env_file))
+            if recovered:
+                object.__setattr__(self, "highlightly_api_key", recovered)
+        return self
 
     @property
     def allowed_telegram_ids(self) -> set[int]:
