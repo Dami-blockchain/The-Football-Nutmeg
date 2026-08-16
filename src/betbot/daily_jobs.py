@@ -404,7 +404,10 @@ async def send_prediction_alert(
             adj_note=adj_note, absences=absences,
             entitlement_fn=entitlement_fn,
         )
-        body = f"*⏰ Pre-match — confirmed lineup*\n\n{text}"
+        # Honest header: the EARLY alert fires before the XI is posted, so
+        # only claim "confirmed lineup" when one is actually attached.
+        label = "confirmed lineup" if lineup else "model prediction"
+        body = f"*⏰ Pre-match — {label}*\n\n{text}"
         try:
             if await send(settings, user.telegram_user_id, body):
                 sent += 1
