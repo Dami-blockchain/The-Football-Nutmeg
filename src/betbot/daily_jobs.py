@@ -466,6 +466,92 @@ def _absence_summary(lineup, home_adj: float, away_adj: float) -> str | None:
 # ----------------------------------------------------------------------
 # Scheduling
 # ----------------------------------------------------------------------
+# --- Prior-season player-minutes backfill (budget-paced, one league / day) ----
+#
+# Only the currently-fetched PRIOR season (the newest api-football FREE-tier
+# season, 2024) carries usable minutes; the current season (2026) is empty at
+# season start. Fetching all five domestic leagues at once would blow the
+# 100 req/day free budget, so instead a DAILY tick fills exactly ONE missing
+# domestic league's ``<CODE>_<PRIOR>.json`` per run — all four fill within ~4
+# days, each run well under the cap. Once every league is populated it no-ops.
+#
+# Prior season = api_football_season - 2 (2026 -> 2024): the immediate prior
+# (2025) is unavailable on the free tier, matching lineup_service's fallback.
+_PRIOR_SEASON_OFFSET = 2
+# Domestic top-5 only; CL squads overlap these leagues and its own minutes are
+# tiny, so it is excluded from the backfill (mirrors fetch_player_minutes' CL skip).
+_BACKFILL_LEAGUES = ("PL", "PD", "BL1", "SA", "FL1")
+# A cache file this small (``{}`` == 2 bytes, or absent) counts as unpopulated.
+_EMPTY_CACHE_MAX_BYTES = 2
+
+
+def prior_minutes_season(settings) -> int:
+    """The completed season we backfill player-minutes for (free tier: 2024)."""
+    return settings.api_football_season - _PRIOR_SEASON_OFFSET
+
+
+def pick_league_to_backfill(
+    season: int, *, minutes_dir=None, leagues: Sequence[str] = _BACKFILL_LEAGUES
+) -> str | None:
+    """Return the FIRST domestic league whose ``<CODE>_<season>.json`` cache is
+    missing or empty (<= 2 bytes), else ``None`` (all populated).
+
+    Pure/offline: only stats the filesystem, no network. Used by the daily tick
+    to pick a single league to fetch, and unit-tested against a temp dir.
+    """
+    from betbot.data.lineup_service import PLAYER_MINUTES_DIR
+
+    base = minutes_dir if minutes_dir is not None else PLAYER_MINUTES_DIR
+    for code in leagues:
+        path = base / f"{code.upper()}_{season}.json"
+        try:
+            populated = path.exists() and path.stat().st_size > _EMPTY_CACHE_MAX_BYTES
+        except OSError:
+            populated = False
+        if not populated:
+            return code.upper()
+    return None
+
+
+async def backfill_one_league_minutes_tick(settings, *, repo_root=None) -> None:
+    """Daily: fetch ONE missing prior-season domestic league's player minutes.
+
+    Budget-paced — one league per run keeps each day well under the 100 req/day
+    api-football free cap; the four domestic leagues self-complete over ~4 days.
+    No-ops once every league is populated. Runs ``fetch_player_minutes.py`` in a
+    subprocess (isolation) and is best-effort: any failure is logged, never
+    raised, so a bad fetch can't crash the daemon.
+    """
+    import asyncio
+    import subprocess
+    from pathlib import Path
+
+    season = prior_minutes_season(settings)
+    code = pick_league_to_backfill(season)
+    if code is None:
+        log.info("player_minutes_backfill_complete", season=season)
+        return
+
+    root = Path(repo_root) if repo_root is not None else Path(__file__).resolve().parents[2]
+
+    def _run() -> None:
+        args = [
+            ".venv/bin/python", "scripts/fetch_player_minutes.py",
+            "--league", code, "--season", str(season),
+        ]
+        subprocess.run(
+            args, cwd=str(root), timeout=1800, check=True, capture_output=True,
+        )
+
+    try:
+        await asyncio.to_thread(_run)
+        log.info("player_minutes_backfilled", code=code, season=season)
+    except Exception as exc:  # noqa: BLE001 — never crash the daemon
+        log.warning(
+            "player_minutes_backfill_failed", code=code, season=season, error=str(exc)
+        )
+
+
 def register_daily_jobs(scheduler, settings, *, matchday_notice) -> None:
     """Register the Nairobi-local morning heads-up cron on the daemon's scheduler.
 
@@ -478,6 +564,14 @@ def register_daily_jobs(scheduler, settings, *, matchday_notice) -> None:
             hour=settings.matchday_alert_hour, minute=0, timezone=REPORT_TZ
         ),
         id="matchday_notice",
+    )
+    # Daily 05:15 UTC (before the 05:xx alert reschedule / scoring): fill ONE
+    # missing prior-season domestic league's player-minutes cache. Budget-paced;
+    # no-ops once all four are populated. Self-contained + best-effort.
+    scheduler.add_job(
+        lambda: backfill_one_league_minutes_tick(settings),
+        trigger=CronTrigger.from_crontab("15 5 * * *", timezone=timezone.utc),
+        id="player_minutes_backfill",
     )
 
 

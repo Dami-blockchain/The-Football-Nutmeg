@@ -70,8 +70,7 @@ class StrategyEngine:
         self._settings = settings
 
     # ------------------------------------------------------------------
-    @staticmethod
-    def _per_game(form) -> float:
+    def _per_game(self, form) -> float:
         """Collapse FormService's summed weighted_points onto a per-game (0-3ish)
         scale so it is commensurate with ``draw_score`` (~2.4) and ``softmax_temp``.
 
@@ -83,11 +82,25 @@ class StrategyEngine:
         matches_considered=0) we return 0.0 so both sides sit near draw_score and
         the softmax yields a sane near-uniform prior (home nudged by
         home_advantage) rather than H0/D0/A100 garbage.
+
+        Sample-size shrinkage: a per-game score computed from ONE game is far
+        noisier than one from five, yet the raw value trusts them equally and so
+        over-reacts at season start (Fable flag). We shrink the per-game score
+        toward the neutral prior (0.0 — the SAME value the n=0 no-form case maps
+        to) with a data weight ``n / (n + K)`` where K = ``form_shrinkage_k``
+        (default 4): n=1 => 20% data / 80% prior, n=5 => 56% data, n large =>
+        approaches the un-shrunk value. n=0 already returns the prior (unchanged).
+        Shrinkage is applied BEFORE the clamp so the [0, 3] bound still holds.
         """
         n = getattr(form, "matches_considered", 0)
         if n <= 0:
             return 0.0
         pg = form.weighted_points / recency_weight_sum(n)
+        # Shrink toward the neutral prior (0.0) by the sample-size data weight.
+        # K>=0 is enforced defensively so a mis-set config can't invert the pull.
+        k = max(getattr(self._settings, "form_shrinkage_k", 4.0), 0.0)
+        data_weight = n / (n + k) if (n + k) > 0 else 1.0
+        pg *= data_weight
         # Hard-bound to the true points-per-game scale. weighted_points folds in
         # an opponent-strength factor of up to 1.5x, so the normalised value can
         # still exceed 3.0 (max 4.5); left unclamped that re-opens sub-1% tails

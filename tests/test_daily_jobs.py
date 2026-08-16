@@ -501,13 +501,53 @@ async def _noop() -> None:  # pragma: no cover — never fired in tests
 def test_matchday_cron_registered_with_nairobi_timezone(settings):
     sched = FakeScheduler()
     register_daily_jobs(sched, settings, matchday_notice=_noop)
-    assert set(sched.jobs) == {"matchday_notice"}
+    assert set(sched.jobs) == {"matchday_notice", "player_minutes_backfill"}
     trig = sched.jobs["matchday_notice"]
     assert isinstance(trig, CronTrigger)
     assert str(trig.timezone) == "Africa/Nairobi"
     fields = {f.name: str(f) for f in trig.fields}
     assert fields["hour"] == "8"  # default matchday_alert_hour
     assert fields["minute"] == "0"
+
+
+def test_player_minutes_backfill_registered_daily_utc(settings):
+    sched = FakeScheduler()
+    register_daily_jobs(sched, settings, matchday_notice=_noop)
+    trig = sched.jobs["player_minutes_backfill"]
+    assert isinstance(trig, CronTrigger)
+    assert str(trig.timezone) in ("UTC", "utc")
+    fields = {f.name: str(f) for f in trig.fields}
+    assert fields["hour"] == "5"
+    assert fields["minute"] == "15"
+
+
+def test_pick_league_to_backfill_selects_missing_skips_populated(tmp_path):
+    # Only PD_2024 populated (mirrors the live cache): picker must skip PL? No —
+    # PL comes first and is missing, so it is chosen; a dir where all are
+    # populated returns None.
+    from betbot.daily_jobs import pick_league_to_backfill
+
+    # Fake cache dir: PD populated, others absent.
+    (tmp_path / "PD_2024.json").write_text('{"111": {"x": 90}}', encoding="utf-8")
+    picked = pick_league_to_backfill(2024, minutes_dir=tmp_path)
+    assert picked == "PL"  # first missing domestic league
+
+    # Empty (2-byte "{}") counts as unpopulated and is still picked.
+    (tmp_path / "PL_2024.json").write_text("{}", encoding="utf-8")
+    assert pick_league_to_backfill(2024, minutes_dir=tmp_path) == "PL"
+
+    # Populate every domestic league -> no-op (None).
+    for code in ("PL", "PD", "BL1", "SA", "FL1"):
+        (tmp_path / f"{code}_2024.json").write_text(
+            '{"1": {"p": 90}}', encoding="utf-8"
+        )
+    assert pick_league_to_backfill(2024, minutes_dir=tmp_path) is None
+
+
+def test_prior_minutes_season_is_two_back(settings):
+    from betbot.daily_jobs import prior_minutes_season
+
+    assert prior_minutes_season(settings) == settings.api_football_season - 2
 
 
 # ----------------------------------------------------------------------

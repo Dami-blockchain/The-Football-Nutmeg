@@ -64,6 +64,11 @@ class Settings(BaseSettings):
     home_advantage: float = Field(default=0.3, alias="BETBOT_HOME_ADVANTAGE")
     draw_score: float = Field(default=2.4, alias="BETBOT_DRAW_SCORE")
     softmax_temp: float = Field(default=1.0, alias="BETBOT_SOFTMAX_TEMP")
+    # Sample-size shrinkage for the naive engine's per-game form. Each side's
+    # per-game score is pulled toward the neutral prior (0.0) with data weight
+    # n / (n + form_shrinkage_k): n=1 => 20% data, n=5 => 56%, large n => ~raw.
+    # Bigger K = more conservative at season start. K=0 disables shrinkage.
+    form_shrinkage_k: float = Field(default=4.0, alias="BETBOT_FORM_SHRINKAGE_K")
     opp_strength_weight: float = Field(
         default=0.5, alias="BETBOT_OPP_STRENGTH_WEIGHT"
     )
