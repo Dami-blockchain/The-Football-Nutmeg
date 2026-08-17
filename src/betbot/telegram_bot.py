@@ -130,6 +130,7 @@ def build_onboarding_guide(user, settings) -> str:
         f"{pricing}"
         "*Commands*\n"
         "/predictions – today's fixtures + picks\n"
+        "/title – who's winning La Liga? (or /title PL)\n"
         "/balance – your balance + credits\n"
         "/status – trial / credits status\n"
         "/record – how accurate I've been\n"
@@ -255,6 +256,66 @@ async def record_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(body, parse_mode=ParseMode.MARKDOWN)
 
 
+def _format_title_race(result: dict, code: str) -> str:
+    """Render a cached season-title projection for /title (Markdown)."""
+    from betbot.season_service import LEAGUE_NAMES
+
+    name = LEAGUE_NAMES.get(code, code)
+    md = result.get("matchday")
+    played = result.get("played")
+    remaining = result.get("remaining")
+    gen = (result.get("generated_at") or "")[:10]
+    table = result.get("table") or []
+
+    lines = [f"*🏆 {name} title race*"]
+    ctx = []
+    if md:
+        ctx.append(f"after matchday {md}")
+    if played is not None and remaining is not None:
+        ctx.append(f"{played} played / {remaining} left")
+    if ctx:
+        lines.append("_" + ", ".join(ctx) + "_")
+    lines.append("")
+    for i, row in enumerate(table[:6], 1):
+        lines.append(
+            f"{i}. *{row['team']}* — {row['p_title']*100:.0f}% "
+            f"(exp {row['exp_points']:.0f} pts)"
+        )
+    if not table:
+        lines.append("_No projection available yet._")
+    early = (played or 0) < 8
+    note = (
+        "\n\n_Model projection from a Monte-Carlo of the run-in — not a "
+        "guarantee. "
+        + ("Very early season, so this will move a lot. " if early else "")
+        + (f"Sim run {gen}." if gen else "")
+        + "_"
+    )
+    return "\n".join(lines) + note
+
+
+@_authed
+async def title_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Season-title race for a league (default La Liga). FREE, cached."""
+    from betbot.season_service import LEAGUE_NAMES, load_cache
+
+    _register(update)
+    s = get_settings()
+    arg = (ctx.args[0].upper() if ctx.args else "PD")
+    code = arg if arg in LEAGUE_NAMES else "PD"
+    result = load_cache(s, code)
+    if not result:
+        await update.message.reply_text(
+            f"The {LEAGUE_NAMES.get(code, code)} title projection is still being "
+            "computed — check back shortly. (Tip: /title PL, /title SA, "
+            "/title BL1, /title FL1.)"
+        )
+        return
+    await update.message.reply_text(
+        _format_title_race(result, code), parse_mode=ParseMode.MARKDOWN,
+    )
+
+
 # Lazily constructed so importing this module never needs settings; tests
 # inject their own agent by assigning to ``_llm_agent``.
 _llm_agent: LLMAgent | None = None
@@ -293,6 +354,7 @@ def build_application(settings) -> Application:
     app.add_handler(CommandHandler("balance", balance_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("record", record_cmd))
+    app.add_handler(CommandHandler("title", title_cmd))
     # Free-text → LLM assistant. Added LAST so commands keep priority.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_handler))
     return app

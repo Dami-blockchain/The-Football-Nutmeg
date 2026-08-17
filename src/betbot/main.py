@@ -616,6 +616,34 @@ def run_daemon(
         except Exception as e:  # noqa: BLE001 — never crash the daemon
             get_logger(__name__).warning("club_refresh_failed", error=str(e))
 
+    async def _season_title_refresh_tick() -> None:
+        # Weekly: refresh the season-title Monte-Carlo cache for each domestic
+        # league so /title stays current. Subprocess per league (isolation +
+        # never crash the daemon); non-fatal if one fails. Budget-safe: one
+        # football-data.org call per league per week.
+        import subprocess
+
+        _s = get_settings()
+        leagues = [c for c in _s.leagues if c in ("PL", "PD", "BL1", "SA", "FL1")]
+
+        def _run() -> None:
+            for code in leagues:
+                try:
+                    subprocess.run(
+                        [".venv/bin/python", "scripts/simulate_season.py",
+                         "--league", code],
+                        cwd=str(_REPO_ROOT), timeout=900, check=True,
+                        capture_output=True,
+                    )
+                except Exception as e:  # noqa: BLE001 — one league must not sink the rest
+                    get_logger(__name__).warning(
+                        "season_title_league_failed", league=code, error=str(e))
+        try:
+            await asyncio.to_thread(_run)
+            get_logger(__name__).info("season_title_refreshed", leagues=len(leagues))
+        except Exception as e:  # noqa: BLE001 — never crash the daemon
+            get_logger(__name__).warning("season_title_refresh_failed", error=str(e))
+
     async def _matchday_notice_tick() -> None:
         # Morning heads-up (Africa/Nairobi): FREE fixture list, no prediction.
         try:
@@ -756,6 +784,14 @@ def run_daemon(
             _player_minutes_refresh_tick,
             trigger=CronTrigger.from_crontab("30 5 * * 1", timezone=timezone.utc),
             id="player_minutes_refresh",
+        )
+        # Weekly (Mon 06:30 UTC, after the club re-seed at 06:00): refresh the
+        # season-title Monte-Carlo cache so /title tracks the season. One
+        # football-data.org call per domestic league per week.
+        scheduler.add_job(
+            _season_title_refresh_tick,
+            trigger=CronTrigger.from_crontab("30 6 * * 1", timezone=timezone.utc),
+            id="season_title_refresh",
         )
         # Periodic (every 2h): settle finished fixtures + fire RESULT ALERTS, so
         # results land within ~2h of full time rather than at the next 08:00 tick.

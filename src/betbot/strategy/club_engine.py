@@ -113,27 +113,44 @@ class ClubStrategyEngine:
         n = normalize(name)
         return self._name_map.get(n, n)
 
-    def predict(
+    def is_rated(self, home_name: str, away_name: str) -> bool:
+        """True iff both sides have a real rating (RD below the default).
+
+        Mirrors the unknown-team guard in :meth:`predict`: an RD at/above the
+        default means no real history, so the ensemble would be guessing.
+        Exposed so a season simulation can flag unrated ties up-front instead
+        of silently pricing them off default ratings.
+        """
+        s = self._settings
+        rh = self._get_rating(home_name)
+        ra = self._get_rating(away_name)
+        return rh.rd < s.glicko_default_rd and ra.rd < s.glicko_default_rd
+
+    def probability_triple(
         self,
-        fixture_form: FixtureForm,
+        home_name: str,
+        away_name: str,
         *,
         home_rating_adj: float = 0.0,
         away_rating_adj: float = 0.0,
-    ) -> Prediction:
+        form_probs: tuple[float, float, float] | None = None,
+    ) -> tuple[tuple[float, float, float], float | None, float | None]:
+        """Pre-market (p_home, p_draw, p_away) + (home_xg, away_xg) for a tie.
+
+        The single source of truth for the club ensemble's probability triple:
+        the Glicko + Dixon-Coles (+ optional form) log-pool, then calibration —
+        exactly as :meth:`predict` computes it (``predict`` now calls this). A
+        season simulation reuses this so its per-match probabilities are the
+        SAME maths the live engine prices with, not a subtly-different copy.
+
+        ``form_probs`` supplies the form component's triple when the caller has
+        recent-form data (``predict`` does); a form-free caller (season sim)
+        omits it, which — with the production ``club_weight_form=0`` — changes
+        nothing. Assumes both sides are rated; check :meth:`is_rated` first.
+        """
         s = self._settings
-        fx = fixture_form.fixture
-        home_name, away_name = fx.home_team.name, fx.away_team.name
         rh = self._get_rating(home_name)
         ra = self._get_rating(away_name)
-
-        # Unknown-team guard: an RD at/above the default means we have no real
-        # rating history for this side (e.g. a just-promoted club). The ensemble
-        # would be guessing, so defer to the form-based naive engine.
-        if rh.rd >= s.glicko_default_rd or ra.rd >= s.glicko_default_rd:
-            return self._base.predict(fixture_form)
-
-        # Optional lineup-adjusted rating shift (R4a). Default 0.0 leaves the
-        # ratings — and thus every downstream number — byte-identical.
         if home_rating_adj:
             rh = dataclasses.replace(rh, rating=rh.rating + home_rating_adj)
         if away_rating_adj:
@@ -155,12 +172,45 @@ class ClubStrategyEngine:
             components.append((s.club_weight_dc, dc_probs))
             lam_h, lam_a = dc.expected_goals(self._dc_params, hk, ak, home_field=True)
             home_xg, away_xg = round(lam_h, 2), round(lam_a, 2)
-        if s.club_weight_form > 0:
-            fp = self._base.predict(fixture_form)
-            components.append((s.club_weight_form, (fp.p_home, fp.p_draw, fp.p_away)))
+        if s.club_weight_form > 0 and form_probs is not None:
+            components.append((s.club_weight_form, form_probs))
 
         probs = log_pool(components)
-        p_home, p_draw, p_away = calibrate(probs, self._calibrators)
+        return calibrate(probs, self._calibrators), home_xg, away_xg
+
+    def predict(
+        self,
+        fixture_form: FixtureForm,
+        *,
+        home_rating_adj: float = 0.0,
+        away_rating_adj: float = 0.0,
+    ) -> Prediction:
+        s = self._settings
+        fx = fixture_form.fixture
+        home_name, away_name = fx.home_team.name, fx.away_team.name
+        rh = self._get_rating(home_name)
+        ra = self._get_rating(away_name)
+
+        # Unknown-team guard: an RD at/above the default means we have no real
+        # rating history for this side (e.g. a just-promoted club). The ensemble
+        # would be guessing, so defer to the form-based naive engine.
+        if rh.rd >= s.glicko_default_rd or ra.rd >= s.glicko_default_rd:
+            return self._base.predict(fixture_form)
+
+        # Optional lineup-adjusted rating shift (R4a). Default 0.0 leaves the
+        # ratings — and thus every downstream number — byte-identical.
+        form_probs: tuple[float, float, float] | None = None
+        if s.club_weight_form > 0:
+            fp = self._base.predict(fixture_form)
+            form_probs = (fp.p_home, fp.p_draw, fp.p_away)
+
+        (p_home, p_draw, p_away), home_xg, away_xg = self.probability_triple(
+            home_name, away_name,
+            home_rating_adj=home_rating_adj, away_rating_adj=away_rating_adj,
+            form_probs=form_probs,
+        )
+        rh_adj = rh.rating + home_rating_adj
+        ra_adj = ra.rating + away_rating_adj
         return Prediction(
             fixture_id=fx.id,
             competition_code=fx.competition_code,
@@ -169,8 +219,8 @@ class ClubStrategyEngine:
             p_home=p_home,
             p_draw=p_draw,
             p_away=p_away,
-            home_score=rh.rating,   # store ratings for transparency
-            away_score=ra.rating,
+            home_score=rh_adj,   # store ratings for transparency
+            away_score=ra_adj,
             draw_score=0.0,
             home_xg=home_xg,
             away_xg=away_xg,
