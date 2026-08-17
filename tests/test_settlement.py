@@ -17,7 +17,7 @@ from betbot.storage.repos import (
 )
 from betbot.strategy.engine import BetDecision, Prediction
 
-NOW = datetime(2026, 6, 8, 12, 0, tzinfo=timezone.utc)
+NOW = datetime.now(timezone.utc)  # real-clock relative so drawdown-window tests never go stale
 
 
 # ----------------------------------------------------------------------
