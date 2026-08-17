@@ -128,3 +128,24 @@ def test_format_result_wrong_pick_away_label():
     text = format_result(o, "Home", "Away")
     assert "Full time: Home 1-1 Away" in text
     assert "Our call: Away (A) — ❌ wrong" in text
+
+
+def test_format_prediction_states_predicted_winner():
+    from types import SimpleNamespace
+    from betbot.tips import format_prediction
+    home_fav = SimpleNamespace(home_team="Man City", away_team="Arsenal",
+                               p_home=0.52, p_draw=0.26, p_away=0.22,
+                               home_xg=1.9, away_xg=1.1, competition_code="PL",
+                               kickoff=None, paper_bets=[])
+    out = format_prediction(home_fav)
+    assert "Prediction:" in out and "Man City to win" in out and "52%" in out
+    draw_top = SimpleNamespace(home_team="A", away_team="B",
+                               p_home=0.30, p_draw=0.40, p_away=0.30,
+                               home_xg=None, away_xg=None, competition_code="PL",
+                               kickoff=None, paper_bets=[])
+    assert "Prediction: Draw" in format_prediction(draw_top)
+    away_fav = SimpleNamespace(home_team="A", away_team="B",
+                               p_home=0.20, p_draw=0.25, p_away=0.55,
+                               home_xg=None, away_xg=None, competition_code="PL",
+                               kickoff=None, paper_bets=[])
+    assert "B to win" in format_prediction(away_fav)

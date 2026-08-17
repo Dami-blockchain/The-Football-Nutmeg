@@ -38,13 +38,26 @@ def format_prediction(pred, *, edge_threshold: float | None = None) -> str:
     if ko:
         header += f" — {ko}"
 
+    # Predicted winner = the model's most likely outcome (argmax of H/D/A),
+    # stated plainly with its probability (favourites often sit below 50% once
+    # the draw is in play — the % keeps it honest).
+    _pick, _p = max(
+        [("home", pred.p_home), ("draw", pred.p_draw), ("away", pred.p_away)],
+        key=lambda kv: kv[1],
+    )
+    if _pick == "draw":
+        winner = f"🏆 *Prediction: Draw* ({_p:.0%})"
+    else:
+        _team = pred.home_team if _pick == "home" else pred.away_team
+        winner = f"🏆 *Prediction: {_team} to win* ({_p:.0%})"
+
     model = (
         f"Model: H {pred.p_home:.0%} / D {pred.p_draw:.0%} / A {pred.p_away:.0%}"
     )
     if pred.home_xg is not None and pred.away_xg is not None:
         model += f"   (xG {pred.home_xg:.2f}–{pred.away_xg:.2f})"
 
-    return "\n".join([header, model])
+    return "\n".join([header, winner, model])
 
 
 def _format_xi(side: dict | None) -> str:
