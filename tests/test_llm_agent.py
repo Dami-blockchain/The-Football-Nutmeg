@@ -448,6 +448,64 @@ async def test_start_onboarding_content(tg_env):
     assert "/bets" not in reply
 
 
+class _FakeUser:
+    """Minimal user for the pure guide builder (no DB needed)."""
+
+    def __init__(self, telegram_user_id: int, wallet_address: str):
+        self.telegram_user_id = telegram_user_id
+        self.wallet_address = wallet_address
+
+
+def test_build_onboarding_guide_normal_user():
+    s = _settings(TELEGRAM_ALLOWED_USER_ID=1111)
+    u = _FakeUser(telegram_user_id=2222, wallet_address="0xABCDEF")
+    g = tb.build_onboarding_guide(u, s)
+
+    # 4 numbered "how it works" steps.
+    for step in ("1️⃣", "2️⃣", "3️⃣", "4️⃣"):
+        assert step in g
+    # Trial + pricing pitch.
+    assert "7 days" in g.lower()
+    assert "1 USDC" in g
+    assert "Polygon" in g
+    # The user's real deposit address is shown.
+    assert "0xABCDEF" in g
+    # All commands present.
+    for cmd in ("/predictions", "/balance", "/status", "/record", "/guide"):
+        assert cmd in g
+    # Risk phrases preserved.
+    assert "not financial advice" in g.lower()
+    assert "lose money" in g.lower()
+
+
+def test_build_onboarding_guide_operator():
+    s = _settings(TELEGRAM_ALLOWED_USER_ID=1111)
+    op = _FakeUser(telegram_user_id=1111, wallet_address="0xOPERATOR")
+    g = tb.build_onboarding_guide(op, s)
+
+    # Operator sees the always-free line, NOT the trial / 1-USDC pitch.
+    assert "operator" in g.lower()
+    assert "always free" in g.lower()
+    assert "7 days" not in g.lower()
+    assert "1 USDC" not in g
+    # Risk disclaimer still shown to the operator.
+    assert "not financial advice" in g.lower()
+
+
+async def test_guide_command_sends_guide(tg_env):
+    update = _FakeTGUpdate(user_id=888)
+
+    await tb.guide_cmd(update, ctx=None)
+
+    [reply] = update.message.replies
+    u = get_user(888)
+    assert u is not None  # /guide also registers (same flow as /start)
+    assert u.wallet_address in reply
+    for cmd in ("/predictions", "/balance", "/status", "/record", "/guide"):
+        assert cmd in reply
+    assert "not financial advice" in reply.lower()
+
+
 async def test_free_text_registers_user_and_replies_via_llm(
     tg_env, tmp_path, monkeypatch
 ):

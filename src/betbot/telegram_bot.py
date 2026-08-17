@@ -79,34 +79,83 @@ def _authed(handler):
     return wrapper
 
 
+def build_onboarding_guide(user, settings) -> str:
+    """The step-by-step onboarding guide shown on /start and /guide.
+
+    Pure string builder (no I/O) so it is unit-testable. Branches on whether
+    ``user`` is the operator (``telegram_allowed_user_id``): the operator sees
+    an always-free line instead of the trial/pricing pitch. Everyone else sees
+    their real per-user Polygon deposit address and the 1-USDC pricing.
+    """
+    is_operator = bool(
+        settings.telegram_allowed_user_id
+        and user.telegram_user_id == settings.telegram_allowed_user_id
+    )
+
+    if is_operator:
+        pricing = (
+            "*Pricing*\n"
+            "• You're the *operator* — all predictions are *always free*, "
+            "unlimited, no trial or payment.\n"
+            "• Check your account any time with /balance.\n\n"
+        )
+    else:
+        pricing = (
+            "*Pricing*\n"
+            "• Your first *7 days are FREE* — every prediction, no charge.\n"
+            "• After that it's *1 USDC per prediction*, paid in USDC on "
+            "*Polygon* (1 USDC unlocks 1 prediction).\n"
+            "• Top up by sending USDC (on *Polygon*) to your personal deposit "
+            "address below — I detect it on-chain automatically.\n"
+            f"• *Your deposit address (Polygon):*\n`{user.wallet_address}`\n"
+            "• Check your credits any time with /balance.\n\n"
+        )
+
+    return (
+        "⚽ *Football Nutmeg Bot*\n\n"
+        "Welcome! I send *data-driven predictions* for the big-5 European "
+        "leagues (England, Spain, Italy, Germany, France) plus the Champions "
+        "League. I never place bets and never move your funds.\n\n"
+        "*How it works — for each match you get:*\n"
+        "1️⃣ A *morning heads-up* of the day's fixtures and when the "
+        "predictions will land.\n"
+        "2️⃣ About *1 hour before kickoff*, the *model prediction* — "
+        "home / draw / away, plus a *BOLD bet / no-bet call* (the default is "
+        "*NO BET*).\n"
+        "3️⃣ About *10 minutes before kickoff*, the *confirmed starting XI* "
+        "and a *lineup-adjusted* prediction.\n"
+        "4️⃣ At *full time*, the *result vs the call* (✅ / ❌).\n\n"
+        "*Just chat with me* — message me any time to ask about a match: why a "
+        "pick, the xG, form, anything about today's matches.\n\n"
+        f"{pricing}"
+        "*Commands*\n"
+        "/predictions – today's fixtures + picks\n"
+        "/balance – your balance + credits\n"
+        "/status – trial / credits status\n"
+        "/record – how accurate I've been\n"
+        "/guide – show this guide again\n"
+        "/help – show this guide\n\n"
+        "⚠️ *Not financial advice.* Prediction markets / betting can "
+        "lose money. Bet responsibly — only ever stake what you can afford to "
+        "lose, and past results never guarantee future ones."
+    )
+
+
 @_authed
 async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     u = _register(update)
     await update.message.reply_text(
-        "⚽ *Football Nutmeg Bot*\n\n"
-        "I send you football *predictions* for the top European leagues and the "
-        "Champions League: model probabilities, expected goals, and a clear "
-        "bet / no-bet call anchored to the market. I never place bets and never "
-        "move your funds.\n\n"
-        "*You're registered.*\n\n"
-        "*How it works*\n"
-        "• Predictions are *FREE for your first 7 days*.\n"
-        "• After the trial, each match prediction costs *1 USDC on Polygon* — "
-        "1 USDC unlocks 1 prediction.\n"
-        "• Pay by sending USDC (Polygon) to your personal address below; I "
-        "detect it on-chain automatically.\n\n"
-        f"*Your payment address (Polygon):*\n`{u.wallet_address}`\n\n"
-        "*Commands*\n"
-        "/predictions – today's fixtures + predictions\n"
-        "/balance – your USDC balance + credits\n"
-        "/status – trial / credits\n"
-        "/record – how accurate my predictions have been\n"
-        "/help – this guide\n\n"
-        "You can also just *message me* — ask me anything about today's "
-        "matches.\n\n"
-        "⚠️ *Not financial advice.* Predictions can be wrong and betting can "
-        "lose money — only ever stake what you can afford to lose. Past results "
-        "never guarantee future ones.",
+        build_onboarding_guide(u, get_settings()),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+@_authed
+async def guide_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Re-send the same onboarding guide on demand (also backs /help)."""
+    u = _register(update)
+    await update.message.reply_text(
+        build_onboarding_guide(u, get_settings()),
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -238,7 +287,8 @@ async def chat_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 def build_application(settings) -> Application:
     app = Application.builder().token(settings.telegram_bot_token).build()
     app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("help", start_cmd))
+    app.add_handler(CommandHandler("help", guide_cmd))
+    app.add_handler(CommandHandler("guide", guide_cmd))
     app.add_handler(CommandHandler("predictions", predictions_cmd))
     app.add_handler(CommandHandler("balance", balance_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
