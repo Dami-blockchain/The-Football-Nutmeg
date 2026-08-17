@@ -476,6 +476,11 @@ def test_build_onboarding_guide_normal_user():
     # Risk phrases preserved.
     assert "not financial advice" in g.lower()
     assert "lose money" in g.lower()
+    # Pure tipster: the bet / no-bet call language is gone; step 2 describes
+    # the model's win/draw/loss probabilities instead.
+    assert "bet / no-bet" not in g.lower()
+    assert "no bet" not in g.lower()
+    assert "win / draw / loss" in g.lower()
 
 
 def test_build_onboarding_guide_operator():

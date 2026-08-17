@@ -4,19 +4,17 @@ Pure formatters over a stored :class:`~betbot.storage.models.PredictionRow`
 (and its linked ``paper_bet``, which IS our recommendation). Kept separate from
 storage/network so the exact message shapes are unit-testable with fixture data.
 
-The STANDING format rule (a memory-pinned product requirement): every match
-prediction carries a home/away designation, market anchoring, the xG readout
-when present, and a BOLD bet/no-bet call — defaulting to NO BET. A prediction is
-a BET only when a stored paper_bet exists with a market edge at/above threshold;
-otherwise (no market, or edge below threshold) it is NO BET.
+The bot is a pure tipster: every match prediction carries a home/away
+designation, the model H/D/A probabilities, and the xG readout when present.
+There is NO user-facing bet / no-bet call (removed by operator directive) — the
+internal paper_bet / edge record is still logged for our own accuracy tracking
+but never rendered to users.
 
 Messages use Telegram Markdown (``parse_mode="Markdown"``), matching
 :mod:`betbot.reports`.
 """
 
 from __future__ import annotations
-
-from betbot.config import get_settings
 
 
 def _kickoff_str(pred) -> str:
@@ -27,33 +25,13 @@ def _kickoff_str(pred) -> str:
     return ko.strftime("%H:%M")
 
 
-def _reco_bet(pred, *, edge_threshold: float):
-    """The stored recommendation for this prediction, or ``None`` = NO BET.
-
-    Our recommendation is the linked paper_bet. A paper_bet with a market price
-    and an edge >= threshold is a BET on ``outcome``; anything else (no
-    paper_bet, no market price, or edge below threshold) is NO BET.
-    """
-    bets = list(getattr(pred, "paper_bets", None) or [])
-    for b in bets:
-        if b.market_price is not None and b.edge is not None and b.edge >= edge_threshold:
-            return b
-    return None
-
-
-def _outcome_label(outcome: str, home: str, away: str) -> str:
-    if outcome == "HOME":
-        return f"{home} (H)"
-    if outcome == "AWAY":
-        return f"{away} (A)"
-    return "the draw"
-
-
 def format_prediction(pred, *, edge_threshold: float | None = None) -> str:
-    """Full revealed prediction: teams (H/A), model triple + xG, market, call."""
-    if edge_threshold is None:
-        edge_threshold = get_settings().edge_threshold
+    """Full revealed prediction: teams (H/A), model triple + xG.
 
+    Pure tipster output — the bot no longer emits a bet / no-bet call or the
+    market/edge line that supported it. ``edge_threshold`` is accepted (and
+    ignored) for backwards-compatible call sites.
+    """
     home, away = pred.home_team, pred.away_team
     ko = _kickoff_str(pred)
     header = f"*{home} (H) v {away} (A)*"
@@ -66,25 +44,7 @@ def format_prediction(pred, *, edge_threshold: float | None = None) -> str:
     if pred.home_xg is not None and pred.away_xg is not None:
         model += f"   (xG {pred.home_xg:.2f}–{pred.away_xg:.2f})"
 
-    reco = _reco_bet(pred, edge_threshold=edge_threshold)
-    if reco is not None:
-        market = f"Market: {reco.outcome} {reco.market_price:.2f}   Edge: {reco.edge:+.2f}"
-        call = f"*Bet: {_outcome_label(reco.outcome, home, away)}* (edge {reco.edge:+.2f})"
-    else:
-        # Any priced-but-below-threshold reco still shows the price if we have it.
-        priced = next(
-            (b for b in (getattr(pred, "paper_bets", None) or [])
-             if b.market_price is not None),
-            None,
-        )
-        if priced is not None:
-            market = f"Market: {priced.outcome} {priced.market_price:.2f}"
-            call = "*Bet: NO BET* (edge below threshold)"
-        else:
-            market = "Market: n/a"
-            call = "*Bet: NO BET* (no market)"
-
-    return "\n".join([header, model, market, call])
+    return "\n".join([header, model])
 
 
 def _format_xi(side: dict | None) -> str:

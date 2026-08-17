@@ -5,7 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from betbot.tips import format_locked, format_prediction, format_result
+from betbot.tips import (
+    format_locked,
+    format_prediction,
+    format_prediction_with_lineup,
+    format_result,
+)
 
 
 @dataclass
@@ -28,19 +33,30 @@ class _Pred:
     paper_bets: list = field(default_factory=list)
 
 
-def test_format_prediction_has_home_away_tags_and_bold_call():
+def test_format_prediction_has_home_away_tags_probs_and_no_bet_line():
     text = format_prediction(_Pred(), edge_threshold=0.05)
     assert "Man City (H)" in text
     assert "Arsenal (A)" in text
-    # A bold bet/no-bet line is always present.
-    assert "*Bet:" in text
+    # Model probabilities and kickoff are present.
+    assert "H 39% / D 31% / A 30%" in text
     assert "19:30" in text
+    # Pure tipster: NO bet / no-bet / market / edge language anywhere.
+    assert "Bet" not in text
+    assert "NO BET" not in text
+    assert "Edge" not in text
+    assert "Market" not in text
 
 
-def test_no_bet_is_the_default_when_no_market():
-    text = format_prediction(_Pred(paper_bets=[]), edge_threshold=0.05)
-    assert "*Bet: NO BET*" in text
-    assert "Market: n/a" in text
+def test_bet_line_absent_even_when_a_paper_bet_exists():
+    # A stored paper_bet (internal reco record) must NOT surface to the user.
+    p = _Pred(paper_bets=[_Bet(outcome="HOME", market_price=0.45, edge=0.06)])
+    text = format_prediction(p, edge_threshold=0.05)
+    assert "Bet" not in text
+    assert "Edge" not in text
+    assert "Market" not in text
+    # Prediction body still present.
+    assert "Man City (H)" in text
+    assert "H 39% / D 31% / A 30%" in text
 
 
 def test_xg_shown_when_present_and_hidden_when_absent():
@@ -50,26 +66,29 @@ def test_xg_shown_when_present_and_hidden_when_absent():
     assert "xG" not in without
 
 
-def test_bet_call_when_edge_at_threshold():
-    p = _Pred(paper_bets=[_Bet(outcome="HOME", market_price=0.45, edge=0.06)])
-    text = format_prediction(p, edge_threshold=0.05)
-    assert "Market: HOME 0.45" in text
-    assert "Edge: +0.06" in text
-    assert "*Bet: Man City (H)*" in text
+def test_lineup_variant_shows_xi_and_probs_but_no_bet_line():
+    lineup = {
+        "home": {"formation": "4-3-3", "xi": ["Ederson", "Walker", "Dias"]},
+        "away": {"formation": "4-2-3-1", "xi": ["Raya", "White", "Saliba"]},
+    }
+    text = format_prediction_with_lineup(
+        _Pred(paper_bets=[_Bet(outcome="HOME", market_price=0.45, edge=0.06)]),
+        lineup,
+        edge_threshold=0.05,
+        adj_note="(lineup adjusted)",
+    )
+    # Confirmed XI block present.
+    assert "Man City (H)* XI: [4-3-3] Ederson, Walker, Dias" in text
+    assert "Arsenal (A)* XI: [4-2-3-1] Raya, White, Saliba" in text
+    assert "(lineup adjusted)" in text
+    # Prediction body present.
+    assert "H 39% / D 31% / A 30%" in text
+    assert "xG 1.44" in text
+    # No bet-call language anywhere.
+    assert "Bet" not in text
     assert "NO BET" not in text
-
-
-def test_priced_below_threshold_is_no_bet_but_shows_price():
-    p = _Pred(paper_bets=[_Bet(outcome="HOME", market_price=0.45, edge=0.01)])
-    text = format_prediction(p, edge_threshold=0.05)
-    assert "*Bet: NO BET* (edge below threshold)" in text
-    assert "Market: HOME 0.45" in text
-
-
-def test_away_bet_uses_away_team_label():
-    p = _Pred(paper_bets=[_Bet(outcome="AWAY", market_price=0.30, edge=0.08)])
-    text = format_prediction(p, edge_threshold=0.05)
-    assert "*Bet: Arsenal (A)*" in text
+    assert "Edge" not in text
+    assert "Market" not in text
 
 
 def test_format_locked_hides_probabilities():
