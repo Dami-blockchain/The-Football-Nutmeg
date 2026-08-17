@@ -136,6 +136,33 @@ def format_prediction_with_lineup(
     return body
 
 
+def _pick_label(pick: str, home: str, away: str) -> str:
+    if pick == "HOME":
+        return f"{home} (H)"
+    if pick == "AWAY":
+        return f"{away} (A)"
+    return "the draw"
+
+
+def format_result(outcome_row, home_team: str, away_team: str) -> str:
+    """End-of-match RESULT ALERT body for one settled fixture.
+
+    Shows the final score, whether OUR pick was right, and the model's original
+    triple — no new probabilities are gated (the user already saw/paid for the
+    prediction). ``outcome_row`` is a
+    :class:`~betbot.storage.models.PredictionOutcome`.
+    """
+    verdict = "✅ correct" if outcome_row.correct else "❌ wrong"
+    pick = _pick_label(outcome_row.predicted_pick, home_team, away_team)
+    return "\n".join([
+        f"*Full time: {home_team} {outcome_row.home_goals}-"
+        f"{outcome_row.away_goals} {away_team}*",
+        f"Our call: {pick} — {verdict}",
+        f"Model had H {outcome_row.predicted_home:.0%} / "
+        f"D {outcome_row.predicted_draw:.0%} / A {outcome_row.predicted_away:.0%}",
+    ])
+
+
 def format_locked(pred) -> str:
     """Teaser for a locked prediction — teams + kickoff only, NO probabilities."""
     home, away = pred.home_team, pred.away_team
