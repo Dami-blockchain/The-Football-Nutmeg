@@ -638,6 +638,15 @@ def run_daemon(
                 except Exception as e:  # noqa: BLE001 — one league must not sink the rest
                     get_logger(__name__).warning(
                         "season_title_league_failed", league=code, error=str(e))
+            # Champions League winner projection (tournament sim, ClubElo-seeded).
+            try:
+                subprocess.run(
+                    [".venv/bin/python", "scripts/simulate_cl.py"],
+                    cwd=str(_REPO_ROOT), timeout=900, check=True,
+                    capture_output=True,
+                )
+            except Exception as e:  # noqa: BLE001 — CL must not sink the leagues
+                get_logger(__name__).warning("cl_winner_refresh_failed", error=str(e))
         try:
             await asyncio.to_thread(_run)
             get_logger(__name__).info("season_title_refreshed", leagues=len(leagues))

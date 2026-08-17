@@ -130,7 +130,7 @@ def build_onboarding_guide(user, settings) -> str:
         f"{pricing}"
         "*Commands*\n"
         "/predictions – today's fixtures + picks\n"
-        "/title – who's winning La Liga? (or /title PL)\n"
+        "/title – who's winning La Liga? (or /title PL, /title CL)\n"
         "/balance – your balance + credits\n"
         "/status – trial / credits status\n"
         "/record – how accurate I've been\n"
@@ -294,14 +294,64 @@ def _format_title_race(result: dict, code: str) -> str:
     return "\n".join(lines) + note
 
 
+def _format_cl_winner(result: dict) -> str:
+    """Render a cached Champions League winner projection for /title CL."""
+    gen = (result.get("generated_at") or "")[:10]
+    pre_draw = result.get("pre_draw", True)
+    n = result.get("n_entrants") or 0
+    table = result.get("table") or []
+
+    lines = ["*🏆 Champions League winner*"]
+    ctx = []
+    if pre_draw:
+        ctx.append("pre-draw estimate")
+    else:
+        ctx.append("live bracket")
+    if n:
+        ctx.append(f"{n} entrants")
+    lines.append("_" + ", ".join(ctx) + "_")
+    lines.append("")
+    for i, row in enumerate(table[:8], 1):
+        lines.append(f"{i}. *{row['team']}* — {row['p_win']*100:.0f}%")
+    if not table:
+        lines.append("_No projection available yet._")
+    note_bits = [
+        "Tournament projection from a ClubElo Monte-Carlo — not a guarantee.",
+    ]
+    if pre_draw:
+        note_bits.append(
+            "The 2026/27 draw isn't out yet, so this is a seeded-bracket "
+            "estimate off current ClubElo strength and will change once the "
+            "real draw lands."
+        )
+    if gen:
+        note_bits.append(f"Sim run {gen}.")
+    return "\n".join(lines) + "\n\n_" + " ".join(note_bits) + "_"
+
+
 @_authed
 async def title_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Season-title race for a league (default La Liga). FREE, cached."""
+    """Season-title race for a league (default La Liga), or /title CL. FREE, cached."""
     from betbot.season_service import LEAGUE_NAMES, load_cache
 
     _register(update)
     s = get_settings()
     arg = (ctx.args[0].upper() if ctx.args else "PD")
+
+    if arg == "CL":
+        from betbot.cl_service import load_cache as load_cl_cache
+        cl_result = load_cl_cache(s)
+        if not cl_result or not cl_result.get("table"):
+            await update.message.reply_text(
+                "The Champions League winner projection is still being "
+                "computed — check back shortly. (Tip: /title PL, /title PD.)"
+            )
+            return
+        await update.message.reply_text(
+            _format_cl_winner(cl_result), parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
     code = arg if arg in LEAGUE_NAMES else "PD"
     result = load_cache(s, code)
     if not result:
