@@ -50,7 +50,7 @@ _BROWSER_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120 Safari/537.36"
 )
-_FALLBACK_MODEL = "llama-3.1-8b-instant"
+_FALLBACK_MODEL = "openai/gpt-oss-20b"
 
 # ~6 exchanges of context per user (each exchange = user + assistant message).
 MAX_HISTORY_MESSAGES = 12

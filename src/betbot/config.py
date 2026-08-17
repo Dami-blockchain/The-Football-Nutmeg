@@ -188,7 +188,7 @@ class Settings(BaseSettings):
     # field is retained (harmless) but no longer drives the chat path.
     groq_api_key: str = Field(default="", alias="GROQ_API_KEY")
     groq_model: str = Field(
-        default="llama-3.3-70b-versatile", alias="BETBOT_GROQ_MODEL"
+        default="openai/gpt-oss-120b", alias="BETBOT_GROQ_MODEL"
     )
     groq_base_url: str = Field(
         default="https://api.groq.com/openai/v1", alias="BETBOT_GROQ_BASE_URL"
@@ -197,7 +197,7 @@ class Settings(BaseSettings):
     llm_model: str = Field(
         default="claude-haiku-4-5-20251001", alias="BETBOT_LLM_MODEL"
     )
-    llm_max_tokens: int = Field(default=500, alias="BETBOT_LLM_MAX_TOKENS")
+    llm_max_tokens: int = Field(default=1024, alias="BETBOT_LLM_MAX_TOKENS")
     # Per-user daily question cap: the bot is public, so this bounds API spend
     # per Telegram user per UTC day.
     llm_daily_limit_per_user: int = Field(
