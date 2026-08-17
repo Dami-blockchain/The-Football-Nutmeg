@@ -61,10 +61,13 @@ _MAX_REPLY_CHARS = 3900
 SYSTEM_PROMPT = (
     "You are Football Nutmeg Bot, a football match-prediction assistant on "
     "Telegram. Be concise, friendly, and conversational. You may ONLY discuss "
-    "the predictions listed as available below. If the user asks about a match "
-    "marked LOCKED, do NOT reveal any pick or probability — tell them to unlock "
-    "it for 1 USDC via the pre-match alert. Never invent predictions not "
-    "listed. This is not financial advice."
+    "the predictions listed as available below. Respect the ACCESS line: if the "
+    "user has full access (operator or trial) NEVER tell them anything is locked "
+    "or that they must pay. Only for a fixture explicitly marked LOCKED do you "
+    "withhold the pick and mention unlocking it for 1 USDC via the pre-match "
+    "alert. If NO predictions are listed (no fixtures today), simply say there "
+    "are no matches today — do NOT invent predictions and do NOT mention paying "
+    "or unlocking. This is not financial advice."
 )
 
 NO_KEY_MESSAGE = (
@@ -127,13 +130,34 @@ def build_prediction_context(user, settings, *, now: datetime | None = None) -> 
 
     start, end, _day = nairobi_day_bounds(now)
     preds = predictions_for_kickoff_range(start, end)
-    if not preds:
-        return record_line + "\n\nToday's predictions available to this user:\n(no fixtures today)"
 
     ent = entitlement_for(user, settings, now=now)
     all_free = ent.reason in ("operator", "trial")
+    if ent.reason == "operator":
+        access_note = (
+            "ACCESS: this user is the OPERATOR — unlimited free access. Nothing "
+            "is ever locked for them; never mention paying or unlocking."
+        )
+    elif ent.reason == "trial":
+        access_note = (
+            "ACCESS: this user is on their free trial — all of today's "
+            "predictions are unlocked for them; do not mention paying."
+        )
+    else:
+        access_note = (
+            "ACCESS: this user is a payer — only fixtures shown with a pick are "
+            "unlocked; fixtures marked LOCKED need 1 USDC to reveal."
+        )
 
-    lines = [record_line, "", "Today's predictions available to this user:"]
+    if not preds:
+        return "\n".join([
+            record_line, "", access_note, "",
+            "Today's predictions available to this user: (no fixtures scheduled "
+            "today). Tell the user plainly there are no matches today; do NOT "
+            "mention locking or paying.",
+        ])
+
+    lines = [record_line, "", access_note, "", "Today's predictions available to this user:"]
     for p in preds:
         entitled = all_free or has_revealed(
             user.telegram_user_id, p.fixture_id
