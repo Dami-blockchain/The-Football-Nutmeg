@@ -284,10 +284,20 @@ def _format_title_race(result: dict, code: str) -> str:
     if not table:
         lines.append("_No projection available yet._")
     early = (played or 0) < 8
+    unrated = result.get("unrated") or []
+    unrated_note = (
+        "New/promoted sides ("
+        + ", ".join(unrated[:4])
+        + (", …" if len(unrated) > 4 else "")
+        + ") have no rating history yet and are priced neutrally. "
+        if unrated
+        else ""
+    )
     note = (
         "\n\n_Model projection from a Monte-Carlo of the run-in — not a "
         "guarantee. "
         + ("Very early season, so this will move a lot. " if early else "")
+        + unrated_note
         + (f"Sim run {gen}." if gen else "")
         + "_"
     )
