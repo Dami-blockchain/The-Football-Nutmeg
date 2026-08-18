@@ -149,3 +149,77 @@ def test_format_prediction_states_predicted_winner():
                                home_xg=None, away_xg=None, competition_code="PL",
                                kickoff=None, paper_bets=[])
     assert "B to win" in format_prediction(away_fav)
+
+
+# ----------------------------------------------------------------------
+# Flag-gated confidence filter: the BOLD BET / NO BET call
+# ----------------------------------------------------------------------
+from betbot.config import Settings  # noqa: E402
+
+
+def _settings(**kw):
+    base = dict(
+        _env_file=None,
+        FOOTBALL_DATA_API_KEY="fake-test-key",
+        BETBOT_CONFIDENCE_FILTER="true",
+        BETBOT_CONFIDENCE_THRESHOLD="0.60",
+        BETBOT_CONFIDENCE_DRAW_MARGIN="0.05",
+    )
+    base.update(kw)
+    return Settings(**base)
+
+
+def test_no_call_line_when_flag_is_off():
+    """Shipped default: output is unchanged pure-tipster text."""
+    off = _settings(BETBOT_CONFIDENCE_FILTER="false")
+    text = format_prediction(_Pred(p_home=0.72, p_draw=0.16, p_away=0.12), settings=off)
+    assert "BET" not in text
+    assert "Man City (H)" in text
+
+
+def test_bet_call_when_favourite_clears_the_threshold():
+    pred = _Pred(p_home=0.72, p_draw=0.16, p_away=0.12)
+    text = format_prediction(pred, settings=_settings())
+    assert "*BET: Man City (H) to win* (72% confidence)" in text
+    assert "NO BET" not in text
+    # Home/away tags and the model triple survive alongside the call.
+    assert "Man City (H)" in text and "Arsenal (A)" in text
+    assert "H 72% / D 16% / A 12%" in text
+
+
+def test_bet_call_names_the_away_side_when_the_away_team_is_the_favourite():
+    pred = _Pred(p_home=0.12, p_draw=0.18, p_away=0.70)
+    text = format_prediction(pred, settings=_settings())
+    assert "*BET: Arsenal (A) to win* (70% confidence)" in text
+
+
+def test_no_bet_default_below_the_threshold():
+    pred = _Pred(p_home=0.55, p_draw=0.25, p_away=0.20)
+    text = format_prediction(pred, settings=_settings())
+    assert "*NO BET*" in text
+    assert "*BET:" not in text
+
+
+def test_no_bet_when_the_draw_is_too_close():
+    pred = _Pred(p_home=0.62, p_draw=0.60, p_away=0.30)
+    text = format_prediction(pred, settings=_settings())
+    assert "*NO BET*" in text
+
+
+def test_call_line_never_claims_value():
+    """Honesty pin: no +EV / edge / market-beating language in the copy."""
+    for pred in (
+        _Pred(p_home=0.72, p_draw=0.16, p_away=0.12),
+        _Pred(p_home=0.55, p_draw=0.25, p_away=0.20),
+    ):
+        text = format_prediction(pred, settings=_settings()).lower()
+        for banned in ("+ev", "expected value", "edge", "value bet", "beat the market"):
+            assert banned not in text
+
+
+def test_lineup_wrapper_threads_settings_through():
+    pred = _Pred(p_home=0.72, p_draw=0.16, p_away=0.12)
+    lineup = {"home": {"formation": "4-3-3", "xi": ["A", "B"]}, "away": None}
+    text = format_prediction_with_lineup(pred, lineup, settings=_settings())
+    assert "*BET: Man City (H) to win*" in text
+    assert "[4-3-3]" in text
