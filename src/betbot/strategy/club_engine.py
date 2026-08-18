@@ -247,18 +247,14 @@ class ClubStrategyEngine:
         w_model = s.club_weight_glicko + s.club_weight_form + (
             s.club_weight_dc if self._dc_params is not None else 0.0
         )
-        p_model = {
-            Outcome.HOME: prediction.p_home,
-            Outcome.DRAW: prediction.p_draw,
-            Outcome.AWAY: prediction.p_away,
-        }[outcome]
+        # Single-anchor invariant: anchor the RAW model probability toward the
+        # exchange price. When BETBOT_ODDS_ANCHOR has already pulled the
+        # displayed p_* toward a bookmaker line, anchoring that number again
+        # would double-count the market and — where the book and the exchange
+        # disagree — manufacture apparent edge out of the disagreement.
+        p_model = prediction.model_probability(outcome)
         p_final = anchor_to_market(p_model, market_price, w_model, s.club_weight_market)
-        field_name = {
-            Outcome.HOME: "p_home",
-            Outcome.DRAW: "p_draw",
-            Outcome.AWAY: "p_away",
-        }[outcome]
-        anchored = dataclasses.replace(prediction, **{field_name: p_final})
+        anchored = prediction.anchored_to_market(outcome, p_final)
         return self._base.decide_with_market(
             anchored, outcome, market_price, require_edge=require_edge
         )
