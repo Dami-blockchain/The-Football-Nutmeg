@@ -221,6 +221,9 @@ class FootballDataCoUkProvider:
         # audit script and logged once per run — this is how the alias table
         # grows, deliberately.
         self.unresolved: dict[str, int] = {}
+        # Exact coverage counters (in-scope fixtures seen / skipped on a name).
+        self.attempted_fixtures = 0
+        self.skipped_fixtures = 0
 
     # -- public ---------------------------------------------------------
     def fetch(self, leagues: Sequence[str]) -> list[MatchOdds]:
@@ -268,9 +271,13 @@ class FootballDataCoUkProvider:
                 continue
             raw_home = (row.get("HomeTeam") or "").strip()
             raw_away = (row.get("AwayTeam") or "").strip()
+            if not (raw_home and raw_away):
+                continue
+            self.attempted_fixtures += 1
             home = self._resolver.resolve(raw_home)
             away = self._resolver.resolve(raw_away)
             if home is None or away is None:
+                self.skipped_fixtures += 1
                 for nm, res in ((raw_home, home), (raw_away, away)):
                     if res is None and nm:
                         self.unresolved[nm] = self.unresolved.get(nm, 0) + 1

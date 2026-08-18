@@ -35,7 +35,7 @@ from betbot.data.models import Fixture, FixtureForm, FormSnapshot, Team
 from betbot.strategy import dixon_coles as dc
 from betbot.strategy.engine import StrategyEngine
 from betbot.exchanges.matcher import normalize
-from betbot.strategy.ensemble import log_pool, ranked_probability_score
+from betbot.strategy.ensemble import anchor_triple, log_pool, ranked_probability_score
 from betbot.strategy.glicko import Glicko2Rating, match_probabilities, update_rating
 
 OUT_IDX = {"HOME": 0, "DRAW": 1, "AWAY": 2}
@@ -72,6 +72,59 @@ def _market_probs(ps: tuple[str, str, str]) -> tuple[float, float, float] | None
     inv = [1.0 / v for v in o]
     s = sum(inv)
     return (inv[0] / s, inv[1] / s, inv[2] / s)
+
+
+def _odds_triple(row: dict, prefix: str) -> tuple[float, float, float] | None:
+    """De-vigged 1X2 probabilities from one price vintage of data/club_odds.csv."""
+    try:
+        o = [float(row[f"{prefix}_{k}"]) for k in ("home", "draw", "away")]
+    except (KeyError, ValueError, TypeError):
+        return None
+    if any(v <= 1.0 for v in o):
+        return None
+    inv = [1.0 / v for v in o]
+    s = sum(inv)
+    return (inv[0] / s, inv[1] / s, inv[2] / s)
+
+
+def _load_odds(path: Path) -> dict[tuple[str, str, str], list[tuple]]:
+    """data/club_odds.csv -> {(league, home, away): [(date, pre, close), ...]}.
+
+    ``pre`` is the EARLY-WEEK price — the same column family the live
+    fixtures.csv feed publishes, so it is the honest stand-in for what we would
+    have at T-24h. ``close`` is the KICKOFF price: not available pre-match, and
+    kept only so the report can quantify how optimistic a closing-odds
+    backtest is.
+    """
+    idx: dict[tuple[str, str, str], list[tuple]] = defaultdict(list)
+    if not path.exists():
+        return idx
+    for r in csv.DictReader(path.open()):
+        try:
+            d = date.fromisoformat(r["date"])
+        except (KeyError, ValueError):
+            continue
+        idx[(r["league"], r["home"], r["away"])].append(
+            (d, _odds_triple(r, "pre"), _odds_triple(r, "close"))
+        )
+    return idx
+
+
+def _lookup_odds(idx, league: str, home: str, away: str, d: date, slack: int = 3):
+    """Nearest-date odds row for a fixture, or ``(None, None)``.
+
+    The date slack absorbs a local-vs-UTC date shift without ever reaching the
+    REVERSE fixture later in the season.
+    """
+    best = None
+    best_gap = None
+    for row_date, pre, close in idx.get((league, home, away), ()):  # noqa: B007
+        gap = abs((row_date - d).days)
+        if gap > slack:
+            continue
+        if best_gap is None or gap < best_gap:
+            best, best_gap = (pre, close), gap
+    return best or (None, None)
 
 
 class Glicko:
@@ -148,6 +201,12 @@ def main() -> None:
     ap.add_argument("--test-from", default="2025-07-01",
                     help="matches on/after this date are the held-out test set")
     ap.add_argument("--dc-iterations", type=int, default=200)
+    ap.add_argument("--odds", type=Path, default=Path("data/club_odds.csv"),
+                    help="free pre-match odds history (scripts/fetch_club_odds.py)")
+    ap.add_argument("--no-anchor", action="store_true",
+                    help="skip the odds-anchored variants entirely")
+    ap.add_argument("--anchor-weight", type=float, default=None,
+                    help="market weight in the anchor (default: settings.odds_anchor_market_weight)")
     args = ap.parse_args()
 
     s = get_settings()
@@ -185,10 +244,45 @@ def main() -> None:
         (s.club_weight_form, "form"),
     ]
 
+    # ---- Odds anchoring (R-odds) ---------------------------------------
+    # w_model mirrors ClubStrategyEngine.model_weight(): the summed weight of
+    # the ACTIVE model components, which is the denominator the live anchor
+    # uses. w_market is the shipped setting, NOT tuned here — tuning a weight
+    # after seeing the gate would manufacture a pass.
+    anchor_on = not args.no_anchor
+    odds_idx = _load_odds(args.odds) if anchor_on else {}
+    if anchor_on and not odds_idx:
+        print(f"NOTE: no odds at {args.odds} — run scripts/fetch_club_odds.py. "
+              "Anchored variants skipped.")
+        anchor_on = False
+    w_model = s.club_weight_glicko + s.club_weight_dc + s.club_weight_form
+    w_market = (
+        args.anchor_weight if args.anchor_weight is not None
+        else s.odds_anchor_market_weight
+    )
+    if anchor_on:
+        print(f"anchoring: w_model={w_model:.2f} w_market={w_market:.2f} "
+              f"({len(odds_idx)} fixtures of odds loaded)")
+
     # Accumulators per model.
+    model_names = ["naive", "ensemble", "market"]
+    if anchor_on:
+        model_names += ["market_pre", "market_close", "anchored_pre", "anchored_close"]
     stats: dict[str, dict] = {
-        m: {"n": 0, "hit": 0, "rps": 0.0, "ll": 0.0} for m in ("naive", "ensemble", "market")
+        m: {"n": 0, "hit": 0, "rps": 0.0, "ll": 0.0} for m in model_names
     }
+    # Paired per-match RPS improvements (ensemble - anchored): positive means
+    # anchoring helped. Two populations, because unanchored fixtures dilute:
+    #   *_subset — only fixtures that actually got a quote;
+    #   *_all    — every test fixture, unanchored ones contributing exactly 0.
+    anch_diffs_subset: list[float] = []
+    anch_diffs_all: list[float] = []
+    close_diffs_subset: list[float] = []
+    close_diffs_all: list[float] = []
+    anchored_n = 0
+    # Accuracy before/after ON THE ANCHORED SUBSET (the all-match numbers come
+    # from `stats`, where unanchored fixtures are identical in both models).
+    subset_hits = {"ensemble": 0, "anchored_pre": 0, "anchored_close": 0, "market_pre": 0}
     per_league: dict[str, dict] = defaultdict(
         lambda: {"n": 0, "naive_rps": 0.0, "ens_rps": 0.0}
     )
@@ -221,6 +315,52 @@ def main() -> None:
 
             mkt = _market_probs(r["ps"])
 
+            # ---- odds anchoring ----------------------------------------
+            # The anchor is applied to the ALREADY-COMPUTED walk-forward
+            # ensemble probabilities. It adds no information about the result:
+            # the prices are the ones published BEFORE the match.
+            if anchor_on:
+                pre_mkt, close_mkt = _lookup_odds(
+                    odds_idx, r["league"], normalize(home), normalize(away), d
+                )
+                # Graceful degradation is modelled exactly as it behaves live:
+                # no quote -> the unanchored ensemble ships.
+                anch_pre = (
+                    anchor_triple(ens_probs, pre_mkt, w_model, w_market)
+                    if pre_mkt else ens_probs
+                )
+                anch_close = (
+                    anchor_triple(ens_probs, close_mkt, w_model, w_market)
+                    if close_mkt else ens_probs
+                )
+                e_r = ranked_probability_score(ens_probs, oi)
+                a_r = ranked_probability_score(anch_pre, oi)
+                c_r = ranked_probability_score(anch_close, oi)
+                anch_diffs_all.append(e_r - a_r)
+                close_diffs_all.append(e_r - c_r)
+                if pre_mkt:
+                    anchored_n += 1
+                    anch_diffs_subset.append(e_r - a_r)
+                    close_diffs_subset.append(e_r - c_r)
+                    subset_hits["ensemble"] += int(max(range(3), key=lambda i: ens_probs[i]) == oi)
+                    subset_hits["anchored_pre"] += int(max(range(3), key=lambda i: anch_pre[i]) == oi)
+                    subset_hits["anchored_close"] += int(max(range(3), key=lambda i: anch_close[i]) == oi)
+                    subset_hits["market_pre"] += int(max(range(3), key=lambda i: pre_mkt[i]) == oi)
+                for nm, pr in (("anchored_pre", anch_pre), ("anchored_close", anch_close)):
+                    st = stats[nm]
+                    st["n"] += 1
+                    st["hit"] += int(max(range(3), key=lambda i: pr[i]) == oi)
+                    st["rps"] += ranked_probability_score(pr, oi)
+                    st["ll"] += -math.log(max(pr[oi], 1e-9))
+                for nm, pr in (("market_pre", pre_mkt), ("market_close", close_mkt)):
+                    if not pr:
+                        continue
+                    st = stats[nm]
+                    st["n"] += 1
+                    st["hit"] += int(max(range(3), key=lambda i: pr[i]) == oi)
+                    st["rps"] += ranked_probability_score(pr, oi)
+                    st["ll"] += -math.log(max(pr[oi], 1e-9))
+
             for name, probs in (("naive", naive_probs), ("ensemble", ens_probs)):
                 st = stats[name]
                 st["n"] += 1
@@ -250,11 +390,11 @@ def main() -> None:
 
     # ---- Report --------------------------------------------------------
     print("\n=== held-out test results ===")
-    print(f"{'model':10s} {'n':>5s} {'acc%':>7s} {'meanRPS':>9s} {'logloss':>9s}")
-    for m in ("naive", "ensemble", "market"):
+    print(f"{'model':14s} {'n':>5s} {'acc%':>7s} {'meanRPS':>9s} {'logloss':>9s}")
+    for m in model_names:
         st = stats[m]
         n = max(st["n"], 1)
-        print(f"{m:10s} {st['n']:>5d} {100*st['hit']/n:>7.2f} "
+        print(f"{m:14s} {st['n']:>5d} {100*st['hit']/n:>7.2f} "
               f"{st['rps']/n:>9.4f} {st['ll']/n:>9.4f}")
 
     n = max(stats["ensemble"]["n"], 1)
@@ -267,6 +407,68 @@ def main() -> None:
           f"({'SIGNIFICANT — ensemble wins' if lo > 0 else 'includes 0 — not distinguishable'})")
     rel = 100 * impr / naive_mrps if naive_mrps else 0.0
     print(f"  relative RPS reduction vs naive: {rel:+.2f}%")
+
+    # ---- Odds-anchoring gate -------------------------------------------
+    if anchor_on:
+        total_n = max(stats["ensemble"]["n"], 1)
+        cov = 100.0 * anchored_n / total_n
+        print("\n=== ODDS-ANCHORING GATE ===")
+        print(f"coverage: {anchored_n}/{total_n} test fixtures got a pre-match "
+              f"quote ({cov:.1f}%)")
+        print("\n!! CLOSING-ODDS BIAS — read before believing any of this !!")
+        print("   'anchored_pre'   uses the EARLY-WEEK price (PSH/B365H) — the same")
+        print("   column family the live fixtures.csv feed publishes, so it is what")
+        print("   we could really have at T-24h. THIS is the gate.")
+        print("   'anchored_close' uses the KICKOFF price (PSCH/B365CH), which is NOT")
+        print("   available pre-match. It is reported ONLY to quantify how optimistic")
+        print("   a closing-odds backtest would be. Never ship on it.")
+
+        for label, subset, allm in (
+            ("anchored_pre  (HONEST — pre-match prices)", anch_diffs_subset, anch_diffs_all),
+            ("anchored_close (OPTIMISTIC — lookahead)", close_diffs_subset, close_diffs_all),
+        ):
+            print(f"\n-- {label}")
+            for scope, diffs in (("anchored subset", subset), ("all fixtures", allm)):
+                if not diffs:
+                    print(f"   {scope:16s}: no data")
+                    continue
+                impr = sum(diffs) / len(diffs)
+                lo, hi = _bootstrap_ci(diffs)
+                verdict = (
+                    "GATE PASSED — CI excludes 0" if lo > 0
+                    else ("anchoring HURTS — CI excludes 0" if hi < 0
+                          else "GATE FAILED — CI includes 0")
+                )
+                print(f"   {scope:16s}: n={len(diffs):>5d}  RPS improvement "
+                      f"(ensemble - anchored) {impr:+.5f}/match  "
+                      f"CI95 [{lo:+.5f}, {hi:+.5f}]  -> {verdict}")
+
+        if anchored_n:
+            print(f"\naccuracy ON THE ANCHORED SUBSET (n={anchored_n}):")
+            for k in ("ensemble", "anchored_pre", "anchored_close", "market_pre"):
+                print(f"   {k:16s} {100.0*subset_hits[k]/anchored_n:>6.2f}%")
+            print("\nCEILING CHECK: anchoring shrinks the model TOWARD the price, so")
+            print("anchored accuracy must sit between the ensemble and the market and")
+            print("must NOT exceed the market line. Anchored materially above the")
+            print("market row is a lookahead leak in the harness, not a result.")
+            mp = 100.0 * subset_hits["market_pre"] / anchored_n
+            ap_ = 100.0 * subset_hits["anchored_pre"] / anchored_n
+            if ap_ > mp + 1.0:
+                print(f"   !! ALERT: anchored_pre {ap_:.2f}% > market_pre {mp:.2f}% + 1pt "
+                      "-> investigate the harness before reporting this as a win.")
+            else:
+                print(f"   ok: anchored_pre {ap_:.2f}% <= market_pre {mp:.2f}% + 1pt")
+
+        # Closing-vs-prematch price gap: how much of the measured effect is
+        # only available with hindsight.
+        if stats["market_pre"]["n"] and stats["market_close"]["n"]:
+            mp_rps = stats["market_pre"]["rps"] / stats["market_pre"]["n"]
+            mc_rps = stats["market_close"]["rps"] / stats["market_close"]["n"]
+            print(f"\nprice-vintage gap: market_pre RPS {mp_rps:.5f} vs "
+                  f"market_close RPS {mc_rps:.5f} (close - pre = {mc_rps - mp_rps:+.5f}).")
+            print("   Negative/near-zero means the early price we CAN get is about as")
+            print("   informative as the closing price we CANNOT — i.e. the usual")
+            print("   closing-odds optimism is small on this sample. Report it either way.")
 
     print("\nper-league mean RPS (naive -> ensemble):")
     for lg in sorted(per_league):
