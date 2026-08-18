@@ -319,11 +319,32 @@ def _ledger_epoch() -> datetime | None:
         return None
 
 
+# A real 1X2 forecast never assigns a component below this. Anything that does
+# is the degenerate 0/0/100-AWAY rating bug — those rows are excluded from every
+# accuracy read no matter when they settled. The date epoch alone is NOT enough:
+# stale fixtures are backfilled with settled_at = now, so a poisoned prediction
+# made before the fix can land in the ledger dated after it (verified on the
+# live ledger 2026-08-18: a 0.000/0.000/1.000 row carried settled_at 2026-08-17
+# 18:00, i.e. inside the epoch).
+_DEGENERATE_P = 1e-4
+
+
+def _is_degenerate(row: PredictionOutcome) -> bool:
+    return min(row.predicted_home, row.predicted_draw, row.predicted_away) < _DEGENERATE_P
+
+
 def prediction_outcomes_since(days: int) -> list[PredictionOutcome]:
     """Scored predictions settled within the trailing window (newest first).
 
-    Clamped to the accuracy-ledger epoch, so poisoned pre-fix rows can never
-    leak into a user-facing accuracy figure.
+    Two poison filters, both of which must hold for a row to be reported:
+
+    * settled on/after the accuracy-ledger epoch
+      (``BETBOT_ACCURACY_LEDGER_EPOCH``), and
+    * a non-degenerate probability triple (see ``_DEGENERATE_P``).
+
+    Together these keep the 0/0/100-AWAY-bug era out of every user-facing
+    accuracy figure, including rows the bug era backfilled under a recent
+    ``settled_at``.
     """
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     epoch = _ledger_epoch()
@@ -338,7 +359,13 @@ def prediction_outcomes_since(days: int) -> list[PredictionOutcome]:
             ).scalars()
         )
         s.expunge_all()
-        return rows
+        clean = [r for r in rows if not _is_degenerate(r)]
+        if len(clean) != len(rows):
+            log.info(
+                "accuracy_ledger_degenerate_rows_excluded",
+                excluded=len(rows) - len(clean),
+            )
+        return clean
 
 
 def track_record(days: int = 30) -> dict:

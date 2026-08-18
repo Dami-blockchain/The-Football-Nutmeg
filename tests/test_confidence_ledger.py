@@ -136,3 +136,27 @@ def test_unparseable_epoch_disables_the_cutoff(db, monkeypatch):
         assert len(prediction_outcomes_since(365)) == 1
     finally:
         get_settings.cache_clear()
+
+
+# ---- degenerate-triple poison filter ---------------------------------
+
+def test_degenerate_0_0_100_rows_are_excluded_whenever_they_settled(db):
+    """The date epoch alone is not enough.
+
+    Stale fixtures are backfilled with settled_at = now, so a prediction made
+    during the 0/0/100-AWAY bug era can land in the ledger dated AFTER the
+    epoch (observed on the live ledger 2026-08-18). Filter on the poison's
+    actual signature — a probability component of essentially zero.
+    """
+    _score(1, 0.0, 0.0, 1.0, "DRAW", settled_at=_now())   # poisoned
+    _score(2, 0.60, 0.25, 0.15, "HOME", settled_at=_now())  # clean
+    rows = prediction_outcomes_since(365)
+    assert [r.fixture_id for r in rows] == [2]
+    tr = track_record(365)
+    assert tr["n"] == 1 and tr["hits"] == 1
+
+
+def test_a_merely_lopsided_but_real_forecast_is_kept(db):
+    """Guard the guard: a legitimate 90/6/4 favourite must NOT be filtered."""
+    _score(1, 0.90, 0.06, 0.04, "HOME", settled_at=_now())
+    assert len(prediction_outcomes_since(365)) == 1
