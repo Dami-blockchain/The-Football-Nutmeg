@@ -328,13 +328,25 @@ class OddsService:
         settings,
         providers: Iterable[OddsProvider] | None = None,
         *,
+        resolver: OddsNameResolver | None = None,
         clock=time.monotonic,
     ) -> None:
         self._settings = settings
         self._clock = clock
-        self._providers: list[OddsProvider] = list(providers) if providers is not None else []
-        if not self._providers:
-            self._providers = [_default_provider(settings)]
+        given = list(providers) if providers is not None else None
+        if resolver is None and given:
+            for p in given:
+                r = getattr(p, "_resolver", None)
+                if r is not None:
+                    resolver = r
+                    break
+        self._resolver = resolver or _build_resolver(settings)
+        # providers=[] is a deliberate OFFLINE service (rows injected via
+        # load_rows: backtests, replays, tests). Only ``None`` means "give me
+        # the default live provider".
+        self._providers: list[OddsProvider] = (
+            given if given is not None else [_default_provider(settings, self._resolver)]
+        )
         self._index: dict[tuple[str, str, str], list[MatchOdds]] = {}
         self._loaded_at: float | None = None
         self._last_request_at: float | None = None
@@ -406,9 +418,9 @@ class OddsService:
         through the same explicit resolver as the feed's own spellings, so
         both sides meet in the canonical dataset namespace.
         """
-        resolver = self.resolver
-        home = resolver.resolve(home_name) if resolver else None
-        away = resolver.resolve(away_name) if resolver else None
+        resolver = self._resolver
+        home = resolver.resolve(home_name)
+        away = resolver.resolve(away_name)
         if home is None or away is None:
             log.info(
                 "odds_fixture_name_unresolved",
@@ -436,12 +448,8 @@ class OddsService:
         return OddsQuote(odds=best)
 
     @property
-    def resolver(self) -> OddsNameResolver | None:
-        for p in self._providers:
-            r = getattr(p, "_resolver", None)
-            if r is not None:
-                return r
-        return None
+    def resolver(self) -> OddsNameResolver:
+        return self._resolver
 
     @property
     def providers(self) -> list[OddsProvider]:
@@ -451,13 +459,17 @@ class OddsService:
         return sum(len(v) for v in self._index.values())
 
 
-def _default_provider(settings) -> OddsProvider:
-    resolver = OddsNameResolver.from_files(
+def _build_resolver(settings) -> OddsNameResolver:
+    return OddsNameResolver.from_files(
         getattr(settings, "odds_team_alias_path", Path("./config/odds_team_aliases.yaml")),
         getattr(settings, "club_name_map_path", Path("./data/club_name_map.json")),
     )
+
+
+def _default_provider(settings, resolver: OddsNameResolver | None = None) -> OddsProvider:
     return FootballDataCoUkProvider(
-        resolver, timeout=float(getattr(settings, "odds_http_timeout_seconds", 30.0))
+        resolver or _build_resolver(settings),
+        timeout=float(getattr(settings, "odds_http_timeout_seconds", 30.0)),
     )
 
 
