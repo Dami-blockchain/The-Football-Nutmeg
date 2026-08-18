@@ -361,6 +361,45 @@ class Settings(BaseSettings):
     cl_weight_dc: float = Field(default=1.0, alias="BETBOT_CL_W_DC")
     cl_weight_market: float = Field(default=1.0, alias="BETBOT_CL_W_MARKET")
 
+    # ---- Confidence filter on the BET / NO BET call (flag-gated, OFF) ---
+    # A PRE-REGISTERED selection rule, not a model change: it never alters a
+    # probability, it only decides whether the argmax is put forward as
+    # a BET or falls back to the standing NO BET default. See
+    # betbot/strategy/confidence.py. Default OFF, same discipline as the
+    # dispersion/MOV challengers — turn on only after the live gate below.
+    #
+    # Measured on data/club_results.csv (n=10,734, Pinnacle CLOSING odds — so
+    # optimistic vs the T-24h prices we would have live): favourite hit rate
+    # p>=0.55 -> 68.1% (38% of fixtures), p>=0.60 -> 72.2% (27%), p>=0.65 ->
+    # 75.0% (19%).
+    #
+    # HONESTY: that hit rate is an ACCURACY KPI. It is NOT edge and NOT +EV —
+    # backing favourites at a fair market price is ~0 EV by construction. It
+    # must never be presented as beating the market.
+    #
+    # Applies to whatever FINAL blended probability the caller passes, so it
+    # keeps working unchanged once market anchoring lands on all fixtures.
+    club_confidence_filter: bool = Field(
+        default=False, alias="BETBOT_CONFIDENCE_FILTER"
+    )
+    # Minimum favourite probability for a BET call.
+    club_confidence_threshold: float = Field(
+        default=0.60, alias="BETBOT_CONFIDENCE_THRESHOLD"
+    )
+    # Force NO BET when p_draw is within this of the favourite. Draws are ~25%
+    # of outcomes and effectively unpickable — this drops the worst-calibrated
+    # call category rather than trying to price it.
+    club_confidence_draw_margin: float = Field(
+        default=0.05, alias="BETBOT_CONFIDENCE_DRAW_MARGIN"
+    )
+    # Accuracy-ledger epoch: outcomes settled BEFORE this date are excluded
+    # from every accuracy read. Predictions made before 2026-08-17 are poisoned
+    # by the degenerate 0/0/100-AWAY rating bug, so quoting them to a user
+    # would be dishonest. Set empty to disable the cutoff.
+    accuracy_ledger_epoch: str = Field(
+        default="2026-08-17", alias="BETBOT_ACCURACY_LEDGER_EPOCH"
+    )
+
     # ---- Storage ------------------------------------------------------
     db_path: Path = Field(
         default=Path("./data/betbot.sqlite"), alias="BETBOT_DB_PATH"
