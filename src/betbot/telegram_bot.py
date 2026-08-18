@@ -246,11 +246,30 @@ async def record_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "\n\n_Small sample so far — treat as provisional._"
             if tr["n"] < 10 else ""
         )
+        # TWO metrics, deliberately kept apart: all-match accuracy (model
+        # skill) and hit rate on the picks the confidence filter actually
+        # CALLS (a selection KPI on short-priced favourites). Merging them
+        # would misrepresent both, so they are never combined into one number.
+        called = tr.get("called") or {}
+        called_block = ""
+        if called.get("enabled") and called.get("n"):
+            c_small = " — provisional" if called["n"] < 30 else ""
+            called_block = (
+                f"\n*Called picks only* (confidence filter)\n"
+                f"Correct: {called['hits']}/{called['n']} "
+                f"({called['hit_rate']:.0%}), 95% CI "
+                f"{called['ci_lo']:.0%}–{called['ci_hi']:.0%}{c_small}\n"
+                f"Called on {called['call_rate']:.0%} of matches\n"
+                "_Called picks are short-priced favourites, so a higher hit "
+                "rate here is expected and is NOT extra profit or an edge._\n"
+            )
         body = (
             "*Track record — last 30 days*\n\n"
+            f"*All matches*\n"
             f"Correct: {tr['hits']}/{tr['n']} ({tr['hit_rate']:.0%})\n"
-            f"Mean RPS: {tr['mean_rps']:.2f}  ·  Mean Brier: {tr['mean_brier']:.2f}\n\n"
-            "_This is prediction accuracy, not proof of profit or betting edge._"
+            f"Mean RPS: {tr['mean_rps']:.2f}  ·  Mean Brier: {tr['mean_brier']:.2f}\n"
+            + called_block
+            + "\n_This is prediction accuracy, not proof of profit or betting edge._"
             + small
         )
     await update.message.reply_text(body, parse_mode=ParseMode.MARKDOWN)

@@ -41,3 +41,24 @@ def settings() -> Settings:
         BETBOT_REQUIRE_GATE="true",
         BETBOT_ARB_EXECUTE="false",
     )
+
+
+@pytest.fixture(autouse=True)
+def _no_ledger_epoch(monkeypatch):
+    """Disable the accuracy-ledger epoch cutoff for the suite.
+
+    Production defaults BETBOT_ACCURACY_LEDGER_EPOCH=2026-08-17 so the
+    poisoned pre-fix 0/0/100-AWAY outcomes never reach a user-facing accuracy
+    figure. Several settlement tests pin a frozen "now" in the past, and a
+    wall-clock-anchored cutoff in the code under test would silently filter
+    their fixtures out — the same staleness trap that bit the kill-switch
+    drawdown test. So the cutoff is off by default here and switched ON
+    explicitly by the tests that actually exercise it
+    (tests/test_confidence_ledger.py).
+    """
+    from betbot.config import get_settings
+
+    monkeypatch.setenv("BETBOT_ACCURACY_LEDGER_EPOCH", "")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()

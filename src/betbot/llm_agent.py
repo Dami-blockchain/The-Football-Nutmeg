@@ -122,10 +122,25 @@ def build_prediction_context(user, settings, *, now: datetime | None = None) -> 
         )
     else:
         small = " (small sample — treat as provisional)" if tr["n"] < 10 else ""
+        # All-match accuracy and called-pick hit rate are DIFFERENT metrics
+        # and are stated separately so the assistant can never conflate them.
+        called = tr.get("called") or {}
+        called_line = ""
+        if called.get("enabled") and called.get("n"):
+            called_line = (
+                f" On the subset the confidence filter CALLS as a bet "
+                f"({called['call_rate']:.0%} of matches): {called['hits']}/"
+                f"{called['n']} ({called['hit_rate']:.0%}, 95% CI "
+                f"{called['ci_lo']:.0%}-{called['ci_hi']:.0%}). Those are "
+                "short-priced favourites, so a higher hit rate there is "
+                "expected and is NOT an edge, NOT +EV and NOT beating the "
+                "market — never present it as such."
+            )
         record_line = (
-            f"Track record (last 30 days): {tr['hits']}/{tr['n']} correct "
-            f"({tr['hit_rate']:.0%}), mean RPS {tr['mean_rps']:.2f}{small}. "
+            f"Track record (last 30 days), ALL matches: {tr['hits']}/{tr['n']} "
+            f"correct ({tr['hit_rate']:.0%}), mean RPS {tr['mean_rps']:.2f}{small}. "
             "This is prediction ACCURACY, not a profit/edge guarantee."
+            + called_line
         )
 
     start, end, _day = nairobi_day_bounds(now)

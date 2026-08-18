@@ -299,9 +299,36 @@ def record_prediction_outcome(
         return False
 
 
+def _ledger_epoch() -> datetime | None:
+    """Earliest settlement instant an accuracy read is allowed to include.
+
+    Outcomes settled before BETBOT_ACCURACY_LEDGER_EPOCH come from the
+    degenerate 0/0/100-AWAY rating bug and are NOT representative of the model
+    we ship, so quoting them to a user would be dishonest. Returns None when
+    the setting is empty/unparseable (cutoff disabled).
+    """
+    from betbot.config import get_settings
+
+    raw = (get_settings().accuracy_ledger_epoch or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw).replace(tzinfo=timezone.utc)
+    except ValueError:
+        log.warning("bad_accuracy_ledger_epoch", value=raw)
+        return None
+
+
 def prediction_outcomes_since(days: int) -> list[PredictionOutcome]:
-    """Scored predictions settled within the trailing window (newest first)."""
+    """Scored predictions settled within the trailing window (newest first).
+
+    Clamped to the accuracy-ledger epoch, so poisoned pre-fix rows can never
+    leak into a user-facing accuracy figure.
+    """
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    epoch = _ledger_epoch()
+    if epoch is not None and epoch > cutoff:
+        cutoff = epoch
     with session_scope() as s:
         rows = list(
             s.execute(
@@ -317,16 +344,45 @@ def prediction_outcomes_since(days: int) -> list[PredictionOutcome]:
 def track_record(days: int = 30) -> dict:
     """Rolling accuracy over scored predictions in the trailing window.
 
-    ``{n, hits, hit_rate, mean_brier, mean_rps, mean_logloss}``. With no data
-    the rates are 0.0 — the caller is responsible for saying "sample too small"
-    honestly. This is ACCURACY, not CLV/profit.
+    Returns TWO metrics that measure different things and must NEVER be merged
+    into a single figure by any caller:
+
+    * top level {n, hits, hit_rate, mean_brier, mean_rps, mean_logloss} —
+      ALL-MATCH 3-way accuracy over every scored prediction. This is model
+      skill; the market closing line sits at ~53-54% on our own data, which is
+      the ceiling a sane all-match number lives under.
+    * ["called"] {n, hits, hit_rate, ci_lo, ci_hi, call_rate, enabled}
+      — hit rate on ONLY the picks the confidence filter actually calls as a
+      BET. This is a SELECTION KPI on short-priced favourites. It is NOT edge,
+      NOT +EV and NOT evidence of beating the market: backing favourites at a
+      fair price is ~0 EV by construction. With the filter flag off, n is 0
+      and enabled is False.
+
+    With no data the rates are 0.0 — the caller is responsible for saying
+    "sample too small" honestly. Neither figure is CLV or profit.
     """
+    from betbot.config import get_settings
+    from betbot.strategy.confidence import call_stats
+
+    settings = get_settings()
     rows = prediction_outcomes_since(days)
     n = len(rows)
+    stats = call_stats(
+        [
+            ((r.predicted_home, r.predicted_draw, r.predicted_away), r.actual_outcome)
+            for r in rows
+        ],
+        enabled=bool(settings.club_confidence_filter),
+        threshold=float(settings.club_confidence_threshold),
+        draw_margin=float(settings.club_confidence_draw_margin),
+    )
+    called = dict(stats["called"])
+    called["enabled"] = bool(settings.club_confidence_filter)
     if n == 0:
         return {
             "n": 0, "hits": 0, "hit_rate": 0.0,
             "mean_brier": 0.0, "mean_rps": 0.0, "mean_logloss": 0.0,
+            "called": called,
         }
     hits = sum(1 for r in rows if r.correct)
     return {
@@ -336,6 +392,7 @@ def track_record(days: int = 30) -> dict:
         "mean_brier": sum(r.brier for r in rows) / n,
         "mean_rps": sum(r.rps for r in rows) / n,
         "mean_logloss": sum(r.log_loss for r in rows) / n,
+        "called": called,
     }
 
 
