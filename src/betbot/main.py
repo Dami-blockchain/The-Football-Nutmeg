@@ -277,6 +277,13 @@ async def _score_and_log_one(
         )
         return 0
 
+    # NOTE (single-anchor invariant): with BETBOT_ODDS_ANCHOR on, this picks
+    # the leg from the ODDS-ANCHORED triple, which flipped the favourite on
+    # 4.1% of held-out fixtures (n=1752, scripts/double_anchor_report.py). That
+    # is deliberate, not a second anchor — the anchored triple is the better
+    # calibrated one (the gate: RPS 0.2033 -> 0.2005), and whichever leg is
+    # chosen, decide_with_market prices it from the RAW model against the
+    # exchange, so the bookmaker never reaches the edge number.
     favourite = prediction.best_outcome
 
     # ---- Market route (Phase 2 + Phase 5 live placement) -------------
