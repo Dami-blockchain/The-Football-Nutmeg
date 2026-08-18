@@ -113,6 +113,19 @@ class ClubStrategyEngine:
         n = normalize(name)
         return self._name_map.get(n, n)
 
+    def model_weight(self) -> float:
+        """Summed log-pool weight of the ACTIVE model components.
+
+        The denominator for any market anchor: it says how much evidence the
+        model side of the blend carries. Read-only — it computes the same sum
+        ``decide_with_market`` already computes inline, so the odds-anchoring
+        path (betbot.strategy.odds_anchor) does not have to guess it.
+        """
+        s = self._settings
+        return s.club_weight_glicko + s.club_weight_form + (
+            s.club_weight_dc if self._dc_params is not None else 0.0
+        )
+
     def is_rated(self, home_name: str, away_name: str) -> bool:
         """True iff both sides have a real rating (RD below the default).
 

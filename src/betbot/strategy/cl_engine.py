@@ -190,6 +190,19 @@ class EuropeanStrategyEngine:
         n = normalize(name)
         return self._name_map.get(n, n)
 
+    def model_weight(self) -> float:
+        """Summed log-pool weight of the ACTIVE model components.
+
+        The Elo component is always on; DC only when it is weighted AND both
+        clubs are in the params — but that is per-fixture, so this returns the
+        weight the CL blend carries in the common (DC-available) case, which
+        is what the odds anchor uses as its model-side denominator.
+        """
+        s = self._settings
+        return s.cl_weight_elo + (
+            s.cl_weight_dc if self._dc_params is not None else 0.0
+        )
+
     def predict(
         self,
         fixture_form: FixtureForm,
