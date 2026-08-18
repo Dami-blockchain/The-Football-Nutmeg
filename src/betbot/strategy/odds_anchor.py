@@ -15,8 +15,16 @@ in ``Prediction.model_probs`` and records ``anchor_source="odds"``. The
 exchange-priced decision path reads ``Prediction.model_probability`` and so
 anchors the RAW model toward the exchange, never this already-anchored number.
 A probability is therefore anchored to at most one market source, exactly once,
-on every path — and the bet decision is invariant to ``BETBOT_ODDS_ANCHOR``.
-An already-anchored prediction is returned unchanged.
+on every path. An already-anchored prediction is returned unchanged.
+
+Precisely what is invariant: FOR ANY GIVEN LEG, the edge priced against the
+exchange is invariant to ``BETBOT_ODDS_ANCHOR``. The decision as a whole is
+NOT — leg selection (``best_outcome``) reads the anchored triple, so the flag
+can change which leg is considered, and hence whether a bet happens at all
+(~4.1% of held-out fixtures). That is deliberate: the anchored triple is better
+calibrated (RPS 0.2033 -> 0.2005, CI excludes 0), and a redirected leg still
+has to clear the edge threshold on its RAW model probability, so the channel
+can decline a bet but can never manufacture edge.
 
 Honesty: anchoring shrinks the model toward the price. It moves us toward
 market-level accuracy and cannot exceed it. It is not an edge.
