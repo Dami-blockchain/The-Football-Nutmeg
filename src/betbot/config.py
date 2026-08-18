@@ -86,6 +86,43 @@ class Settings(BaseSettings):
         alias="HIGHLIGHTLY_BASE_URL",
     )
 
+    # ---- Free pre-match odds anchoring (flag-gated, DEFAULT OFF) -------
+    # anchor_to_market previously fired ONLY when Polymarket happened to list
+    # the fixture, so most big-5 matches shipped raw, unanchored model output.
+    # This flag turns on a free pre-match odds feed (football-data.co.uk —
+    # no key, no signup, no quota, no cost) so EVERY scored club fixture can
+    # be anchored to a de-vigged bookmaker line.
+    #
+    # HONESTY: anchoring moves the model TOWARD market-level accuracy. It
+    # cannot beat the market and it is not an edge. Default OFF until the
+    # pre-registered live gate passes (see RONALDO_PLAN.md).
+    odds_anchor_enabled: bool = Field(default=False, alias="BETBOT_ODDS_ANCHOR")
+    # Weight given to the de-vigged odds line, relative to the engine's own
+    # summed component weights, in the logit-space anchor.
+    odds_anchor_market_weight: float = Field(
+        default=1.0, alias="BETBOT_ODDS_ANCHOR_W"
+    )
+    # Shared-cache TTL: one HTTP GET covers every division's whole card, so
+    # 6h means a 20-fixture Saturday costs ONE request, not twenty.
+    odds_cache_ttl_seconds: float = Field(
+        default=21600.0, alias="BETBOT_ODDS_TTL_SEC"
+    )
+    odds_min_request_interval_seconds: float = Field(
+        default=60.0, alias="BETBOT_ODDS_MIN_INTERVAL_SEC"
+    )
+    odds_http_timeout_seconds: float = Field(
+        default=30.0, alias="BETBOT_ODDS_HTTP_TIMEOUT_SEC"
+    )
+    # Feed dates are local match dates; kickoff dates are UTC. A small slack
+    # absorbs the offset without letting a fixture match the reverse leg.
+    odds_max_date_slack_days: int = Field(
+        default=3, alias="BETBOT_ODDS_DATE_SLACK_DAYS"
+    )
+    odds_team_alias_path: Path = Field(
+        default=Path("./config/odds_team_aliases.yaml"),
+        alias="BETBOT_ODDS_ALIAS_PATH",
+    )
+
     # ---- Lineup-adjusted scoring (R4a) --------------------------------
     # Max Glicko-point penalty when a team's entire expected first XI is
     # absent from the confirmed starting XI. Scales linearly with the

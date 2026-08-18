@@ -1,0 +1,37 @@
+# Explicit team-name bridge: ODDS-PROVIDER spelling -> canonical dataset name.
+#
+# Keys are the CANONICAL dataset name (the football-data.co.uk *historical*
+# spelling, the one our Glicko ratings and Dixon-Coles params are keyed by).
+# Values are the alternative spellings an odds feed uses for that same club.
+#
+# Matching is on the diacritic-stripped, noise-token-stripped, lowercased form
+# (betbot.exchanges.matcher.normalize), so you only need an entry where the
+# feed genuinely disagrees with the historical files.
+#
+# RULES — read before adding anything:
+#   * NEVER add an alias you have not verified against a real feed row. A
+#     missing alias just means that fixture ships unanchored (harmless). A
+#     WRONG alias anchors a prediction to a DIFFERENT club's price. That is
+#     the Espanyol/Barcelona failure mode and it is a merge blocker.
+#   * Every key must already exist as a canonical name, or the loader raises
+#     (AliasTableError) rather than silently accepting a typo.
+#   * `python scripts/audit_odds_aliases.py` prints every spelling the live
+#     feed used that did NOT resolve — that is the ONLY list you should be
+#     adding from.
+
+aliases:
+  # football-data.co.uk disagrees with ITSELF: fixtures.csv writes La Liga's
+  # Atletico as "Atl. Madrid" while every historical mmz4281 season file (and
+  # therefore our ratings) uses "Ath Madrid". Verified 2026-08-18 against a
+  # live fixtures.csv row (SP1, Atl. Madrid v Malaga).
+  "Ath Madrid": ["Atl. Madrid", "Atletico Madrid", "Atl Madrid"]
+
+  # fixtures.csv writes the full club name; the historical files (and our
+  # ratings) use the short one. Verified 2026-08-18 against a live
+  # fixtures.csv row (SP1, Rayo Vallecano v Alaves).
+  "Vallecano": ["Rayo Vallecano"]
+
+  # football-data.org writes the full club name; our ratings use the short
+  # one. Verified 2026-08-18 against a live football-data.org
+  # /competitions/PL/teams response and an unresolved-name log line.
+  "Wolves": ["Wolverhampton Wanderers"]

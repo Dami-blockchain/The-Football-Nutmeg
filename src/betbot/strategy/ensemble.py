@@ -119,6 +119,38 @@ def anchor_to_market(
     return 1.0 / (1.0 + math.exp(-z))
 
 
+def anchor_triple(
+    p_model: Probs, p_market: Probs, w_model: float, w_market: float
+) -> Probs:
+    """Anchor a whole 1X2 triple toward a de-vigged market triple.
+
+    Per-outcome :func:`anchor_to_market` (logit-space blend), then renormalise
+    so the result is a probability distribution again. Renormalising after
+    three independent binary blends is the standard, well-behaved way to do
+    this; it is NOT identical to a 3-way log-pool but stays inside a few
+    thousandths of it and keeps the single-outcome path (which
+    ``decide_with_market`` already uses) and the triple path consistent.
+
+    ``p_market`` must already be de-vigged (see :func:`de_vig`) — anchoring to
+    raw bookmaker prices would drag every outcome up by the overround.
+
+    Honesty note: this SHRINKS us toward the price. It moves the model toward
+    market-level accuracy; it cannot exceed it, and it is not an edge.
+    """
+    if w_market <= 0.0 or w_model < 0.0:
+        return p_model
+    if any(not 0.0 < p < 1.0 for p in p_market):
+        return p_model
+    blended = [
+        anchor_to_market(pm, pk, w_model, w_market)
+        for pm, pk in zip(p_model, p_market)
+    ]
+    s = sum(blended)
+    if s <= 0.0:
+        return p_model
+    return (blended[0] / s, blended[1] / s, blended[2] / s)
+
+
 class IsotonicCalibrator:
     """Pool-adjacent-violators isotonic regression: monotone map from
     predicted probability to observed frequency. Step function with

@@ -23,6 +23,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from betbot.config import get_settings
 from betbot.data.football_data import FootballDataClient, FootballDataError
 from betbot.data.form import FormService, _parse_kickoff, _parse_team
+from betbot.data.odds import shared_odds_service
 from betbot.exchanges.matcher import TeamAliasResolver
 from betbot.exchanges.polymarket import PolymarketAdapter
 from betbot.exchanges.polymarket_gamma import GammaClient
@@ -52,6 +53,7 @@ from betbot.storage.repos import (
 from betbot.strategy.engine import StrategyEngine
 from betbot.strategy.club_engine import ClubStrategyEngine
 from betbot.strategy.cl_engine import EuropeanStrategyEngine
+from betbot.strategy.odds_anchor import anchor_prediction
 
 # Repo root (…/tfsm), used to locate config/team_aliases.yaml regardless of cwd.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -136,6 +138,10 @@ async def _score_once() -> int:
             if settings.cl_elo_enabled
             else engine
         )
+        # ONE odds service for the whole run: a single shared TTL cache means a
+        # 20-fixture Saturday costs ONE HTTP GET, not twenty (the Highlightly
+        # lesson). None when BETBOT_ODDS_ANCHOR is off — the default.
+        odds_service = shared_odds_service(settings)
 
         try:
             for league in settings.leagues:
@@ -163,6 +169,7 @@ async def _score_once() -> int:
                     try:
                         bets = await _score_and_log_one(
                             m, league, form_service, eng, router, settings,
+                            odds_service=odds_service,
                         )
                         paper_bets_logged += bets
                     except FootballDataError as e:
@@ -198,6 +205,8 @@ async def _score_and_log_one(
     engine: StrategyEngine,
     router: ExchangeRouter,
     settings,
+    *,
+    odds_service=None,
 ) -> int:
     """Score one fixture and log a paper reco (recommendation record).
 
@@ -224,6 +233,18 @@ async def _score_and_log_one(
     )
 
     prediction = engine.predict(fixture_form)
+    # Free pre-match odds anchoring (flag-gated, default OFF). Every scored
+    # fixture gets anchored to a de-vigged bookmaker line, not just the ones
+    # Polymarket happens to list. Returns the prediction UNCHANGED on any
+    # failure — unresolvable name, missing row, dead feed.
+    prediction = await anchor_prediction(
+        prediction,
+        league=league,
+        kickoff=kickoff,
+        settings=settings,
+        odds_service=odds_service,
+        engine=engine,
+    )
     log.info(
         "prediction",
         fixture_id=fixture_id,
@@ -415,6 +436,16 @@ async def score_fixture_adjusted(
             fixture_form,
             home_rating_adj=home_rating_adj,
             away_rating_adj=away_rating_adj,
+        )
+        # Same anchor as the daily run, so the pre-match alert and the stored
+        # baseline are priced the same way. Flag-gated, default OFF.
+        prediction = await anchor_prediction(
+            prediction,
+            league=league,
+            kickoff=kickoff,
+            settings=settings,
+            odds_service=shared_odds_service(settings),
+            engine=engine,
         )
         return prediction, kickoff
 
