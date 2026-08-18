@@ -25,9 +25,11 @@ CANON = [
     "vallecano", "alaves", "sociedad", "celta", "betis",
     "man city", "man united", "nott m forest", "tottenham",
     "paris sg", "paris fc", "bayern munich", "m gladbach", "inter", "milan",
+    "wolves", "burnley", "sunderland",
 ]
 
 NAME_MAP = {
+    "wolverhampton wanderers fc": "wolves",
     "atletico madrid": "ath madrid",
     "rayo vallecano madrid": "vallecano",
     "rcd espanyol de barcelona": "espanol",

@@ -30,3 +30,8 @@ aliases:
   # ratings) use the short one. Verified 2026-08-18 against a live
   # fixtures.csv row (SP1, Rayo Vallecano v Alaves).
   "Vallecano": ["Rayo Vallecano"]
+
+  # football-data.org writes the full club name; our ratings use the short
+  # one. Verified 2026-08-18 against a live football-data.org
+  # /competitions/PL/teams response and an unresolved-name log line.
+  "Wolves": ["Wolverhampton Wanderers"]

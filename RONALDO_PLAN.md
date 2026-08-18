@@ -138,6 +138,59 @@ STILL TO DELIVER (operator asked for it): surface predicted expected-goals
 Liverpool"). This is information, not a probability change, so it needs no gate.
 Needs an Understat->football-data.org name bridge + a Prediction xG field.
 
+### R-ODDS — Free pre-match odds anchoring on ALL club fixtures
+Problem: `anchor_to_market` only fired when Polymarket happened to list the
+fixture, so most big-5 matches shipped raw, UNANCHORED model output.
+Fix: a pluggable free odds provider (football-data.co.uk `fixtures.csv` —
+no key, no signup, no quota, no cost) + `anchor_triple`, applied to every
+scored club fixture. Flag `BETBOT_ODDS_ANCHOR`, DEFAULT OFF.
+
+### R-ODDS — RESULT (2026-08-18): GATE PASSED on pre-match prices
+Walk-forward, held-out 2025-26 season, n=1752 (scripts/backtest_club.py):
+
+| model                       | acc %  | mean RPS | log-loss |
+|-----------------------------|--------|----------|----------|
+| ensemble (incumbent)        | 50.74  | 0.2033   | 0.9995   |
+| **anchored_pre (this)**     | 51.71  | 0.2005   | 0.9893   |
+| anchored_close (optimistic) | 52.00  | 0.2003   | 0.9885   |
+| market_pre (early price)    | 53.42  | 0.19776  | 0.9788   |
+| market_close (closing line) | 53.37  | 0.19778  | 0.9783   |
+
+Paired per-match RPS improvement (ensemble - anchored_pre): **+0.00277/match,
+bootstrap 95% CI [+0.00200, +0.00357] — excludes 0.** Coverage 1752/1752
+(100%), so the anchored-subset and all-fixture effects are identical.
+
+ANTI-LOOKAHEAD: the gate uses the EARLY-WEEK price columns (PSH/B365H), the
+same family the live fixtures.csv feed publishes, NOT the closing columns
+(PSCH/B365CH). Closing-odds optimism measured directly on this sample:
+market_close RPS 0.19778 vs market_pre 0.19776 (+0.00002) — i.e. essentially
+nil for big-5 1X2 at the RPS level in 2025-26. Anchoring to closing instead of
+pre-match would have added only +0.00015/match.
+
+CEILING CHECK PASSED: anchored 51.71% sits strictly between the ensemble
+(50.74%) and the market line (53.42%). Anchoring is SHRINKAGE toward the
+price — it moves us toward market-level accuracy and CANNOT exceed it. It is
+NOT an edge and must never be described as one.
+
+NAME SAFETY: explicit alias table only, no fuzzy matching (the Espanyol /
+Barcelona incident). Season audit 2025-26: 1752/1752 in-scope fixtures
+resolved, 0 skipped, 0 mis-resolutions, 0 clubs appearing in two leagues.
+Live 2026-27 football-data.org namespace: 88/96 club names resolve (91.7%);
+the 8 misses are newly promoted sides (Hull, Coventry, Malaga, Deportivo,
+Racing Santander, Paderborn, Elversberg, Le Mans) that have no Glicko rating
+either, so those fixtures already take the naive path. Unresolvable = SKIP +
+log, never a guess.
+
+PRE-REGISTERED LIVE GATE (before BETBOT_ODDS_ANCHOR may be turned on):
+>= 200 paired settled matches, anchored vs unanchored on the SAME fixtures,
+paired bootstrap 95% CI on per-match RPS excluding 0. The live ledger held
+n=7 as of 2026-08-18, and everything before 2026-08-17 is excluded (poisoned
+by the degenerate 0/0/100 AWAY bug). Flag stays OFF until then.
+
+OPEN follow-up: `python scripts/audit_odds_aliases.py` after each matchday and
+add aliases ONLY from its unresolved list; `python scripts/fetch_club_odds.py`
+regenerates data/club_odds.csv for the backtest.
+
 ### R4 — Player & lineup layer (the "EA-style" part)
 * Squad strength: aggregate player ratings (Sofascore/FotMob public
   ratings; EA FC ratings dataset as seasonal prior) weighted by expected
