@@ -10,6 +10,14 @@ Scope discipline: this changes PROBABILITIES only. It does not touch the
 bet/no-bet decision path (``decide_with_market``), the edge threshold, or any
 staking logic.
 
+Single-anchor invariant: the anchored prediction carries its PRE-anchor triple
+in ``Prediction.model_probs`` and records ``anchor_source="odds"``. The
+exchange-priced decision path reads ``Prediction.model_probability`` and so
+anchors the RAW model toward the exchange, never this already-anchored number.
+A probability is therefore anchored to at most one market source, exactly once,
+on every path — and the bet decision is invariant to ``BETBOT_ODDS_ANCHOR``.
+An already-anchored prediction is returned unchanged.
+
 Honesty: anchoring shrinks the model toward the price. It moves us toward
 market-level accuracy and cannot exceed it. It is not an edge.
 
@@ -59,6 +67,18 @@ async def anchor_prediction(
     point — an alert must never fail because a free CSV was slow.
     """
     if odds_service is None or not getattr(settings, "odds_anchor_enabled", False):
+        return prediction
+    if getattr(prediction, "is_anchored", False):
+        # Already anchored to a market (a re-scored fixture, or a caller that
+        # ran this twice). Anchoring again would double-count the price.
+        log.info(
+            "odds_anchor_skipped",
+            league=league,
+            home=prediction.home_team,
+            away=prediction.away_team,
+            reason="already_anchored",
+            anchor_source=prediction.anchor_source,
+        )
         return prediction
     try:
         await odds_service.prime(getattr(settings, "leagues", (league,)))
@@ -114,6 +134,10 @@ async def anchor_prediction(
             p_home=anchored[0],
             p_draw=anchored[1],
             p_away=anchored[2],
+            # Keep the raw model triple so the exchange-priced decision path
+            # can anchor from it instead of anchoring this number a 2nd time.
+            model_probs=(prediction.p_home, prediction.p_draw, prediction.p_away),
+            anchor_source="odds",
         )
     except Exception as e:  # noqa: BLE001 — anchoring must never break an alert
         log.warning(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -39,6 +40,20 @@ class Prediction:
     home_xg: float | None = None
     away_xg: float | None = None
 
+    # --- single-anchor bookkeeping (see ``model_probability``) -------------
+    # ``model_probs`` is set ONLY by the free-odds anchor layer
+    # (``betbot.strategy.odds_anchor``) and holds the model's own PRE-anchor
+    # 1X2 triple. ``anchor_source`` names the one market this prediction's
+    # displayed probabilities have been anchored to ("odds" for the bookmaker
+    # feed, "market" for the exchange price). ``None`` means never anchored.
+    #
+    # INVARIANT: a probability is anchored to at most one market source,
+    # exactly once, on every path. The bet-decision path therefore anchors
+    # from ``model_probability`` (the raw model) rather than stacking a second
+    # anchor on top of a bookmaker-anchored number.
+    model_probs: tuple[float, float, float] | None = None
+    anchor_source: str | None = None
+
     @property
     def best_outcome(self) -> Outcome:
         triples = [
@@ -47,6 +62,46 @@ class Prediction:
             (Outcome.AWAY, self.p_away),
         ]
         return max(triples, key=lambda kv: kv[1])[0]
+
+    # ------------------------------------------------------------------
+    @property
+    def is_anchored(self) -> bool:
+        """True once these probabilities have been anchored to a market."""
+        return self.anchor_source is not None
+
+    def model_probability(self, outcome: Outcome) -> float:
+        """The PRE-anchor model probability for ``outcome``.
+
+        When the free-odds layer has anchored this prediction toward a
+        bookmaker line, the displayed ``p_*`` fields already carry market
+        information. Anchoring those toward a second venue would double-count
+        the market AND manufacture apparent edge wherever the two venues
+        disagree, so every decision path prices off this raw model number
+        instead. Unanchored predictions return their live field unchanged, so
+        behaviour with the odds anchor OFF is byte-identical to before.
+        """
+        h, d, a = self.model_probs or (self.p_home, self.p_draw, self.p_away)
+        return {Outcome.HOME: h, Outcome.DRAW: d, Outcome.AWAY: a}[outcome]
+
+    def anchored_to_market(self, outcome: Outcome, p_final: float) -> "Prediction":
+        """Return a copy whose ``outcome`` probability is the market-anchored
+        ``p_final``, marked as anchored so nothing anchors it a second time.
+
+        ``model_probs`` is cleared deliberately: once ``p_final`` is the
+        single-anchored number, there is no pending un-anchored value left for
+        a downstream caller to re-derive.
+        """
+        field_name = {
+            Outcome.HOME: "p_home",
+            Outcome.DRAW: "p_draw",
+            Outcome.AWAY: "p_away",
+        }[outcome]
+        return dataclasses.replace(
+            self,
+            **{field_name: p_final},
+            model_probs=None,
+            anchor_source="market",
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,11 +213,11 @@ class StrategyEngine:
         "bet every match" mode, which knowingly bets at negative edge).
         """
         s = self._settings
-        our_p = {
-            Outcome.HOME: prediction.p_home,
-            Outcome.DRAW: prediction.p_draw,
-            Outcome.AWAY: prediction.p_away,
-        }[outcome]
+        # Single-anchor invariant: price off the raw model probability. For an
+        # unanchored prediction this IS ``p_home``/``p_draw``/``p_away``; for
+        # an odds-anchored one it is the pre-anchor value, so the bookmaker
+        # line never leaks into an exchange-priced edge.
+        our_p = prediction.model_probability(outcome)
         e = edge(our_p, market_price)
         if require_edge and e < s.edge_threshold:
             return None

@@ -42,7 +42,6 @@ engine and the World Cup to the international engine.
 from __future__ import annotations
 
 import csv
-import dataclasses
 import json
 from datetime import date
 from pathlib import Path
@@ -277,18 +276,10 @@ class EuropeanStrategyEngine:
             and self._dc_key(away_name) in self._dc_params.teams
         )
         w_model = s.cl_weight_elo + (s.cl_weight_dc if dc_active else 0.0)
-        p_model = {
-            Outcome.HOME: prediction.p_home,
-            Outcome.DRAW: prediction.p_draw,
-            Outcome.AWAY: prediction.p_away,
-        }[outcome]
+        # Single-anchor invariant — see ClubEnsembleEngine.decide_with_market.
+        p_model = prediction.model_probability(outcome)
         p_final = anchor_to_market(p_model, market_price, w_model, s.cl_weight_market)
-        field_name = {
-            Outcome.HOME: "p_home",
-            Outcome.DRAW: "p_draw",
-            Outcome.AWAY: "p_away",
-        }[outcome]
-        anchored = dataclasses.replace(prediction, **{field_name: p_final})
+        anchored = prediction.anchored_to_market(outcome, p_final)
         return self._base.decide_with_market(
             anchored, outcome, market_price, require_edge=require_edge
         )
