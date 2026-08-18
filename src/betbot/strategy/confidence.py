@@ -15,9 +15,17 @@ Two pre-registered rules, both fixed BEFORE looking at any live result:
 
 2. **Draw-aware abstention.** Never call when ``p_draw`` is within
    ``club_confidence_draw_margin`` (default 0.05) of the favourite. Draws are
-   ~25.4% of outcomes and are effectively unpickable: this is the worst
-   calibrated call category, so it is abstained from outright. A draw is also
-   never itself a callable pick.
+   ~25.4% of outcomes and are effectively unpickable, so that category is
+   abstained from outright. A draw is also never itself a callable pick.
+
+   MEASURED CAVEAT (be honest about this): at the shipped 0.60 threshold this
+   rule is a **no-op**. Because ``p_fav + p_draw <= 1``, a gap below ``m``
+   requires ``p_fav < (1 + m) / 2`` — i.e. below 0.525 for m = 0.05 — so the
+   rule cannot fire at any threshold at or above that. Replayed over the
+   held-out 2025-26 season (n=1752) it blocked exactly 0 calls at every
+   threshold from 0.40 to 0.60. It is kept as a safety belt that becomes live
+   if the threshold is ever lowered, NOT as something currently doing work. Do
+   not attribute any part of the called-pick hit rate to it.
 
 HONESTY (non-negotiable, applies to every use of this module):
     The filtered ~70% figure is an **accuracy KPI**. It is NOT edge, NOT +EV,

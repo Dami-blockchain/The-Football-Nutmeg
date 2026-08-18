@@ -15,9 +15,27 @@ Metrics: accuracy (argmax), mean RPS (lower better), mean log-loss. A bootstrap
 95% CI on the per-match RPS improvement (naive - ensemble) says whether the
 ensemble's edge over naive is real or noise.
 
+It also replays the flag-gated CONFIDENCE FILTER
+(betbot.strategy.confidence) over the same held-out season and reports TWO
+metrics that are deliberately never merged:
+
+* ALL-MATCH 3-way accuracy — model skill. The market closing line sits at
+  ~53-54% here; any all-match number far above that is a BUG or a lookahead
+  leak, not a result.
+* CALLED-pick hit rate + call rate — the subset the filter puts forward as a
+  BET, per threshold bucket and per league, each with a Wilson 95% CI.
+
+HONESTY, applies to every number this script prints:
+* The ``ps_*`` columns are CLOSING odds. Every market/anchored figure below is
+  therefore OPTIMISTIC relative to the T-24h prices we would actually have
+  live, and the closing line is not a price we could have taken.
+* A called-subset hit rate is an ACCURACY KPI. It is NOT edge and NOT +EV —
+  backing short-priced favourites at a fair price is ~0 EV by construction.
+
 Run (repo root, venv active):
     python scripts/backtest_club.py
     python scripts/backtest_club.py --test-from 2025-07-01 --dc-iterations 200
+    python scripts/backtest_club.py --confidence-thresholds 0.55,0.60,0.65
 """
 
 from __future__ import annotations
@@ -35,10 +53,12 @@ from betbot.data.models import Fixture, FixtureForm, FormSnapshot, Team
 from betbot.strategy import dixon_coles as dc
 from betbot.strategy.engine import StrategyEngine
 from betbot.exchanges.matcher import normalize
+from betbot.strategy.confidence import call_stats, favourite, wilson_interval
 from betbot.strategy.ensemble import log_pool, ranked_probability_score
 from betbot.strategy.glicko import Glicko2Rating, match_probabilities, update_rating
 
 OUT_IDX = {"HOME": 0, "DRAW": 1, "AWAY": 2}
+_LABELS = ("HOME", "DRAW", "AWAY")
 
 
 def _outcome(hs: int, as_: int) -> str:
@@ -148,6 +168,16 @@ def main() -> None:
     ap.add_argument("--test-from", default="2025-07-01",
                     help="matches on/after this date are the held-out test set")
     ap.add_argument("--dc-iterations", type=int, default=200)
+    ap.add_argument(
+        "--confidence-thresholds", default="0.50,0.55,0.60,0.65,0.70",
+        help="comma-separated favourite-probability buckets to replay the "
+             "confidence filter at (the SHIPPED default is 0.60; the others "
+             "are exploratory, not confirmatory)",
+    )
+    ap.add_argument(
+        "--draw-margin", type=float, default=None,
+        help="draw-abstention margin (default: config club_confidence_draw_margin)",
+    )
     args = ap.parse_args()
 
     s = get_settings()
@@ -193,6 +223,9 @@ def main() -> None:
         lambda: {"n": 0, "naive_rps": 0.0, "ens_rps": 0.0}
     )
     rps_diffs: list[float] = []  # naive_rps - ens_rps, per test match (ensemble better => positive)
+    # (league, ensemble_probs, market_probs_or_None, actual_outcome) per test
+    # match — replayed by the confidence-filter report below.
+    calls: list[tuple[str, tuple, tuple | None, str]] = []
 
     test_by_date: dict[date, list] = defaultdict(list)
     for r in test:
@@ -241,6 +274,7 @@ def main() -> None:
             pl["n"] += 1
             pl["naive_rps"] += n_rps
             pl["ens_rps"] += e_rps
+            calls.append((r["league"], ens_probs, mkt, _LABELS[oi]))
 
         # Now fold the day's results into ratings + form (walk-forward).
         glk.update_day([(r["home"], r["away"], _outcome(r["hs"], r["as"])) for r in day],
@@ -275,6 +309,118 @@ def main() -> None:
         nr, er = pl["naive_rps"] / c, pl["ens_rps"] / c
         print(f"  {lg:4s} n={pl['n']:>4d}  {nr:.4f} -> {er:.4f}  "
               f"({100*(nr-er)/nr:+.1f}%)")
+
+    thresholds = [float(x) for x in args.confidence_thresholds.split(",") if x.strip()]
+    draw_margin = (
+        args.draw_margin if args.draw_margin is not None
+        else s.club_confidence_draw_margin
+    )
+    _confidence_report(calls, thresholds, draw_margin, s.club_confidence_threshold)
+
+
+def _pct_ci(hits: int, n: int) -> str:
+    lo, hi = wilson_interval(hits, n)
+    rate = (hits / n) if n else 0.0
+    return f"{100*rate:>6.2f}  [{100*lo:>5.1f}, {100*hi:>5.1f}]"
+
+
+def _confidence_report(calls, thresholds, draw_margin, shipped) -> None:
+    """Replay the confidence filter over the held-out season.
+
+    Two probability sources are reported side by side and must not be conflated:
+
+    * ``model``  — the club ensemble's own blended triple (what we call today
+      when no price is available);
+    * ``market`` — the de-vigged CLOSING line. This is the source the
+      pre-registered 0.55/0.60/0.65 buckets were measured on, and it stands in
+      for the post-anchoring blend. Closing odds are NOT a price we could have
+      taken at T-24h, so every market row is optimistic.
+    """
+    if not calls:
+        print("\n(no test matches — confidence report skipped)")
+        return
+
+    model_recs = [(probs, actual) for _lg, probs, _m, actual in calls]
+    market_recs = [(m, actual) for _lg, _p, m, actual in calls if m is not None]
+
+    print("\n=== confidence filter (flag-gated, default OFF) ===")
+    print("TWO DISTINCT METRICS — never merge them into one number.\n")
+
+    for label, recs in (("model", model_recs), ("market (CLOSING)", market_recs)):
+        if not recs:
+            continue
+        n = len(recs)
+        hits = sum(1 for probs, actual in recs if favourite(probs)[0] == actual)
+        print(f"[{label}] ALL-MATCH 3-way accuracy: {_pct_ci(hits, n)}  (n={n})")
+    print("  ^ model skill. The closing line is the ceiling (~53-54%); an "
+          "all-match\n    number far above that would be a harness bug or "
+          "lookahead, not a result.\n")
+
+    print("CALLED picks only (threshold + draw abstention, draw_margin "
+          f"{draw_margin:.2f}):")
+    hdr = (f"  {'src':16s} {'thr':>5s} {'called':>7s} {'call%':>7s} "
+           f"{'hit%':>7s}  {'Wilson 95% CI':>16s}")
+    for label, recs in (("model", model_recs), ("market (CLOSING)", market_recs)):
+        if not recs:
+            continue
+        print(hdr)
+        for t in thresholds:
+            st = call_stats(
+                recs, enabled=True, threshold=t, draw_margin=draw_margin
+            )["called"]
+            star = " <- SHIPPED" if abs(t - shipped) < 1e-9 else ""
+            print(f"  {label:16s} {t:>5.2f} {st['n']:>7d} "
+                  f"{100*st['call_rate']:>6.1f}% {_pct_ci(st['hits'], st['n'])}{star}")
+        print()
+
+    # Incremental effect of rule 2 alone, at the shipped threshold.
+    print(f"draw-abstention effect at the shipped threshold {shipped:.2f}:")
+    for label, recs in (("model", model_recs), ("market (CLOSING)", market_recs)):
+        if not recs:
+            continue
+        off = call_stats(recs, enabled=True, threshold=shipped, draw_margin=0.0)["called"]
+        on = call_stats(
+            recs, enabled=True, threshold=shipped, draw_margin=draw_margin
+        )["called"]
+        print(f"  {label:16s} margin 0.00: n={off['n']:>4d} hit {_pct_ci(off['hits'], off['n'])}")
+        print(f"  {label:16s} margin {draw_margin:.2f}: n={on['n']:>4d} hit "
+              f"{_pct_ci(on['hits'], on['n'])}")
+
+    # Per-league at the shipped threshold — does the bucket hold everywhere?
+    print(f"\nper-league CALLED picks at threshold {shipped:.2f}:")
+    for label, key in (("model", 1), ("market (CLOSING)", 2)):
+        by_lg: dict[str, list] = defaultdict(list)
+        for row in calls:
+            probs = row[key]
+            if probs is None:
+                continue
+            by_lg[row[0]].append((probs, row[3]))
+        if not by_lg:
+            continue
+        print(f"  [{label}]")
+        print(f"    {'lg':4s} {'all_n':>6s} {'all%':>6s} {'called':>7s} "
+              f"{'call%':>6s} {'hit%':>7s}  {'Wilson 95% CI':>16s}")
+        for lg in sorted(by_lg):
+            recs = by_lg[lg]
+            st = call_stats(
+                recs, enabled=True, threshold=shipped, draw_margin=draw_margin
+            )
+            a, c = st["all"], st["called"]
+            print(f"    {lg:4s} {a['n']:>6d} {100*a['hit_rate']:>5.1f}% "
+                  f"{c['n']:>7d} {100*c['call_rate']:>5.1f}% "
+                  f"{_pct_ci(c['hits'], c['n'])}")
+
+    print(
+        "\nREAD THIS BEFORE QUOTING ANY NUMBER ABOVE:\n"
+        "  * ps_* are CLOSING odds -> every market/anchored figure is "
+        "OPTIMISTIC vs the\n    T-24h prices we would have live.\n"
+        "  * A called-subset hit rate is an ACCURACY KPI, NOT edge and NOT "
+        "+EV: called\n    picks are short-priced favourites, and favourites "
+        "at a fair market price\n    are ~0 EV by construction.\n"
+        "  * Only the SHIPPED threshold is pre-registered. Other buckets are "
+        "exploratory.\n"
+        "  * Offline held-out numbers are not live proof."
+    )
 
 
 if __name__ == "__main__":

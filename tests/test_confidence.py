@@ -165,3 +165,32 @@ def test_call_stats_with_filter_off_calls_nothing():
     st = call_stats(records, enabled=False, threshold=0.60, draw_margin=0.05)
     assert st["all"]["n"] == 1 and st["all"]["hits"] == 1
     assert st["called"]["n"] == 0 and st["called"]["hit_rate"] == 0.0
+
+
+def test_draw_rule_cannot_fire_at_or_above_the_algebraic_bite_point():
+    """Honest pin: at the shipped 0.60 threshold rule 2 is a NO-OP.
+
+    p_fav + p_draw <= 1, so a gap below m needs p_fav < (1+m)/2 = 0.525 for
+    m=0.05. Replayed on the held-out season it blocked 0 calls at every
+    threshold 0.40-0.60. Kept only as a safety belt for a lower threshold.
+    """
+    import random
+
+    rng = random.Random(7)
+    fired = 0
+    for _ in range(20000):
+        a, b, c = (rng.random() for _ in range(3))
+        s = a + b + c
+        probs = (a / s, b / s, c / s)
+        if favourite(probs)[1] < 0.60:
+            continue
+        if evaluate(probs, **ON).reason == "draw_too_close":
+            fired += 1
+    assert fired == 0
+
+
+def test_draw_rule_does_fire_below_the_bite_point():
+    """...but it is not dead code: lower the threshold and it bites."""
+    probs = (0.48, 0.45, 0.07)
+    c = evaluate(probs, enabled=True, threshold=0.45, draw_margin=0.05)
+    assert c.called is False and c.reason == "draw_too_close"
