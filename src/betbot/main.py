@@ -861,9 +861,18 @@ def run_daemon(
         try:
             _s = get_settings()
             now = datetime.now(timezone.utc)
-            preds = predictions_for_kickoff_range(
-                now, now + timedelta(hours=ALERT_WATCHDOG_HORIZON_HOURS)
+            # Clamp to the end of the CURRENT Nairobi day. Scheduling passes
+            # only ever cover today-on-the-Nairobi-clock, but scoring writes
+            # predictions 48h ahead — so a fixture on the NEXT Nairobi day that
+            # is already inside the horizon has legitimately not been scheduled
+            # yet, and flagging it would fire an hourly false alarm until the
+            # 05:00 UTC pass. Alarming on a non-problem trains the operator to
+            # ignore the exact signal this watchdog exists to send.
+            _, day_end, _day = nairobi_day_bounds(now)
+            horizon = min(
+                now + timedelta(hours=ALERT_WATCHDOG_HORIZON_HOURS), day_end
             )
+            preds = predictions_for_kickoff_range(now, horizon)
             plan = plan_kickoff_alert_jobs(_s, preds, now)
             await report_alert_coverage(scheduler, plan, settings=_s)
         except Exception as e:  # noqa: BLE001 — never crash the daemon
