@@ -56,4 +56,13 @@ packages = ["src/betbot"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# A dropped coroutine is a SILENT production failure, not a style nit. Wrapping
+# an `async def` scheduler job in a sync lambda made APScheduler call it and
+# discard the coroutine, so the daily pre-match/lineup alert re-scan never ran
+# for days. Python's only complaint was this RuntimeWarning, emitted by the GC
+# and buried in the daemon log. It is an ERROR in the suite now, so the next
+# one fails a test instead of quietly costing us alerts.
+filterwarnings = [
+    "error:coroutine .* was never awaited:RuntimeWarning",
+]
 
