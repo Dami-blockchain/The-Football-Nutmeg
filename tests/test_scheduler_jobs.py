@@ -370,3 +370,25 @@ def test_scheduling_pass_reports_a_gap_when_jobs_vanish(monkeypatch, settings):
 
     assert sent, "a scheduling pass that registered nothing stayed silent"
     assert "predict_early_559715" in sent[0][1]
+
+
+# ----------------------------------------------------------------------
+# 5. The warning that sat in the log for days is now fatal in the suite
+# ----------------------------------------------------------------------
+def test_unawaited_coroutine_warning_is_configured_fatal():
+    """pyproject filterwarnings must turn THIS message into an error.
+
+    ``RuntimeWarning: coroutine ... was never awaited`` was printed in
+    /tmp/daemon.log the entire time the alerts were dead and nobody caught it.
+    Asserting the exact message shape keeps the filter honest: a typo in the
+    regex, or someone dropping the ini entry, fails here.
+
+    Caveat worth knowing: CPython emits the real thing from the coroutine's
+    ``__del__`` during GC, where exceptions are unraisable — so this filter is
+    a SECOND net. The deterministic guard is add_async_job plus the
+    registration walk above.
+    """
+    import warnings
+
+    with pytest.raises(RuntimeWarning, match="never awaited"):
+        warnings.warn("coroutine '_x' was never awaited", RuntimeWarning)
