@@ -38,6 +38,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from betbot.entitlement import entitlement_for
 from betbot.logging import get_logger
+from betbot.scheduling import add_async_job
 from betbot.storage.repos import (
     has_revealed,
     increment_predictions_consumed,
@@ -671,7 +672,8 @@ def register_daily_jobs(scheduler, settings, *, matchday_notice) -> None:
     The job callable is passed in (rather than imported) so the daemon can wrap
     it in its own never-crash error handling.
     """
-    scheduler.add_job(
+    add_async_job(
+        scheduler,
         matchday_notice,
         trigger=CronTrigger(
             hour=settings.matchday_alert_hour, minute=0, timezone=REPORT_TZ
@@ -681,8 +683,15 @@ def register_daily_jobs(scheduler, settings, *, matchday_notice) -> None:
     # Daily 05:15 UTC (before the 05:xx alert reschedule / scoring): fill ONE
     # missing prior-season domestic league's player-minutes cache. Budget-paced;
     # no-ops once all four are populated. Self-contained + best-effort.
-    scheduler.add_job(
-        lambda: backfill_one_league_minutes_tick(settings),
+    #
+    # ``settings`` is bound with args=, NOT a sync ``lambda: tick(settings)``:
+    # that lambda shape made APScheduler call-and-discard the coroutine, so
+    # this backfill never ran either (same root cause as the pre-match alert
+    # outage). add_async_job now rejects it at registration time.
+    add_async_job(
+        scheduler,
+        backfill_one_league_minutes_tick,
+        args=(settings,),
         trigger=CronTrigger.from_crontab("15 5 * * *", timezone=timezone.utc),
         id="player_minutes_backfill",
     )

@@ -38,6 +38,7 @@ from betbot.daily_jobs import (
 )
 from betbot.gate import evaluate_gate
 from betbot.logging import configure_logging, get_logger
+from betbot.scheduling import add_async_job, unawaitable_jobs
 from betbot.settlement import SettlementWatcher
 from betbot.storage.db import init_engine
 from betbot.storage.repos import (
@@ -378,6 +379,65 @@ def plan_kickoff_alert_jobs(settings, preds, now):
                 continue  # firing time already past — skip
             plan.append((f"predict_{tag}_{fid}", run_at))
     return plan
+
+
+# ----------------------------------------------------------------------
+# Alert-coverage self-check (the "silent no-op" watchdog)
+# ----------------------------------------------------------------------
+# How long ahead the watchdog expects alert jobs to already be registered.
+# The daily re-scan covers ONE Nairobi day, so a fixture more than ~12h out
+# legitimately has no jobs yet; inside 12h the daily pass has always run and a
+# missing job is a real fault, not a timing artefact.
+ALERT_WATCHDOG_HORIZON_HOURS = 12
+
+
+def audit_alert_coverage(scheduler, plan) -> list[str]:
+    """Job ids from ``plan`` that are NOT registered on ``scheduler``.
+
+    Pure and offline. ``plan`` is :func:`plan_kickoff_alert_jobs` output, which
+    has already dropped fire times in the past — and APScheduler drops one-off
+    DateTrigger jobs once they fire — so a job id present in the plan but
+    absent from the scheduler means the alert will simply never be sent.
+    """
+    registered = {job.id for job in scheduler.get_jobs()}
+    return [job_id for job_id, _run_at in plan if job_id not in registered]
+
+
+async def report_alert_coverage(scheduler, plan, *, settings, send_fn=None) -> list[str]:
+    """Audit alert coverage and, on a gap, log ERROR + Telegram the operator.
+
+    A missing alert job used to be a SILENT no-op — the daily re-scan was
+    registered as a sync lambda around an ``async def`` for weeks and nothing
+    said so. Coverage gaps are now loud: ERROR in the log and a push to
+    ``settings.telegram_allowed_user_id``. Returns the missing job ids so
+    callers (and tests) can assert on them.
+    """
+    missing = audit_alert_coverage(scheduler, plan)
+    if not missing:
+        return []
+    log = get_logger(__name__)
+    log.error(
+        "alert_coverage_gap",
+        missing_count=len(missing),
+        missing_job_ids=missing,
+    )
+    operator_id = getattr(settings, "telegram_allowed_user_id", None)
+    if not operator_id:
+        return missing
+    if send_fn is None:
+        from betbot.notify import send_telegram_to as send_fn  # noqa: PLC0415
+    body = (
+        "*\U0001f6a8 Alert scheduling fault*\n\n"
+        f"{len(missing)} pre-match/lineup alert job(s) are NOT registered on "
+        "the scheduler, so those alerts will NOT be sent:\n"
+        + "\n".join(f"- `{jid}`" for jid in missing[:20])
+        + "\n\nThe daemon needs a restart / investigation."
+    )
+    try:
+        await send_fn(settings, operator_id, body)
+    except Exception as e:  # noqa: BLE001 - the alert must not crash the daemon
+        log.warning("alert_coverage_notify_failed", error=str(e))
+    return missing
 
 
 # ----------------------------------------------------------------------
@@ -763,8 +823,9 @@ def run_daemon(
             now = datetime.now(timezone.utc)
             start, end, _day = nairobi_day_bounds(now)
             preds = predictions_for_kickoff_range(start, end)
+            plan = plan_kickoff_alert_jobs(_s, preds, now)
             scheduled = 0
-            for job_id, run_at in plan_kickoff_alert_jobs(_s, preds, now):
+            for job_id, run_at in plan:
                 # job_id is predict_early_<fid> / predict_late_<fid>; recover the
                 # fixture id (last underscore-delimited token) for the closure.
                 fid = int(job_id.rsplit("_", 1)[1])
@@ -772,7 +833,8 @@ def run_daemon(
                 async def _fire(fixture_id=fid) -> None:
                     await _fire_prediction_alert(fixture_id)
 
-                scheduler.add_job(
+                add_async_job(
+                    scheduler,
                     _fire,
                     trigger=DateTrigger(run_date=run_at, timezone=timezone.utc),
                     id=job_id,
@@ -782,8 +844,32 @@ def run_daemon(
             get_logger(__name__).info(
                 "prematch_alerts_scheduled", scheduled=scheduled,
             )
+            # Self-check: everything we just planned must actually be on the
+            # scheduler. A pass that quietly schedules nothing is the failure
+            # mode that hid this bug for days, so it is now loud.
+            await report_alert_coverage(scheduler, plan, settings=_s)
         except Exception as e:  # noqa: BLE001 — never crash the daemon
             get_logger(__name__).warning("schedule_kickoff_alerts_failed", error=str(e))
+
+    async def _alert_coverage_watchdog(scheduler) -> None:
+        # Hourly independent check that the SCHEDULING ITSELF is happening.
+        # report_alert_coverage inside _schedule_kickoff_alerts only catches a
+        # pass that ran and lost jobs; this catches a pass that never ran at
+        # all (the actual production failure). Looks ahead
+        # ALERT_WATCHDOG_HORIZON_HOURS, by which point the daily re-scan has
+        # always covered the fixture. DB-only, no network, free.
+        try:
+            _s = get_settings()
+            now = datetime.now(timezone.utc)
+            preds = predictions_for_kickoff_range(
+                now, now + timedelta(hours=ALERT_WATCHDOG_HORIZON_HOURS)
+            )
+            plan = plan_kickoff_alert_jobs(_s, preds, now)
+            await report_alert_coverage(scheduler, plan, settings=_s)
+        except Exception as e:  # noqa: BLE001 — never crash the daemon
+            get_logger(__name__).warning(
+                "alert_coverage_watchdog_failed", error=str(e)
+            )
 
     async def _player_minutes_refresh_tick() -> None:
         # Weekly: refresh the api-football player-minutes cache (R4a importance
@@ -811,8 +897,9 @@ def run_daemon(
         s = get_settings()
         init_engine(s.db_path)  # cron jobs may fire before the first scoring tick
         scheduler = AsyncIOScheduler(timezone=timezone.utc)
-        scheduler.add_job(_tick, trigger=trigger, id="score_and_settle")
-        scheduler.add_job(
+        add_async_job(scheduler, _tick, trigger=trigger, id="score_and_settle")
+        add_async_job(
+            scheduler,
             _club_refresh_tick,
             trigger=CronTrigger.from_crontab("0 6 * * 1", timezone=timezone.utc),
             id="club_data_refresh",
@@ -820,14 +907,32 @@ def run_daemon(
         register_daily_jobs(scheduler, s, matchday_notice=_matchday_notice_tick)
         # Re-scan for today's fixtures daily so the daemon keeps scheduling
         # pre-match alerts as new fixtures get scored.
-        scheduler.add_job(
-            lambda: _schedule_kickoff_alerts(scheduler),
+        #
+        # The callable MUST be the coroutine function itself with ``scheduler``
+        # bound through args=. It was a sync ``lambda: _schedule_kickoff_alerts
+        # (scheduler)`` until 2026-08-19, which APScheduler CALLED and then
+        # discarded the coroutine of — so this re-scan never once executed and
+        # every fixture scored after daemon start got NO pre-match and NO
+        # lineup alert. add_async_job now rejects that shape outright.
+        add_async_job(
+            scheduler,
+            _schedule_kickoff_alerts,
+            args=(scheduler,),
             trigger=CronTrigger.from_crontab("0 5 * * *", timezone=timezone.utc),
             id="reschedule_kickoff_alerts",
         )
+        # Hourly: verify the alert jobs the DB says should exist actually do.
+        add_async_job(
+            scheduler,
+            _alert_coverage_watchdog,
+            args=(scheduler,),
+            trigger=IntervalTrigger(hours=1, timezone=timezone.utc),
+            id="alert_coverage_watchdog",
+        )
         # Weekly (Mon 05:30 UTC): refresh the player-minutes importance cache so
         # the lineup adjustment stays warm. Budget-safe (once/week).
-        scheduler.add_job(
+        add_async_job(
+            scheduler,
             _player_minutes_refresh_tick,
             trigger=CronTrigger.from_crontab("30 5 * * 1", timezone=timezone.utc),
             id="player_minutes_refresh",
@@ -835,18 +940,25 @@ def run_daemon(
         # Weekly (Mon 06:30 UTC, after the club re-seed at 06:00): refresh the
         # season-title Monte-Carlo cache so /title tracks the season. One
         # football-data.org call per domestic league per week.
-        scheduler.add_job(
+        add_async_job(
+            scheduler,
             _season_title_refresh_tick,
             trigger=CronTrigger.from_crontab("30 6 * * 1", timezone=timezone.utc),
             id="season_title_refresh",
         )
         # Periodic (every 2h): settle finished fixtures + fire RESULT ALERTS, so
         # results land within ~2h of full time rather than at the next 08:00 tick.
-        scheduler.add_job(
+        add_async_job(
+            scheduler,
             _settle_and_results_tick,
             trigger=IntervalTrigger(hours=2, timezone=timezone.utc),
             id="settle_and_results",
         )
+        # Belt-and-braces: catch anything registered through a raw add_job
+        # that bypassed add_async_job. Loud, but never fatal to the daemon.
+        _broken = unawaitable_jobs(scheduler)
+        if _broken:
+            log.error("scheduler_jobs_not_awaitable", job_ids=_broken)
         scheduler.start()
         log.info(
             "daemon_started",
