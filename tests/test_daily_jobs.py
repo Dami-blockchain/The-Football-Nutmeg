@@ -600,9 +600,16 @@ async def test_send_prediction_alert_no_prediction_is_noop(tmp_path):
 class FakeScheduler:
     def __init__(self) -> None:
         self.jobs: dict[str, object] = {}
+        self.funcs: dict[str, object] = {}
 
-    def add_job(self, func, *, trigger, id):  # noqa: A002 — APScheduler's kwarg
+    # Signature mirrors APScheduler's own: jobs bind their arguments with
+    # args=/kwargs= rather than a sync lambda wrapper (see betbot.scheduling —
+    # a wrapping lambda is call-and-dropped and the job never runs).
+    def add_job(  # noqa: A002 — APScheduler's kwarg
+        self, func, trigger=None, *, id=None, args=None, kwargs=None, **_rest
+    ):
         self.jobs[id] = trigger
+        self.funcs[id] = func
 
 
 async def _noop() -> None:  # pragma: no cover — never fired in tests
