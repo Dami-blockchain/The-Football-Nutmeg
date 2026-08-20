@@ -56,6 +56,13 @@ packages = ["src/betbot"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Test THIS checkout, not the live one. betbot is pip-installed editable
+# against /home/tfsm/tfsm/src, so pytest run inside a git worktree silently
+# imported the LIVE package and validated main instead of the branch under
+# test -- branch results looked green while testing the wrong tree. This is
+# rootdir-relative, so every checkout tests itself and the live tree is
+# unaffected (same path).
+pythonpath = ["src"]
 # A dropped coroutine is a SILENT production failure, not a style nit. Wrapping
 # an `async def` scheduler job in a sync lambda made APScheduler call it and
 # discard the coroutine, so the daily pre-match/lineup alert re-scan never ran
