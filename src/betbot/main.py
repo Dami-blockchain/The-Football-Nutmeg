@@ -39,7 +39,7 @@ from betbot.daily_jobs import (
 )
 from betbot.gate import evaluate_gate
 from betbot.logging import configure_logging, get_logger
-from betbot.notify import announce_change
+from betbot.notify import announce_change, notify_operator
 from betbot.scheduling import add_async_job, unawaitable_jobs
 from betbot.settlement import SettlementWatcher
 from betbot.storage.db import init_engine
@@ -423,11 +423,6 @@ async def report_alert_coverage(scheduler, plan, *, settings, send_fn=None) -> l
         missing_count=len(missing),
         missing_job_ids=missing,
     )
-    operator_id = getattr(settings, "telegram_allowed_user_id", None)
-    if not operator_id:
-        return missing
-    if send_fn is None:
-        from betbot.notify import send_telegram_to as send_fn  # noqa: PLC0415
     body = (
         "*\U0001f6a8 Alert scheduling fault*\n\n"
         f"{len(missing)} pre-match/lineup alert job(s) are NOT registered on "
@@ -435,10 +430,15 @@ async def report_alert_coverage(scheduler, plan, *, settings, send_fn=None) -> l
         + "\n".join(f"- `{jid}`" for jid in missing[:20])
         + "\n\nThe daemon needs a restart / investigation."
     )
-    try:
-        await send_fn(settings, operator_id, body)
-    except Exception as e:  # noqa: BLE001 - the alert must not crash the daemon
-        log.warning("alert_coverage_notify_failed", error=str(e))
+    # Through notify_operator, not a raw send: this runs from the HOURLY
+    # watchdog, and a gap that stays unfixed all day would otherwise push 24
+    # identical messages — which trains the operator to ignore the one signal
+    # this whole watchdog exists to send. The cooldown for
+    # "alert_coverage_gap" caps it, and a delivery failure is logged at
+    # ERROR rather than swallowed.
+    await notify_operator(
+        settings, body, kind="alert_coverage_gap", send_fn=send_fn
+    )
     return missing
 
 
@@ -970,6 +970,19 @@ def run_daemon(
         _broken = unawaitable_jobs(scheduler)
         if _broken:
             log.error("scheduler_jobs_not_awaitable", job_ids=_broken)
+            # Registration-time, so it fires once per daemon start — but a
+            # dropped job is a SILENT job, which is exactly the class of fault
+            # that ran unnoticed for days. It goes to the human too.
+            await notify_operator(
+                s,
+                "*\U0001f6a8 Scheduler fault*\n\n"
+                f"{len(_broken)} registered job(s) will NEVER RUN — "
+                "APScheduler would call them and throw away the coroutine:\n"
+                + "\n".join(f"- `{jid}`" for jid in _broken[:20])
+                + "\n\nThese were registered bypassing add_async_job. "
+                "The affected features are silently dead until this is fixed.",
+                kind="scheduler_jobs_not_awaitable",
+            )
         scheduler.start()
         log.info(
             "daemon_started",

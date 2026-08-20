@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 
 from betbot.data.football_data import FootballDataClient
 from betbot.logging import get_logger
+from betbot.notify import notify_operator
 from betbot.storage.repos import (
     get_rating,
     is_kill_switch_tripped,
@@ -190,6 +191,23 @@ class SettlementWatcher:
         await self._score_outcomes(now)
 
         tripped, pnl_w, staked_w = self._evaluate_kill_switch()
+        if tripped:
+            # A tripped kill switch means the bot has STOPPED betting. That is
+            # the single most important thing the operator can be told, and
+            # until now it existed only as a log line. Re-sent at most once a
+            # day (COOLDOWN_SECONDS["kill_switch_tripped"]) even though
+            # settlement re-evaluates every 2h, so the reminder that betting is
+            # still halted arrives daily rather than twelve times a day.
+            await notify_operator(
+                s,
+                "*\U0001f534 Kill switch TRIPPED — betting has stopped*\n\n"
+                f"Drawdown ${pnl_w:,.2f} over {s.drawdown_window_days}d on "
+                f"${staked_w:,.0f} staked "
+                f"(limit -{s.drawdown_kill_pct:.0%}).\n\n"
+                "No further bets will be placed until "
+                "`tfsm kill-switch reset`.",
+                kind="kill_switch_tripped",
+            )
         log.info(
             "settlement_done",
             settled=settled,
