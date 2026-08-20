@@ -45,6 +45,11 @@ def upsert_prediction(
             .where(PredictionRow.run_date == run_date)
         ).scalar_one_or_none()
         if existing is not None:
+            # Kickoff too: football-data rewrites ``utcDate`` when a fixture is
+            # moved, and every caller passes the kickoff it just read upstream.
+            # Skipping it here is what let a rescheduled match keep its ORIGINAL
+            # time forever — which pinned its pre-match alerts to a dead slot.
+            existing.kickoff = kickoff
             existing.p_home = prediction.p_home
             existing.p_draw = prediction.p_draw
             existing.p_away = prediction.p_away
@@ -1238,3 +1243,79 @@ def prediction_for_fixture(fixture_id: int) -> PredictionRow | None:
         return row
 
 
+
+
+def upcoming_prediction_kickoffs(
+    start_dt: datetime, end_dt: datetime, *, exclude_settled: bool = True
+) -> dict[int, datetime]:
+    """``{fixture_id: stored_kickoff}`` for predictions kicking off in the range.
+
+    The freshest row per fixture wins (max ``run_date``, id breaks ties), so the
+    map holds exactly the kickoff the alert scheduler would plan against. Used
+    by the kickoff re-sync to spot fixtures upstream has since moved.
+
+    ``exclude_settled`` drops fixtures already in the outcome ledger. The range
+    reaches into the PAST — a match moved forward looks long overdue on our
+    clock, which is precisely the row that needs correcting — and without this
+    every finished fixture in that window would be re-compared for nothing.
+    """
+    with session_scope() as s:
+        settled: set[int] = (
+            set(s.execute(select(PredictionOutcome.fixture_id)).scalars())
+            if exclude_settled
+            else set()
+        )
+        rows = list(
+            s.execute(
+                select(
+                    PredictionRow.fixture_id,
+                    PredictionRow.kickoff,
+                    PredictionRow.run_date,
+                    PredictionRow.id,
+                )
+                .where(PredictionRow.kickoff >= start_dt)
+                .where(PredictionRow.kickoff < end_dt)
+            )
+        )
+    best: dict[int, tuple[str, int, datetime]] = {}
+    for fixture_id, kickoff, run_date, row_id in rows:
+        if fixture_id in settled:
+            continue
+        cur = best.get(fixture_id)
+        if cur is None or (run_date, row_id) > (cur[0], cur[1]):
+            best[fixture_id] = (run_date, row_id, kickoff)
+    # SQLite hands back naive datetimes; every caller compares these against
+    # aware upstream kickoffs, and a tz mismatch there reads as "moved".
+    return {
+        fid: (ko.replace(tzinfo=timezone.utc) if ko.tzinfo is None else ko)
+        for fid, (_rd, _id, ko) in best.items()
+    }
+
+
+def update_prediction_kickoff(fixture_id: int, kickoff: datetime) -> int:
+    """Point EVERY stored row for ``fixture_id`` at ``kickoff``. Returns rows hit.
+
+    All rows, not just the freshest: a fixture is re-scored on consecutive daily
+    runs, so it carries 2-3 rows, and the stale ones drive
+    :func:`list_unsettled_predictions_due` (settlement would keep asking for a
+    result at a time the match no longer kicks off at). Rows already on the new
+    time are left alone so the count reports real changes.
+    """
+    with session_scope() as s:
+        rows = list(
+            s.execute(
+                select(PredictionRow).where(
+                    PredictionRow.fixture_id == fixture_id
+                )
+            ).scalars()
+        )
+        changed = 0
+        for row in rows:
+            stored = row.kickoff
+            if stored is not None and stored.tzinfo is None:
+                stored = stored.replace(tzinfo=timezone.utc)
+            if stored == kickoff:
+                continue
+            row.kickoff = kickoff
+            changed += 1
+        return changed

@@ -115,19 +115,37 @@ class FootballDataClient:
         return data
 
     # ------------------------------------------------------------------
-    async def list_scheduled_matches(
-        self, competition_code: str, date_from: str, date_to: str
+    async def list_matches(
+        self,
+        competition_code: str,
+        date_from: str,
+        date_to: str,
+        *,
+        status: str | None = None,
     ) -> list[dict[str, Any]]:
+        """Every match a competition has in the date range, in one call.
+
+        ``status=None`` means no filter, which is what the kickoff re-sync
+        needs: a fixture that has since been POSTPONED, or promoted from
+        SCHEDULED to TIMED, must still come back. A ``status=SCHEDULED`` filter
+        silently drops those, and the re-sync would read the absence as "not in
+        this window any more" rather than as a match that just moved.
+        """
+        params: dict[str, Any] = {"dateFrom": date_from, "dateTo": date_to}
+        if status is not None:
+            params["status"] = status
         data = await self._get(
-            f"/competitions/{competition_code}/matches",
-            params={
-                "dateFrom": date_from,
-                "dateTo": date_to,
-                "status": "SCHEDULED",
-            },
+            f"/competitions/{competition_code}/matches", params=params
         )
         matches = data.get("matches") or []
         return [m for m in matches if isinstance(m, dict)]
+
+    async def list_scheduled_matches(
+        self, competition_code: str, date_from: str, date_to: str
+    ) -> list[dict[str, Any]]:
+        return await self.list_matches(
+            competition_code, date_from, date_to, status="SCHEDULED"
+        )
 
     async def list_team_recent_matches(
         self, team_id: int, limit: int = 5, before: str | None = None
