@@ -15,6 +15,10 @@ once at scoring time and never revisited. One stale column broke three things:
   2026-08-27 18:30.
 * **Settlement chased a result that could not exist.** ``kickoff + grace`` had
   passed on paper, so every settle tick re-fetched a fixture still days away.
+  Note this one is only fixed for a fixture with a KNOWN new time. A POSTPONED
+  fixture has no new date to write, so it keeps its stored kickoff and
+  settlement keeps polling it until ``_OUTCOME_LOOKBACK_DAYS`` expires —
+  inventing a placeholder kickoff would corrupt the row to quiet a log line.
 
 The re-sync re-reads the current kickoff from the SAME endpoint the scoring run
 uses — one call per league per pass, not one per fixture — and writes it back.
@@ -116,6 +120,13 @@ def plan_kickoff_changes(
         old_utc = _as_utc(old)
         new_utc = _as_utc(new)
         dead = (status or "") in DEAD_STATUSES
+        if not dead and new_utc is None:
+            # Healthy status, unreadable date. Reporting it would set
+            # new_kickoff=None, which reads downstream as "dead" and would pull
+            # the alerts off a match going ahead exactly as scheduled — on
+            # nothing worse than a malformed field.
+            log.warning("kickoff_unparseable", fixture_id=fixture_id, status=status)
+            continue
         if not dead and new_utc == old_utc:
             continue
         changes.append(
@@ -160,20 +171,25 @@ async def fetch_upstream_kickoffs(
     leagues: Iterable[str],
     date_from: str,
     date_to: str,
-) -> dict[int, tuple[datetime | None, str | None]]:
-    """``{fixture_id: (kickoff, status)}`` for every match in the window.
+) -> tuple[dict[int, tuple[datetime | None, str | None]], set[str]]:
+    """``({fixture_id: (kickoff, status)}, failed_leagues)`` for the window.
 
     One call per league — the whole point of going through the competition
-    endpoint rather than per-fixture. A league that fails is logged and skipped;
-    a partial map only means fewer fixtures get re-synced this pass, never a
-    wrong re-sync.
+    endpoint rather than per-fixture. A league that fails is logged and skipped,
+    and named in the second return value: its fixtures are missing because the
+    FETCH failed, not because they moved, and the caller must not send them down
+    the per-fixture fallback. The likeliest reason a league fetch fails is a
+    rate-limit, and answering that with a burst of individual calls is how a
+    blip becomes an outage.
     """
     upstream: dict[int, tuple[datetime | None, str | None]] = {}
+    failed: set[str] = set()
     for league in leagues:
         try:
             matches = await client.list_matches(league, date_from, date_to)
         except Exception as e:  # noqa: BLE001 — one bad league mustn't stop the rest
             log.warning("kickoff_resync_league_failed", league=league, error=str(e))
+            failed.add(league)
             continue
         for match in matches:
             fixture_id = match.get("id")
@@ -183,7 +199,7 @@ async def fetch_upstream_kickoffs(
                 parse_utc(match.get("utcDate")),
                 match.get("status"),
             )
-    return upstream
+    return upstream, failed
 
 
 async def resync_kickoffs(
@@ -211,10 +227,10 @@ async def resync_kickoffs(
     """
     from betbot.storage.repos import (
         update_prediction_kickoff,
-        upcoming_prediction_kickoffs,
+        upcoming_prediction_fixtures,
     )
 
-    stored_fn = stored_fn or upcoming_prediction_kickoffs
+    stored_fn = stored_fn or upcoming_prediction_fixtures
     update_fn = update_fn or update_prediction_kickoff
 
     now = _as_utc(now)
@@ -225,21 +241,38 @@ async def resync_kickoffs(
     # That is the live shape of this bug: stored 2026-08-16, actually 2026-08-27.
     # Settled fixtures are filtered out by the query, so this stays small.
     window_start = now - timedelta(days=backfill_days)
-    stored = stored_fn(window_start, window_end)
-    if not stored:
+    stored_rows = stored_fn(window_start, window_end)
+    if not stored_rows:
         return []
+    stored = {fid: ko for fid, (ko, _code) in stored_rows.items()}
 
-    # football-data's dateTo is exclusive, hence the +1 day.
+    # football-data's dateTo is INCLUSIVE (verified against the live API:
+    # dateFrom=dateTo=2026-08-22 returns that day's matches). The comment on the
+    # scoring run's own window says "exclusive" and is wrong; don't copy it.
     date_from = window_start.date().isoformat()
-    date_to = (window_end.date() + timedelta(days=1)).isoformat()
-    upstream = await fetch_upstream_kickoffs(
+    date_to = window_end.date().isoformat()
+    upstream, failed_leagues = await fetch_upstream_kickoffs(
         client, settings.leagues, date_from, date_to
     )
 
     # Anything we hold but did not see upstream: resolve it individually rather
     # than assume. This is what catches a match moved months out, which is
-    # exactly the case that leaves a phantom job on the old day.
-    for fixture_id in sorted(set(stored) - set(upstream)):
+    # exactly the case that leaves a phantom job on the old day. Fixtures whose
+    # LEAGUE fetch failed are excluded — they are missing because the call
+    # failed, not because they moved, and fanning out one call each would turn a
+    # rate-limit into a much worse one.
+    unseen = [
+        fid
+        for fid in sorted(set(stored) - set(upstream))
+        if stored_rows[fid][1] not in failed_leagues
+    ]
+    if failed_leagues:
+        log.warning(
+            "kickoff_resync_partial",
+            failed_leagues=sorted(failed_leagues),
+            note="fixtures in these leagues are not re-checked this pass",
+        )
+    for fixture_id in unseen:
         try:
             match = await client.get_match(fixture_id)
         except Exception as e:  # noqa: BLE001 — best-effort, never fatal

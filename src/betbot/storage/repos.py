@@ -1245,10 +1245,15 @@ def prediction_for_fixture(fixture_id: int) -> PredictionRow | None:
 
 
 
-def upcoming_prediction_kickoffs(
+def upcoming_prediction_fixtures(
     start_dt: datetime, end_dt: datetime, *, exclude_settled: bool = True
-) -> dict[int, datetime]:
-    """``{fixture_id: stored_kickoff}`` for predictions kicking off in the range.
+) -> dict[int, tuple[datetime, str]]:
+    """``{fixture_id: (stored_kickoff, competition_code)}`` over a kickoff range.
+
+    The competition code rides along because the kickoff re-sync needs to know
+    which league window a fixture belongs to: when a league's window fetch
+    fails, its fixtures must NOT be mistaken for "moved out of the window" and
+    sent down the per-fixture fallback.
 
     The freshest row per fixture wins (max ``run_date``, id breaks ties), so the
     map holds exactly the kickoff the alert scheduler would plan against. Used
@@ -1272,23 +1277,27 @@ def upcoming_prediction_kickoffs(
                     PredictionRow.kickoff,
                     PredictionRow.run_date,
                     PredictionRow.id,
+                    PredictionRow.competition_code,
                 )
                 .where(PredictionRow.kickoff >= start_dt)
                 .where(PredictionRow.kickoff < end_dt)
             )
         )
-    best: dict[int, tuple[str, int, datetime]] = {}
-    for fixture_id, kickoff, run_date, row_id in rows:
+    best: dict[int, tuple[str, int, datetime, str]] = {}
+    for fixture_id, kickoff, run_date, row_id, code in rows:
         if fixture_id in settled:
             continue
         cur = best.get(fixture_id)
         if cur is None or (run_date, row_id) > (cur[0], cur[1]):
-            best[fixture_id] = (run_date, row_id, kickoff)
+            best[fixture_id] = (run_date, row_id, kickoff, code)
     # SQLite hands back naive datetimes; every caller compares these against
     # aware upstream kickoffs, and a tz mismatch there reads as "moved".
     return {
-        fid: (ko.replace(tzinfo=timezone.utc) if ko.tzinfo is None else ko)
-        for fid, (_rd, _id, ko) in best.items()
+        fid: (
+            ko.replace(tzinfo=timezone.utc) if ko.tzinfo is None else ko,
+            code,
+        )
+        for fid, (_rd, _id, ko, code) in best.items()
     }
 
 

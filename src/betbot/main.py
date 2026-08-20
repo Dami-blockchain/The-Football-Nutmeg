@@ -55,6 +55,7 @@ from betbot.storage.repos import (
     insert_paper_bet,
     insert_paper_bet_no_market,
     list_recent_paper_bets,
+    prediction_for_fixture,
     predictions_for_kickoff_range,
     reset_kill_switch,
     upsert_prediction,
@@ -802,7 +803,9 @@ def run_daemon(
         except Exception as e:  # noqa: BLE001 — never crash the daemon
             get_logger(__name__).warning("result_alerts_failed", error=str(e))
 
-    async def _alert_matches_upstream(settings, fixture_id: int) -> bool:
+    async def _alert_matches_upstream(
+        settings, fixture_id: int, *, lead_minutes: int
+    ) -> bool:
         """Re-read the fixture upstream and say whether this alert should fire.
 
         Returns True on any fetch failure: a network blip must not silence a
@@ -826,12 +829,11 @@ def run_daemon(
             return True
         kickoff = parse_utc(match.get("utcDate"))
         status = match.get("status")
-        league = str((match.get("competition") or {}).get("code") or "")
         if alert_still_valid(
             datetime.now(timezone.utc),
             kickoff,
             status,
-            early_lead_minutes=settings.early_alert_lead_minutes(league),
+            early_lead_minutes=lead_minutes,
         ):
             return True
         get_logger(__name__).info(
@@ -843,7 +845,7 @@ def run_daemon(
         )
         return False
 
-    async def _fire_prediction_alert(fixture_id: int) -> None:
+    async def _fire_prediction_alert(fixture_id: int, tag: str = "early") -> None:
         # Pre-match lineup-adjusted, gated. Wire the re-scoring helper so the
         # alert re-scores off the confirmed XI; lineup_fn defaults to the
         # production LineupService inside send_prediction_alert.
@@ -866,7 +868,21 @@ def run_daemon(
             # alert CHARGES a reveal — so confirm against upstream that the
             # match really is about to kick off before spending the user's
             # credit. One call, only ever on the alert path.
-            if not await _alert_matches_upstream(settings, fixture_id):
+            #
+            # The window is sized off THIS job's own lead. Sizing both jobs off
+            # the early lead would let the late "confirmed XI" alert fire over
+            # an hour before kickoff on a fixture that had moved — no charge,
+            # since the re-show is free, but lineups that do not exist yet.
+            baseline = prediction_for_fixture(fixture_id)
+            league = baseline.competition_code if baseline else ""
+            lead = (
+                settings.early_alert_lead_minutes(league)
+                if tag == "early"
+                else settings.lineup_confirm_lead_minutes()
+            )
+            if not await _alert_matches_upstream(
+                settings, fixture_id, lead_minutes=lead
+            ):
                 return
 
             await send_prediction_alert(
@@ -876,6 +892,14 @@ def run_daemon(
             get_logger(__name__).warning(
                 "prematch_alert_failed", fixture_id=fixture_id, error=str(e),
             )
+
+    # The 05:00 cron and the hourly watchdog are distinct APScheduler job ids
+    # invoking the SAME coroutine, so max_instances does not serialise them.
+    # On the hour they both fire: two concurrent re-syncs (double the API cost)
+    # and an audit that can observe the other pass's drop_alert_jobs window and
+    # Telegram a coverage gap that does not exist — the false alarm the horizon
+    # clamping exists to prevent.
+    _schedule_lock = asyncio.Lock()
 
     async def _schedule_kickoff_alerts(scheduler) -> None:
         # TWO-alert pre-match model. For each of today's scored fixtures schedule
@@ -896,6 +920,10 @@ def run_daemon(
         # via the reveal ledger, so the fixture is charged EXACTLY ONCE — the
         # early alert reveals+charges; the late alert finds it already-revealed
         # and re-shows it FREE with the updated lineup-adjusted content.
+        async with _schedule_lock:
+            await _schedule_kickoff_alerts_locked(scheduler)
+
+    async def _schedule_kickoff_alerts_locked(scheduler) -> None:
         try:
             _s = get_settings()
             now = datetime.now(timezone.utc)
@@ -920,21 +948,39 @@ def run_daemon(
                         fixtures=[c.fixture_id for c in changes],
                         removed=removed,
                     )
+                # POSTPONED/CANCELLED fixtures have NO new time to write, so
+                # their stored kickoff still reads as today — and the plan below
+                # is built from exactly that row. Without this the drop above is
+                # a guaranteed no-op: both jobs come off, then get re-registered
+                # at the same dead times a few lines later, and the only thing
+                # left guarding the charge is a fire-time check that fails open.
+                dead_fixtures = {c.fixture_id for c in changes if c.is_dead}
             except Exception as e:  # noqa: BLE001 — re-sync is best-effort
                 get_logger(__name__).warning(
                     "kickoff_resync_failed", error=str(e)
                 )
+                dead_fixtures = set()
             start, end, _day = nairobi_day_bounds(now)
-            preds = predictions_for_kickoff_range(start, end)
+            preds = [
+                p
+                for p in predictions_for_kickoff_range(start, end)
+                if p.fixture_id not in dead_fixtures
+            ]
+            if dead_fixtures:
+                get_logger(__name__).info(
+                    "prematch_alerts_skipped_dead_fixtures",
+                    fixtures=sorted(dead_fixtures),
+                )
             plan = plan_kickoff_alert_jobs(_s, preds, now)
             scheduled = 0
             for job_id, run_at in plan:
                 # job_id is predict_early_<fid> / predict_late_<fid>; recover the
                 # fixture id (last underscore-delimited token) for the closure.
                 fid = int(job_id.rsplit("_", 1)[1])
+                job_tag = job_id.rsplit("_", 2)[1]  # "early" | "late"
 
-                async def _fire(fixture_id=fid) -> None:
-                    await _fire_prediction_alert(fixture_id)
+                async def _fire(fixture_id=fid, tag=job_tag) -> None:
+                    await _fire_prediction_alert(fixture_id, tag)
 
                 add_async_job(
                     scheduler,
@@ -964,13 +1010,6 @@ def run_daemon(
         # scheduling pass it now runs first costs one football-data call per
         # league per hour, which is what buys same-day reschedule pickup.
         try:
-            # Re-run the full scheduling pass first. It re-syncs kickoffs and is
-            # idempotent (per-fixture job ids, replace_existing, past fire times
-            # skipped), so a fixture pulled INTO today by a reschedule picks up
-            # its alerts within the hour instead of waiting for the 05:00 pass
-            # that has already been and gone. Auditing without this could only
-            # ever report the gap; now it closes it.
-            await _schedule_kickoff_alerts(scheduler)
             _s = get_settings()
             now = datetime.now(timezone.utc)
             # Clamp to the end of the CURRENT Nairobi day. Scheduling passes
@@ -986,7 +1025,16 @@ def run_daemon(
             )
             preds = predictions_for_kickoff_range(now, horizon)
             plan = plan_kickoff_alert_jobs(_s, preds, now)
+            # AUDIT FIRST, then heal. This watchdog exists to catch "the
+            # scheduling pass never ran at all" — the sync-lambda fault that hid
+            # for days. Running the pass before measuring would self-heal the
+            # symptom every hour and report perfect coverage forever, so a
+            # re-broken cron job would never reach the operator again.
             await report_alert_coverage(scheduler, plan, settings=_s)
+            # Now close it: re-syncing kickoffs here is what lets a fixture
+            # pulled INTO today by a reschedule pick up its alerts within the
+            # hour, rather than waiting for an 05:00 pass that has been and gone.
+            await _schedule_kickoff_alerts(scheduler)
         except Exception as e:  # noqa: BLE001 — never crash the daemon
             get_logger(__name__).warning(
                 "alert_coverage_watchdog_failed", error=str(e)

@@ -37,7 +37,7 @@ from betbot.reschedule import (
 from betbot.storage.db import init_engine
 from betbot.storage.repos import (
     update_prediction_kickoff,
-    upcoming_prediction_kickoffs,
+    upcoming_prediction_fixtures,
     upsert_prediction,
 )
 from betbot.strategy.engine import Prediction
@@ -98,8 +98,8 @@ def test_upsert_prediction_refreshes_kickoff(db):
     row_id = _seed(1, OLD_KO)
     again_id = _seed(1, NEW_KO)  # same (fixture_id, run_date) -> update branch
     assert again_id == row_id, "expected the update branch, not a second row"
-    stored = upcoming_prediction_kickoffs(NOW, NOW + timedelta(days=30))
-    assert stored[1] == NEW_KO
+    stored = upcoming_prediction_fixtures(NOW, NOW + timedelta(days=30))
+    assert stored[1][0] == NEW_KO
 
 
 def test_update_prediction_kickoff_moves_every_row(db):
@@ -138,7 +138,7 @@ def test_update_prediction_kickoff_reports_only_real_changes(db):
     assert update_prediction_kickoff(3, OLD_KO) == 0
 
 
-def test_upcoming_prediction_kickoffs_takes_the_freshest_row(db):
+def test_upcoming_prediction_fixtures_takes_the_freshest_row(db):
     from betbot.storage.db import session_scope
     from betbot.storage.models import PredictionRow
 
@@ -153,8 +153,8 @@ def test_upcoming_prediction_kickoffs_takes_the_freshest_row(db):
                 home_score=1.0, away_score=0.0, draw_score=2.4,
             )
         )
-    stored = upcoming_prediction_kickoffs(NOW, NOW + timedelta(days=2))
-    assert stored == {4: OLD_KO}
+    stored = upcoming_prediction_fixtures(NOW, NOW + timedelta(days=2))
+    assert stored == {4: (OLD_KO, "PD")}
 
 
 # ----------------------------------------------------------------------
@@ -207,8 +207,8 @@ async def test_resync_persists_a_move_seen_in_the_league_window(db, settings):
     changes = await resync_kickoffs(client, settings, now=NOW)
 
     assert [c.fixture_id for c in changes] == [11]
-    stored = upcoming_prediction_kickoffs(NOW, NOW + timedelta(days=30))
-    assert stored[11] == datetime(2026, 8, 21, 16, 0, tzinfo=timezone.utc)
+    stored = upcoming_prediction_fixtures(NOW, NOW + timedelta(days=30))
+    assert stored[11][0] == datetime(2026, 8, 21, 16, 0, tzinfo=timezone.utc)
     assert client.match_calls == [], "a league hit needs no per-fixture call"
 
 
@@ -223,8 +223,8 @@ async def test_resync_resolves_a_fixture_that_left_the_window(db, settings):
 
     assert client.match_calls == [12]
     assert changes[0].new_kickoff == NEW_KO
-    stored = upcoming_prediction_kickoffs(NOW, NOW + timedelta(days=30))
-    assert stored[12] == NEW_KO
+    stored = upcoming_prediction_fixtures(NOW, NOW + timedelta(days=30))
+    assert stored[12][0] == NEW_KO
 
 
 async def test_resync_reports_a_postponement_without_rewriting_the_kickoff(
@@ -237,8 +237,8 @@ async def test_resync_reports_a_postponement_without_rewriting_the_kickoff(
     changes = await resync_kickoffs(client, settings, now=NOW)
 
     assert changes[0].is_dead is True
-    stored = upcoming_prediction_kickoffs(NOW, NOW + timedelta(days=30))
-    assert stored[13] == OLD_KO, "no new time is known — leave the row alone"
+    stored = upcoming_prediction_fixtures(NOW, NOW + timedelta(days=30))
+    assert stored[13][0] == OLD_KO, "no new time is known — leave the row alone"
 
 
 async def test_resync_costs_one_call_per_league(db, settings):
@@ -259,6 +259,13 @@ async def test_resync_costs_one_call_per_league(db, settings):
 
 
 async def test_resync_survives_a_failing_league(db, settings):
+    """One dead league must not cost the others their re-sync.
+
+    The PD fixture is left alone this pass — its league fetch failed, so its
+    absence says nothing about whether it moved — while the PL fixture, whose
+    league answered, is corrected as normal.
+    """
+
     class Boom(FakeClient):
         async def list_matches(self, code, date_from, date_to, *, status=None):
             if code == "PD":
@@ -267,11 +274,16 @@ async def test_resync_survives_a_failing_league(db, settings):
                 code, date_from, date_to, status=status
             )
 
-    _seed(16, OLD_KO)
-    client = Boom(matches={16: _match(16, "2026-08-27T18:30:00Z")})
+    _seed(16, OLD_KO, code="PD")
+    _seed(17, OLD_KO, code="PL")
+    client = Boom(
+        league_matches={"PL": [_match(17, "2026-08-21T16:00:00Z")]},
+        matches={16: _match(16, "2026-08-27T18:30:00Z")},
+    )
     changes = await resync_kickoffs(client, settings, now=NOW)
-    # PD blew up, so 16 is unseen -> resolved by the per-fixture fallback.
-    assert changes[0].new_kickoff == NEW_KO
+
+    assert [c.fixture_id for c in changes] == [17]
+    assert client.match_calls == [], "the dead league must not fan out"
 
 
 async def test_resync_corrects_a_fixture_that_looks_overdue(db, settings):
@@ -292,8 +304,8 @@ async def test_resync_corrects_a_fixture_that_looks_overdue(db, settings):
 
     assert [c.fixture_id for c in changes] == [21]
     assert changes[0].new_kickoff == NEW_KO
-    stored = upcoming_prediction_kickoffs(NOW - timedelta(days=7), NOW + timedelta(days=30))
-    assert stored[21] == NEW_KO
+    stored = upcoming_prediction_fixtures(NOW - timedelta(days=7), NOW + timedelta(days=30))
+    assert stored[21][0] == NEW_KO
 
 
 async def test_resync_leaves_alone_a_fixture_older_than_the_backfill(db, settings):
@@ -417,3 +429,69 @@ def test_alert_guard_handles_a_naive_kickoff():
 )
 def test_parse_utc(raw, expected):
     assert parse_utc(raw) == expected
+
+
+# ----------------------------------------------------------------------
+# Review regressions
+# ----------------------------------------------------------------------
+async def test_a_postponed_fixture_is_not_re_planned_from_the_stale_row(
+    db, settings, monkeypatch
+):
+    """The drop is worthless unless the dead fixture also leaves the PLAN.
+
+    A POSTPONED fixture has no new time to write, so its stored kickoff still
+    reads as today. Dropping its jobs and then re-planning from that untouched
+    row re-registers both at exactly the dead times — a guaranteed no-op that
+    leaves the phantom, charging alert in place.
+    """
+    from betbot.reschedule import KickoffChange
+
+    _seed(31, OLD_KO)
+    changes = [KickoffChange(31, OLD_KO, None, "POSTPONED")]
+    dead = {c.fixture_id for c in changes if c.is_dead}
+    assert dead == {31}
+
+    # The plan the scheduler builds must not contain the dead fixture.
+    from betbot.storage.repos import predictions_for_kickoff_range
+
+    preds = [
+        p
+        for p in predictions_for_kickoff_range(
+            OLD_KO - timedelta(hours=12), OLD_KO + timedelta(hours=12)
+        )
+        if p.fixture_id not in dead
+    ]
+    assert preds == []
+    assert plan_kickoff_alert_jobs(settings, preds, NOW) == []
+
+
+async def test_a_failed_league_does_not_fan_out_per_fixture_calls(db, settings):
+    """A rate-limited league must not be answered with a burst of single calls."""
+
+    class Boom(FakeClient):
+        async def list_matches(self, code, date_from, date_to, *, status=None):
+            raise RuntimeError("429 rate limited")
+
+    for fid in (41, 42, 43):
+        _seed(fid, OLD_KO)
+    client = Boom(matches={fid: _match(fid, "2026-08-27T18:30:00Z") for fid in (41, 42, 43)})
+    changes = await resync_kickoffs(client, settings, now=NOW)
+
+    assert client.match_calls == [], "a failed league fetch must not fan out"
+    assert changes == []
+
+
+def test_an_unreadable_date_on_a_healthy_fixture_is_left_alone():
+    """A malformed field must not read as a postponement and kill the alerts."""
+    assert plan_kickoff_changes({7: OLD_KO}, {7: (None, "TIMED")}) == []
+
+
+def test_the_late_alert_guard_uses_the_late_lead():
+    """Sized off the EARLY lead, the late alert would pass 70 minutes out.
+
+    It would then ship "confirmed XI" content against lineups that do not exist
+    yet on a fixture that had quietly moved an hour later.
+    """
+    ko = NOW + timedelta(minutes=70)
+    assert alert_still_valid(NOW, ko, "TIMED", early_lead_minutes=10) is False
+    assert alert_still_valid(NOW, ko, "TIMED", early_lead_minutes=70) is True
