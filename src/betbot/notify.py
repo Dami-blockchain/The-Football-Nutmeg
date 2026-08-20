@@ -20,7 +20,6 @@ pre-match alerts dead and said nothing.
 
 from __future__ import annotations
 
-import re
 import asyncio
 import time
 from datetime import datetime, timezone
@@ -29,6 +28,7 @@ from typing import Any, Awaitable, Callable
 import httpx
 
 from betbot.logging import get_logger
+from betbot.redaction import redact
 
 log = get_logger(__name__)
 
@@ -82,14 +82,12 @@ async def send_telegram_to(
 #: already safe -- but an injected send_fn could raise a raw httpx error,
 #: and this file exists because that token leaked once. Redact by shape so
 #: the class of bug is gone, not just today's instance.
-# No \b before the digits: the token appears as "bot<digits>:<secret>" in the
-# URL, and a word boundary cannot match between "t" and a digit.
-_TOKEN_RE = re.compile(r"\d{6,}:[A-Za-z0-9_-]{20,}")
-
-
-def _redact(exc: BaseException) -> str:
-    """Error text with any bot-token-shaped substring removed."""
-    return _TOKEN_RE.sub("<REDACTED>", str(exc))
+#:
+#: The regex and the redactor now live in betbot.redaction, because a third
+#: leak route turned up in python-telegram-bot's own logging and needed the
+#: same pattern. One regex, one home -- two copies drift, and the stale copy
+#: is always the one guarding the path that leaks.
+_redact = redact
 
 
 # --------------------------------------------------------------------------

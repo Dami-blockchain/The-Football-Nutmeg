@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 
 from telegram import Update
 from telegram.constants import ParseMode
+from telegram.error import InvalidToken
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -452,8 +453,30 @@ def main() -> None:
         open_registration=settings.telegram_open_registration,
         allowlisted=len(settings.allowed_telegram_ids),
     )
-    app = build_application(settings)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        app = build_application(settings)
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
+    except InvalidToken:
+        # NEVER render this exception. python-telegram-bot puts the token in
+        # the message itself -- InvalidToken("The token `<token>` was rejected
+        # by the server.") at telegram/_bot.py:860 -- so str(e), repr(e) and
+        # the default traceback all print the credential. That is how the
+        # revoked token landed in /tmp/bot.log six times on 2026-08-20.
+        #
+        # `from None` sets __suppress_context__, which stops the interpreter
+        # printing the chained InvalidToken via __cause__ or __context__. And
+        # SystemExit with a string prints just that string, no traceback, and
+        # exits 1 so systemd sees the failure.
+        log.error("telegram_token_rejected", hint="see stderr for next steps")
+        raise SystemExit(
+            "Telegram rejected the configured TELEGRAM_BOT_TOKEN.\n"
+            "The token is wrong, revoked, or was rotated without .env being "
+            "updated.\n"
+            "Fix: get the current token from @BotFather, set TELEGRAM_BOT_TOKEN "
+            "in ~/tfsm/.env, then restart the bot service.\n"
+            "(The rejected token is deliberately not shown -- it is a "
+            "credential, and this message goes to the logs.)"
+        ) from None
 
 
 if __name__ == "__main__":
