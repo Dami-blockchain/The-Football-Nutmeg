@@ -8,12 +8,13 @@ verbatim as snapshot keys, so exact-normalised matching resolves them).
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 from betbot.config import get_settings
 from betbot.data.models import Fixture, FixtureForm, FormSnapshot, Team
 from betbot.strategy import dixon_coles as dc
-from betbot.strategy.cl_engine import EuropeanStrategyEngine
+from betbot.strategy.cl_engine import EuropeanStrategyEngine, _load_snapshot
 from betbot.strategy.engine import Outcome
 
 
@@ -117,3 +118,91 @@ def test_negative_home_rating_adj_lowers_p_home():
     assert weakened.p_home < base.p_home
     # eh is stored (adjusted) for transparency.
     assert weakened.home_score == base.home_score - 120.0
+
+
+# ---------------------------------------------------------------------------
+# Snapshot freshness + degradation safety (fix/clubelo-refresh).
+#
+# The CL engine is the most accurate component in the system, and it silently
+# reverts to the naive form engine when its ClubElo snapshot is bad. These
+# tests pin BOTH halves of that: the revert must be safe, and it must be loud.
+# ---------------------------------------------------------------------------
+
+_HEADER = "Rank,Club,Country,Level,Elo,From,To"
+
+
+def _csv(frm: date, rows: int = 3) -> str:
+    to = frm + timedelta(days=10)  # ClubElo's To is a FUTURE horizon
+    out = [_HEADER]
+    for i in range(rows):
+        out.append(f"{i + 1},Club {i},ENG,1,{1900 - i * 50}.0,{frm.isoformat()},{to.isoformat()}")
+    return "\n".join(out) + "\n"
+
+
+def _engine_on_file(path, monkeypatch, tmp_path):
+    # chdir so the data/clubelo/ directory fallback cannot reach the real repo
+    monkeypatch.chdir(tmp_path)
+    s = get_settings().model_copy(update={"clubelo_latest_path": Path(path)})
+    return EuropeanStrategyEngine(s, dc_params=None, name_map={}, resolver=None)
+
+
+def test_snapshot_age_uses_From_not_the_future_To_column(tmp_path):
+    """Regression: max(To, From) made a 20-day-old snapshot look -10 days old."""
+    frm = date.today() - timedelta(days=20)
+    p = tmp_path / "c.csv"
+    p.write_text(_csv(frm))
+    snap, snap_date = _load_snapshot(p)
+    assert snap_date == frm
+    assert (date.today() - snap_date).days == 20  # positive, and the real age
+
+
+def test_stale_snapshot_is_flagged_on_the_engine(tmp_path, monkeypatch):
+    p = tmp_path / "c.csv"
+    p.write_text(_csv(date.today() - timedelta(days=40)))
+    eng = _engine_on_file(p, monkeypatch, tmp_path)
+    assert eng.snapshot_stale is True
+    assert eng.snapshot_age_days == 40
+    assert eng.snapshot_reason == "stale_40d"
+
+
+def test_fresh_snapshot_is_not_flagged(tmp_path, monkeypatch):
+    p = tmp_path / "c.csv"
+    p.write_text(_csv(date.today()))
+    eng = _engine_on_file(p, monkeypatch, tmp_path)
+    assert eng.snapshot_stale is False
+    assert eng.snapshot_age_days == 0
+
+
+def test_truncated_row_is_dropped_instead_of_loading_a_nonsense_rating(tmp_path):
+    """A half-written CSV used to load 'Bayern' at Elo 20.0 — silently wrong."""
+    p = tmp_path / "c.csv"
+    p.write_text(_csv(date.today()) + "4,Bayern,GER,1,20")
+    snap, _ = _load_snapshot(p)
+    assert "Bayern" not in snap          # dropped, not believed
+    assert snap["Club 0"] == 1900.0      # the good rows survive
+
+
+def test_missing_snapshot_degrades_to_naive_and_is_flagged(tmp_path, monkeypatch):
+    eng = _engine_on_file(tmp_path / "does_not_exist.csv", monkeypatch, tmp_path)
+    assert eng.snapshot_stale is True
+    assert eng.snapshot_reason == "missing_or_empty"
+
+    ff = _ff("Barcelona", "Espanyol", hp=2.5, ap=0.4)
+    from betbot.strategy.engine import StrategyEngine
+    naive = StrategyEngine(get_settings()).predict(ff)
+    got = eng.predict(ff)
+    # Degraded, but never wrong: identical to naive, not a garbage Elo price.
+    assert (got.p_home, got.p_draw, got.p_away) == (naive.p_home, naive.p_draw, naive.p_away)
+
+
+def test_unparseable_snapshot_degrades_to_naive(tmp_path, monkeypatch):
+    p = tmp_path / "c.csv"
+    p.write_text("total garbage, not a csv at all\n")
+    eng = _engine_on_file(p, monkeypatch, tmp_path)
+    assert eng.snapshot_stale is True
+
+    ff = _ff("Barcelona", "Espanyol", hp=2.5, ap=0.4)
+    from betbot.strategy.engine import StrategyEngine
+    naive = StrategyEngine(get_settings()).predict(ff)
+    got = eng.predict(ff)
+    assert (got.p_home, got.p_draw, got.p_away) == (naive.p_home, naive.p_draw, naive.p_away)

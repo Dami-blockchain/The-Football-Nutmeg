@@ -26,30 +26,30 @@ from __future__ import annotations
 import argparse
 import csv
 import time
-import urllib.request
 from datetime import date
 from pathlib import Path
 
-BASE = "http://api.clubelo.com/{d}"
+from betbot.data.clubelo import refresh_latest, snapshot_status
+
 CACHE_DIR = Path("data/clubelo")
 LATEST = Path("data/clubelo_latest.csv")
 
 
-def _fetch_snapshot(d: str, dest: Path, timeout: int = 30) -> bool:
-    try:
-        raw = urllib.request.urlopen(BASE.format(d=d), timeout=timeout).read()  # noqa: S310
-    except Exception as e:  # noqa: BLE001
-        print(f"  fetch {d} failed: {e}")
-        return False
-    text = raw.decode("utf-8", errors="replace")
-    if not text.startswith("Rank,"):
-        print(f"  fetch {d}: unexpected payload")
-        return False
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(text, encoding="utf-8")
-    n = max(text.count("\n") - 1, 0)
-    print(f"  {d}: {n} clubs -> {dest}")
-    return True
+def _fetch_snapshot(d: str, dest: Path) -> bool:
+    """Delegate to betbot.data.clubelo so there is ONE hardened fetch path.
+
+    This script used to carry its own copy: single attempt, no retry, no
+    payload validation, non-atomic write. That duplicate is exactly how the
+    two paths drifted, so it is gone — retry/backoff, validation and the
+    atomic write now apply here too.
+    """
+    ok = refresh_latest(dest, snapshot_date=date.fromisoformat(d))
+    if ok:
+        st = snapshot_status(dest)
+        print(f"  {d}: {st.clubs} clubs -> {dest}")
+    else:
+        print(f"  fetch {d} failed (see log)")
+    return ok
 
 
 def main() -> None:
@@ -61,8 +61,15 @@ def main() -> None:
     args = ap.parse_args()
 
     if args.latest:
-        today = date.today().isoformat()
-        ok = _fetch_snapshot(today, LATEST)
+        ok = refresh_latest(LATEST)
+        st = snapshot_status(LATEST)
+        if ok:
+            print(f"  {st.snapshot_date}: {st.clubs} clubs -> {LATEST}")
+        else:
+            # Loud on the way out: the operator running this by hand should see
+            # what the CL engine is actually left holding.
+            age = "no file" if st.age_days is None else f"{st.age_days:.1f} days old"
+            print(f"  refresh FAILED; existing snapshot is {age} ({st.reason})")
         raise SystemExit(0 if ok else 1)
 
     if not args.for_dates:

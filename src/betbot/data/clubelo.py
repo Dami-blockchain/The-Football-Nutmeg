@@ -235,15 +235,21 @@ def refresh_latest(
     retries: int = DEFAULT_RETRIES,
     sleep=time.sleep,
     stale_after_days: int = STALE_AFTER_DAYS,
+    snapshot_date: date | None = None,
 ) -> bool:
-    """Fetch today's ClubElo snapshot to ``dest``. Returns True on success.
+    """Fetch a ClubElo snapshot to ``dest`` (today's unless overridden).
 
     Retries transient network failures with jittered exponential backoff. When
     every attempt fails the existing snapshot is left untouched and its age is
     checked: a stale one logs at ERROR so the degradation is visible.
+
+    ``snapshot_date`` pins a historical snapshot (the backtest cache under
+    ``data/clubelo/``). Those files are old *by design*, so the staleness check
+    is skipped for them — it only applies to the live ``clubelo_latest.csv``.
     """
     dest = Path(dest)
-    d = date.today().isoformat()
+    historical = snapshot_date is not None
+    d = (snapshot_date or date.today()).isoformat()
     url = CLUBELO_URL.format(d=d)
     attempts = max(1, retries)
     last_error = "unknown"
@@ -274,7 +280,8 @@ def refresh_latest(
             # retrying will not change it, and we must not overwrite a good
             # snapshot with it.
             log.error("clubelo_refresh_bad_payload", reason=reason, head=text[:60], snapshot=d)
-            check_snapshot_freshness(dest, stale_after_days=stale_after_days)
+            if not historical:
+                check_snapshot_freshness(dest, stale_after_days=stale_after_days)
             return False
 
         _write_atomic(dest, text)
@@ -289,5 +296,6 @@ def refresh_latest(
         "clubelo_refresh_failed",
         error=last_error, attempts=attempts, timeout_s=timeout, url=url,
     )
-    check_snapshot_freshness(dest, stale_after_days=stale_after_days)
+    if not historical:
+        check_snapshot_freshness(dest, stale_after_days=stale_after_days)
     return False
