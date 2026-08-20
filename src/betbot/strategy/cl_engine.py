@@ -30,10 +30,12 @@ Two safety guards (mirroring ClubStrategyEngine):
   bridging via ``normalize`` + ``TeamAliasResolver``) has no cross-league
   rating, so we defer to the form-based naive engine, exactly like the club
   engine's unknown-team guard.
-* **Stale/missing snapshot** — if ``clubelo_latest.csv`` is absent or older than
-  14 days (by its own From/To date columns, not file mtime), the Elo edge is
-  untrustworthy; we log a warning once and fall back to naive when a rating is
-  missing.
+* **Stale/missing snapshot** — if ``clubelo_latest.csv`` is absent or older
+  than 14 days (by its own ``From`` column, not ``To`` and not file mtime),
+  the Elo edge is untrustworthy; we log once at ERROR and expose
+  ``snapshot_stale``/``snapshot_age_days``. An absent or unparseable file
+  leaves the club list empty, so every team is unresolved and every fixture
+  takes the naive path — degraded, but never wrong.
 
 Scope: Champions League only; the caller routes domestic leagues to the club
 engine and the World Cup to the international engine.
@@ -46,6 +48,7 @@ import json
 from datetime import date
 from pathlib import Path
 
+from betbot.data.clubelo import MAX_ELO, MIN_ELO
 from betbot.data.models import FixtureForm
 from betbot.exchanges.matcher import TeamAliasResolver, normalize
 from betbot.logging import get_logger
@@ -71,9 +74,22 @@ def _elo_probs(elo_home: float, elo_away: float, home_adv: float, draw_rho: floa
 
 
 def _load_snapshot(path: Path) -> tuple[dict[str, float], date | None]:
-    """Read a ClubElo CSV -> ({club: elo}, newest 'To' date seen)."""
+    """Read a ClubElo CSV -> ({club: elo}, newest ``From`` date seen).
+
+    The date is the newest **From**, not **To**. ClubElo's ``To`` is the end of
+    a rating's *validity window* and therefore sits in the future for a current
+    snapshot, so an age computed from it is negative and the 14-day staleness
+    guard below could never fire when it mattered: the live file measured -10
+    days old while actually being 3 days stale. ``From`` is when the rating was
+    last recomputed, which is the honest measure.
+
+    Elo values outside the sanity band are dropped. A truncated final row such
+    as ``2,Bayern,GER,1,20`` otherwise loads Bayern at Elo 20.0 and prices them
+    as the worst team in Europe — silently wrong, which is the worst kind.
+    """
     snap: dict[str, float] = {}
     newest: date | None = None
+    dropped = 0
     try:
         with path.open() as fh:
             for row in csv.DictReader(fh):
@@ -82,17 +98,25 @@ def _load_snapshot(path: Path) -> tuple[dict[str, float], date | None]:
                     elo = float(row["Elo"])
                 except (KeyError, ValueError, TypeError):
                     continue
+                if not (MIN_ELO <= elo <= MAX_ELO):
+                    dropped += 1
+                    continue
                 if club:
                     snap[club] = elo
-                for col in ("To", "From"):
-                    try:
-                        dt = date.fromisoformat((row.get(col) or "").strip())
-                    except ValueError:
-                        continue
-                    if newest is None or dt > newest:
-                        newest = dt
+                try:
+                    dt = date.fromisoformat((row.get("From") or "").strip())
+                except ValueError:
+                    continue
+                if newest is None or dt > newest:
+                    newest = dt
     except OSError:
         return {}, None
+    if dropped:
+        log.error(
+            "clubelo_snapshot_rows_dropped",
+            path=str(path), dropped=dropped, kept=len(snap),
+            reason="elo_out_of_sanity_band",
+        )
     return snap, newest
 
 
@@ -141,6 +165,10 @@ class EuropeanStrategyEngine:
             Path(settings.club_name_map_path)
         )
         self._warned = False
+        # Read-only freshness seam (see _check_freshness).
+        self.snapshot_stale = False
+        self.snapshot_age_days: int | None = None
+        self.snapshot_reason = "injected"
 
         if snapshot is not None:
             self._snapshot = snapshot
@@ -161,20 +189,38 @@ class EuropeanStrategyEngine:
         self._res_cache: dict[str, str | None] = {}
 
     def _check_freshness(self, path: Path) -> None:
-        if self._warned:
-            return
+        """Record and announce whether the snapshot behind us is usable.
+
+        Logged at ERROR, not WARNING: a stale or missing ClubElo snapshot
+        silently drops every Champions League price back to the naive form
+        engine (~50.7% vs the CL engine's ~58.7% held-out accuracy), and that
+        is exactly the kind of degradation that must not pass unnoticed.
+        ``snapshot_stale``/``snapshot_age_days`` are the read-only seam an
+        operator notifier can poll; this module does not page anyone itself.
+        """
         stale = False
-        reason = ""
+        reason = "fresh"
+        age: int | None = None
         if not self._snapshot:
             stale, reason = True, "missing_or_empty"
         elif self._snapshot_date is not None:
             age = (date.today() - self._snapshot_date).days
             if age > STALE_AFTER_DAYS:
                 stale, reason = True, f"stale_{age}d"
-        if stale:
-            log.warning(
-                "clubelo_snapshot_stale", path=str(path), reason=reason,
-                snapshot_date=str(self._snapshot_date),
+        else:
+            stale, reason = True, "undated"
+
+        self.snapshot_stale = stale
+        self.snapshot_age_days = age
+        self.snapshot_reason = reason
+
+        if stale and not self._warned:
+            log.error(
+                "clubelo_snapshot_stale",
+                path=str(path), reason=reason, age_days=age,
+                clubs=len(self._snapshot),
+                snapshot_date=None if self._snapshot_date is None else str(self._snapshot_date),
+                impact="cl_predictions_fall_back_to_naive",
             )
             self._warned = True
 
