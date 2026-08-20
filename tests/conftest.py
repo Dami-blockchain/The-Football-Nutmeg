@@ -62,3 +62,18 @@ def _no_ledger_epoch(monkeypatch):
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_operator_notify_cooldowns():
+    """Operator-notification cooldowns are process-global state.
+
+    Without this, a test that sends a notification of some kind would silently
+    suppress the next test that sends the same kind — and the second test would
+    fail for a reason that has nothing to do with what it is asserting.
+    """
+    from betbot.notify import reset_operator_notify_cooldowns
+
+    reset_operator_notify_cooldowns()
+    yield
+    reset_operator_notify_cooldowns()
