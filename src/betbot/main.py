@@ -5,6 +5,7 @@ Commands (run as ``nutmeg <command>``, ``tfsm <command>`` or ``betbot <command>`
     tfsm run-daemon    Schedule run-once daily at 08:00 UTC.
     tfsm bets list     Print recent paper bets to stdout.
     tfsm init-db       Create the SQLite schema (called automatically).
+    tfsm announce      Flag the operator on Telegram BEFORE a change.
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ from betbot.daily_jobs import (
 )
 from betbot.gate import evaluate_gate
 from betbot.logging import configure_logging, get_logger
+from betbot.notify import announce_change
 from betbot.scheduling import add_async_job, unawaitable_jobs
 from betbot.settlement import SettlementWatcher
 from betbot.storage.db import init_engine
@@ -1028,6 +1030,59 @@ def bets_list(
             f"{b.our_probability:>4.2f}  {mkt:>5}  ${b.stake_usd:>5.0f}  "
             f"{res:<4}  {pnl:>8}"
         )
+
+
+@app.command("announce")
+def announce_cmd(
+    what: Annotated[
+        str, typer.Argument(help="What is about to change, in one line.")
+    ],
+    rollback: Annotated[
+        str,
+        typer.Option(
+            "--rollback", "-r",
+            help="How to undo it if it goes wrong. State one.",
+        ),
+    ] = "",
+    who: Annotated[
+        str, typer.Option("--who", help="Who is making the change.")
+    ] = "",
+) -> None:
+    """Flag the operator on Telegram BEFORE changing anything.
+
+    Standing rule: the operator is told what is about to happen *before* a
+    change is committed or a flag is flipped — not after, and not only in a
+    log file. This is the entry point for that, callable from a shell script,
+    a Makefile or an agent without importing the package:
+
+        tfsm announce "merge feat/operator-notify to main" \\
+             --rollback "git revert <sha> && systemctl restart tfsm" \\
+             --who ronaldo
+
+    Exits NON-ZERO if the message did not reach Telegram, so the announcement
+    can gate the change itself:
+
+        tfsm announce "..." --rollback "..." && git merge feat/x
+
+    Announcements are never rate-limited — each one is a deliberate statement
+    about a distinct change.
+    """
+    settings = get_settings()
+    configure_logging(settings.log_level)
+    if not rollback.strip():
+        typer.echo(
+            "warning: no --rollback given; the announcement will say so.",
+            err=True,
+        )
+    ok = announce_change(settings, what, rollback=rollback, who=who)
+    if not ok:
+        typer.echo(
+            "FAILED to announce — the operator has NOT been told. "
+            "Do not make the change yet.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    typer.echo("Announced to the operator on Telegram. Change not yet applied.")
 
 
 def _parse_since(s: str) -> int:
