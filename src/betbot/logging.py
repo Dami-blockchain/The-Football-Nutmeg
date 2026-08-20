@@ -16,6 +16,14 @@ def configure_logging(level: str = "INFO") -> None:
         stream=sys.stdout,
         level=level_num,
     )
+    # httpx logs "HTTP Request: POST <url> ..." at INFO, and the Telegram
+    # API embeds the bot token IN the URL path -- so leaving httpx at INFO
+    # prints the credential to stdout/journal on EVERY successful send.
+    # Not hypothetical: that is how the token leaked into an agent
+    # transcript on 2026-08-20. WARNING keeps genuine transport failures
+    # visible without ever rendering a request line.
+    for _noisy in ("httpx", "httpcore"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
     structlog.configure(
         processors=[
             structlog.contextvars.merge_contextvars,

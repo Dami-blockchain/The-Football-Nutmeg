@@ -20,6 +20,7 @@ pre-match alerts dead and said nothing.
 
 from __future__ import annotations
 
+import re
 import asyncio
 import time
 from datetime import datetime, timezone
@@ -61,8 +62,34 @@ async def send_telegram_to(
             resp.raise_for_status()
         return True
     except Exception as e:  # noqa: BLE001 — a failed notification shouldn't crash callers
-        log.warning("telegram_notify_failed", error=str(e))
+        # NEVER log str(e) here: httpx renders its errors as
+        # "... for url 'https://api.telegram.org/bot<TOKEN>/sendMessage'",
+        # so this line would print the bot token on every failure -- and the
+        # Markdown->plain retry is TRIGGERED by a 400, so it fires often.
+        # Log the SHAPE of the failure, never its text.
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        log.warning(
+            "telegram_notify_failed",
+            error_type=type(e).__name__,
+            status_code=status,
+        )
         return False
+
+
+#: Telegram embeds the bot token in the URL path, so ANY error text that
+#: quotes a request URL carries the credential. On the production path
+#: send_telegram_to returns a bool and never raises, so the logs below are
+#: already safe -- but an injected send_fn could raise a raw httpx error,
+#: and this file exists because that token leaked once. Redact by shape so
+#: the class of bug is gone, not just today's instance.
+# No \b before the digits: the token appears as "bot<digits>:<secret>" in the
+# URL, and a word boundary cannot match between "t" and a digit.
+_TOKEN_RE = re.compile(r"\d{6,}:[A-Za-z0-9_-]{20,}")
+
+
+def _redact(exc: BaseException) -> str:
+    """Error text with any bot-token-shaped substring removed."""
+    return _TOKEN_RE.sub("<REDACTED>", str(exc))
 
 
 # --------------------------------------------------------------------------
@@ -202,7 +229,7 @@ async def notify_operator(
             "operator_notify_failed",
             kind=kind,
             dedupe_key=key,
-            error=str(e),
+            error=_redact(e),
             error_type=type(e).__name__,
             preview=text[:120],
         )
@@ -218,7 +245,7 @@ async def _retry_plain(send, settings, chat_id: int, text: str, kind: str) -> bo
         # retry with, the first attempt was the only attempt.
         return False
     except Exception as e:  # noqa: BLE001
-        log.warning("operator_notify_plain_retry_failed", kind=kind, error=str(e))
+        log.warning("operator_notify_plain_retry_failed", kind=kind, error=_redact(e))
         return False
 
 
@@ -245,7 +272,7 @@ def notify_operator_sync(settings, text: str, **kwargs) -> bool:
         return asyncio.run(notify_operator(settings, text, **kwargs))
     except Exception as e:  # noqa: BLE001 — never raise into a caller
         log.error(
-            "operator_notify_failed", kind=kind, error=str(e),
+            "operator_notify_failed", kind=kind, error=_redact(e),
             error_type=type(e).__name__,
         )
         return False
