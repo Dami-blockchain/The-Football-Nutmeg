@@ -153,7 +153,7 @@ def test_track_record_is_zero_when_the_season_has_no_club_results(db):
 # ----------------------------------------------------------------------
 # Storage + migration
 # ----------------------------------------------------------------------
-def test_settlement_stores_the_kickoff(db, settings):
+async def test_settlement_stores_the_kickoff(db, settings):
     """Without this the row cannot be placed in a season at all."""
     from betbot.settlement import SettlementWatcher
 
@@ -174,12 +174,8 @@ def test_settlement_stores_the_kickoff(db, settings):
                 "score": {"winner": "HOME_TEAM", "fullTime": {"home": 2, "away": 0}},
             }
 
-    import asyncio
-
     w = SettlementWatcher(FakeFD(), settings)
-    asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
-        w.settle_due(now=THIS_SEASON + timedelta(hours=3))
-    )
+    await w.settle_due(now=THIS_SEASON + timedelta(hours=3))
 
     with session_scope() as s:
         row = s.query(PredictionOutcome).filter_by(fixture_id=99).one()
@@ -217,3 +213,131 @@ def test_startup_backfills_kickoffs_for_historical_rows(tmp_path):
         ).scalar_one()
     assert ko is not None
     assert len(prediction_outcomes_since(365)) == 1
+
+
+# ----------------------------------------------------------------------
+# Review regressions
+# ----------------------------------------------------------------------
+def test_a_configured_extra_league_counts_in_the_record(db, monkeypatch):
+    """The record must cover exactly what the bot predicts.
+
+    ``Settings.leagues`` has no env alias — it is overridden in code — but every
+    other stage of the pipeline reads it, so a competition added there would
+    otherwise be fetched, predicted, bet on and settled, then silently dropped
+    from the record, quietly under-counting.
+    """
+    import betbot.config as cfg
+
+    base = cfg.get_settings()
+    widened = base.model_copy(update={"leagues": ("PL", "PD", "DED")})
+    monkeypatch.setattr(cfg, "get_settings", lambda: widened)
+
+    _record(1, "DED", THIS_SEASON)
+    assert len(prediction_outcomes_since(365)) == 1
+
+
+def test_competition_codes_are_matched_case_insensitively(db):
+    """form.py stores whatever the API returns; siblings all normalise first."""
+    _record(1, "pd", THIS_SEASON)
+    assert len(prediction_outcomes_since(365)) == 1
+
+
+def test_an_empty_competition_code_is_not_club_football():
+    from betbot.storage.repos import _is_club_competition
+
+    assert _is_club_competition("") is False
+
+
+def test_the_season_boundary_rolls_forward_with_the_football_year():
+    """A hardcoded date silently expires; the record would then span two seasons."""
+    from betbot.storage.repos import _current_season_start
+
+    # July 2027 is still 2026/27 — the season has not turned over yet.
+    assert _current_season_start(
+        datetime(2027, 7, 15, tzinfo=timezone.utc)
+    ) == datetime(2026, 8, 1, tzinfo=timezone.utc)
+    # August 2027 is 2027/28.
+    assert _current_season_start(
+        datetime(2027, 8, 15, tzinfo=timezone.utc)
+    ) == datetime(2027, 8, 1, tzinfo=timezone.utc)
+
+
+def test_an_unparseable_season_start_falls_back_to_auto_not_to_off(monkeypatch):
+    """A typo must not silently disable scoping and readmit every old fixture."""
+    from betbot.config import get_settings
+    from betbot.storage.repos import _current_season_start, _season_start
+
+    monkeypatch.setenv("BETBOT_SEASON_START", "not-a-date")
+    get_settings.cache_clear()
+    try:
+        assert _season_start() == _current_season_start()
+    finally:
+        get_settings.cache_clear()
+
+
+def test_out_of_scope_rows_are_not_billed_as_degenerate(db, caplog):
+    """The degenerate log traces ledger poison; counting scope drops corrupts it."""
+    import logging
+
+    _record(1, "PD", THIS_SEASON)
+    _record(2, "WC", WORLD_CUP)
+    with caplog.at_level(logging.INFO):
+        prediction_outcomes_since(365)
+    assert "accuracy_ledger_degenerate_rows_excluded" not in caplog.text
+
+
+def test_the_backfill_is_write_free_once_every_row_is_dated(tmp_path):
+    """api, bot and daemon all boot at once; a needless write lock can kill one."""
+    import betbot.storage.db as dbmod
+    from betbot.storage.db import _backfill_outcome_kickoffs
+
+    init_engine(tmp_path / "nowrite.sqlite")
+    _record(1, "PD", THIS_SEASON)  # already dated
+
+    calls = []
+    real_begin = dbmod._engine.begin
+
+    def _spy_begin(*a, **kw):
+        calls.append(1)
+        return real_begin(*a, **kw)
+
+    dbmod._engine.begin = _spy_begin
+    try:
+        _backfill_outcome_kickoffs(dbmod._engine)
+    finally:
+        dbmod._engine.begin = real_begin
+    assert calls == [], "took a write lock with nothing to backfill"
+
+
+def test_the_backfill_survives_a_locked_database(tmp_path, monkeypatch):
+    """Best-effort and idempotent — the next startup retries. Never die at boot."""
+    from sqlalchemy.exc import OperationalError
+
+    import betbot.storage.db as dbmod
+    from betbot.storage.db import _backfill_outcome_kickoffs
+
+    init_engine(tmp_path / "locked.sqlite")
+    _record(1, "PD", None)  # undated -> the backfill will want to write
+
+    def _boom(*a, **kw):
+        raise OperationalError("UPDATE", {}, Exception("database is locked"))
+
+    monkeypatch.setattr(dbmod._engine, "begin", _boom)
+    _backfill_outcome_kickoffs(dbmod._engine)  # must not raise
+
+
+def test_the_kickoff_index_exists_after_an_additive_migration(tmp_path):
+    """create_all does not index an existing table; without this, schema drift."""
+    from sqlalchemy import text
+
+    import betbot.storage.db as dbmod
+
+    init_engine(tmp_path / "idx.sqlite")
+    with dbmod._engine.connect() as conn:
+        names = {
+            r[0]
+            for r in conn.execute(
+                text("SELECT name FROM sqlite_master WHERE type='index'")
+            )
+        }
+    assert "ix_prediction_outcomes_kickoff" in names

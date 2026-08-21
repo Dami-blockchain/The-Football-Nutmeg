@@ -337,18 +337,40 @@ def _ledger_epoch() -> datetime | None:
 # made before the fix can land in the ledger dated after it (verified on the
 # live ledger 2026-08-18: a 0.000/0.000/1.000 row carried settled_at 2026-08-17
 # 18:00, i.e. inside the epoch).
+def _current_season_start(now: datetime | None = None) -> datetime:
+    """1 August of the football year containing ``now``.
+
+    European club seasons run August-May, so the year flips on 1 August: in
+    July 2027 the current season is still 2026/27, and from 1 August 2027 it is
+    2027/28. Derived rather than hardcoded because a fixed date silently
+    expires — next August a stale-backfilled May fixture would pass a
+    2026-08-01 boundary and re-enter a record claiming to be "this season",
+    which is the exact bug this scoping exists to prevent.
+    """
+    now = now or datetime.now(timezone.utc)
+    year = now.year if now.month >= 8 else now.year - 1
+    return datetime(year, 8, 1, tzinfo=timezone.utc)
+
+
 def _season_start() -> datetime | None:
-    """Start of the current club season, or None if unset/unparseable."""
+    """Start of the current club season, or None when scoping is disabled.
+
+    ``BETBOT_SEASON_START`` is an OVERRIDE, not the source of truth: set it to
+    pin a boundary (the test suite sets it empty to disable scoping entirely),
+    leave it at its default and the boundary rolls forward on its own.
+    """
     from betbot.config import get_settings
 
     raw = (get_settings().season_start or "").strip()
     if not raw:
         return None
+    if raw.lower() == "auto":
+        return _current_season_start()
     try:
         return datetime.fromisoformat(raw).replace(tzinfo=timezone.utc)
     except ValueError:
-        log.warning("bad_season_start", value=raw)
-        return None
+        log.warning("bad_season_start", value=raw, note="falling back to auto")
+        return _current_season_start()
 
 
 def _is_club_competition(code: str) -> bool:
@@ -358,10 +380,26 @@ def _is_club_competition(code: str) -> bool:
     next international tournament (EURO, Nations League, friendlies), which is
     the same class of fixture for the same reason — a different engine, neutral
     venues, and no bearing on club-season form.
-    """
-    from betbot.config import LEAGUE_CODES
 
-    return code in LEAGUE_CODES
+    The allowlist is the CONFIGURED league set union the built-in codes, not the
+    constant alone. Every other stage of the pipeline drives off
+    ``settings.leagues``, so an operator who adds a competition there would
+    otherwise have it fetched, predicted, bet on and settled — and then silently
+    dropped from the record, which would quietly under-count.
+
+    Compared upper-case: ``data/form.py`` stores whatever the API returns
+    verbatim, and settlement/lineups already normalise before their own lookups.
+    """
+    from betbot.config import LEAGUE_CODES, get_settings
+
+    if not code:
+        return False
+    allowed = {c.upper() for c in LEAGUE_CODES}
+    try:
+        allowed |= {c.upper() for c in get_settings().leagues}
+    except Exception:  # noqa: BLE001 — settings must never break a read
+        pass
+    return code.upper() in allowed
 
 
 _DEGENERATE_P = 1e-4
@@ -410,6 +448,11 @@ def prediction_outcomes_since(days: int) -> list[PredictionOutcome]:
         )
         s.expunge_all()
         clean = [r for r in rows if not _is_degenerate(r)]
+        # Captured BEFORE the scope filter below reassigns ``clean``, so the
+        # degenerate log reports degenerate rows only. Comparing the final list
+        # against ``rows`` would bill every out-of-scope row as ledger poison
+        # and mislead the one log line that exists to trace it.
+        degenerate = len(rows) - len(clean)
         season = _season_start()
         kept = []
         non_club = undated = pre_season = 0
@@ -441,10 +484,10 @@ def prediction_outcomes_since(days: int) -> list[PredictionOutcome]:
                 pre_season=pre_season,
             )
         clean = kept
-        if len(clean) != len(rows):
+        if degenerate:
             log.info(
                 "accuracy_ledger_degenerate_rows_excluded",
-                excluded=len(rows) - len(clean),
+                excluded=degenerate,
             )
         return clean
 
