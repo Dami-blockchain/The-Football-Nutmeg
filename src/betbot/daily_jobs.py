@@ -38,6 +38,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from betbot.entitlement import entitlement_for
 from betbot.logging import get_logger
+from betbot.notify import notify_operator
 from betbot.scheduling import add_async_job
 from betbot.storage.repos import (
     has_revealed,
@@ -249,7 +250,10 @@ async def run_matchday_notice(
     """
     from betbot.notify import send_telegram_to
 
-    send = send_fn or send_telegram_to
+    # `is not None`, not `or`: a falsy-but-valid injected sender (a callable
+    # object defining __len__) would otherwise be swapped for the real
+    # Telegram transport.
+    send = send_fn if send_fn is not None else send_telegram_to
     start, end, day = nairobi_day_bounds(now)
     fixtures = (
         list(fixtures_source(start, end))
@@ -327,6 +331,80 @@ def render_user_lineup_prediction(
     return header + "\n\n" + format_locked(pred), []
 
 
+# ----------------------------------------------------------------------
+# Lineup-gap reporting (the "silent degradation" alarm)
+# ----------------------------------------------------------------------
+#: Minutes before kickoff past which a missing XI stops being "too early" and
+#: starts being a broken feed. The LATE alert exists solely to show a confirmed
+#: XI, so if one is not available by then the feature is not working.
+LINEUP_EXPECTED_BY_MINUTES = 20
+
+
+def lineup_gap_is_notable(alert_tag: str, kickoff, now) -> bool:
+    """Whether a missing XI at this moment is worth waking the operator for.
+
+    The EARLY alert deliberately fires before the XI is posted — flagging that
+    would be an alarm on normal operation, and an alarm that cries wolf is one
+    the operator learns to ignore. Inside
+    ``LINEUP_EXPECTED_BY_MINUTES`` of kickoff, though, a missing XI means the
+    feed is not delivering what the late alert was built to show. Pure, so the
+    boundary is testable without a clock.
+    """
+    if alert_tag != "late":
+        return False
+    if kickoff is None:
+        return True  # can't place it; report rather than swallow
+    if kickoff.tzinfo is None:
+        kickoff = kickoff.replace(tzinfo=timezone.utc)
+    return (kickoff - now) <= timedelta(minutes=LINEUP_EXPECTED_BY_MINUTES)
+
+
+async def report_lineup_gap(
+    settings,
+    baseline,
+    *,
+    alert_tag: str,
+    error: str | None = None,
+    now=None,
+    send_fn=None,
+) -> bool:
+    """Telegram the operator when a confirmed XI could not be fetched.
+
+    Returns True iff a message was sent. Deduped per fixture per alert, so three
+    matches on the same evening produce three flags rather than one — each is a
+    distinct event the operator asked to see — while a retry of the same alert
+    stays quiet.
+    """
+    now = now or datetime.now(timezone.utc)
+    if not lineup_gap_is_notable(alert_tag, baseline.kickoff, now):
+        return False
+    fixture = f"{baseline.home_team} v {baseline.away_team}"
+    reason = f"`{error}`" if error else "the feed returned no starting XI"
+    body = (
+        "*\u26a0\ufe0f Lineup unavailable*\n\n"
+        f"{fixture} ({baseline.competition_code}) kicks off soon and the "
+        f"confirmed XI could not be fetched — {reason}.\n\n"
+        "The pre-match alert was sent on the MODEL prediction only, with no "
+        "lineup adjustment. If this repeats across fixtures the lineup feed is "
+        "down, not merely late."
+    )
+    log.warning(
+        "lineup_gap",
+        fixture_id=baseline.fixture_id,
+        fixture=fixture,
+        competition=baseline.competition_code,
+        alert=alert_tag,
+        error=error,
+    )
+    return await notify_operator(
+        settings,
+        body,
+        kind="lineup_gap",
+        dedupe_key=f"lineup_gap:{baseline.fixture_id}:{alert_tag}",
+        send_fn=send_fn,
+    )
+
+
 async def send_prediction_alert(
     settings,
     fixture_id: int,
@@ -338,6 +416,8 @@ async def send_prediction_alert(
     rescore_fn: Callable | None = None,
     entitlement_fn=entitlement_for,
     users_fn=list_users,
+    alert_tag: str = "early",
+    operator_send_fn: Callable | None = None,
 ) -> int:
     """Pre-match: fetch the confirmed XI, re-score lineup-adjusted, send gated.
 
@@ -358,7 +438,10 @@ async def send_prediction_alert(
     """
     from betbot.notify import send_telegram_to
 
-    send = send_fn or send_telegram_to
+    # `is not None`, not `or`: a falsy-but-valid injected sender (a callable
+    # object defining __len__) would otherwise be swapped for the real
+    # Telegram transport.
+    send = send_fn if send_fn is not None else send_telegram_to
     baseline = prediction_fn(fixture_id)
     if baseline is None:
         log.info("prematch_alert_no_prediction", fixture_id=fixture_id)
@@ -368,12 +451,36 @@ async def send_prediction_alert(
     lineup = None
     home_adj = away_adj = 0.0
     absences: str | None = None
+    lineup_error: str | None = None
     if lineup_fn is None:
         lineup_fn = _default_lineup_fn(settings)
     try:
         lineup, home_adj, away_adj, absences = await lineup_fn(baseline)
     except Exception as e:  # noqa: BLE001 — lineup data is best-effort
+        lineup_error = str(e)
         log.warning("prematch_lineup_failed", fixture_id=fixture_id, error=str(e))
+    # EVERY outcome is logged, found or not. This path degraded to its "not yet
+    # confirmed" caveat on every single fixture for weeks and said NOTHING —
+    # not one warning in the daemon log — so the only way to discover the feed
+    # was dead was for the operator to ask the bot. A fallback that silent is
+    # indistinguishable from a feature that works.
+    log.info(
+        "prematch_lineup_result",
+        fixture_id=fixture_id,
+        alert=alert_tag,
+        found=bool(lineup),
+        home_adj=home_adj,
+        away_adj=away_adj,
+        error=lineup_error,
+    )
+    if not lineup:
+        await report_lineup_gap(
+            settings,
+            baseline,
+            alert_tag=alert_tag,
+            error=lineup_error,
+            send_fn=operator_send_fn,
+        )
 
     # --- ALWAYS re-score fresh at alert time (or fall back to the baseline) ----
     # Previously this only re-scored when the lineup adjustment was nonzero, so
@@ -481,7 +588,10 @@ async def run_result_alerts(
     )
     from betbot.tips import format_result
 
-    send = send_fn or send_telegram_to
+    # `is not None`, not `or`: a falsy-but-valid injected sender (a callable
+    # object defining __len__) would otherwise be swapped for the real
+    # Telegram transport.
+    send = send_fn if send_fn is not None else send_telegram_to
     outcomes_fn = outcomes_fn or outcomes_pending_result_alert
     mark_notified_fn = mark_notified_fn or mark_result_notified
 
