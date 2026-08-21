@@ -427,6 +427,17 @@ class PredictionOutcome(Base):
     settled_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, index=True
     )
+    # When the match was PLAYED, as distinct from when we scored it. The record
+    # is a statement about a season, and ``settled_at`` cannot express that: a
+    # fixture played in July can be settled in August (stale backfill, or an
+    # outage), and filtering on the settlement time silently readmitted two
+    # July World Cup matches into a record labelled "since 17 August".
+    # Nullable: rows written before this column existed are backfilled from
+    # ``predictions`` at startup, and anything still unknown is excluded from
+    # the record rather than guessed at.
+    kickoff: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
 
 
 class ArbExecution(Base):

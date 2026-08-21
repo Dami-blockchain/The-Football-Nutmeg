@@ -263,6 +263,7 @@ def record_prediction_outcome(
     away_goals: int,
     settled_at: datetime,
     result_notified: bool = False,
+    kickoff: datetime | None = None,
 ) -> bool:
     """INSERT-OR-IGNORE one scored prediction. Returns True iff NEWLY inserted.
 
@@ -273,6 +274,10 @@ def record_prediction_outcome(
     ``result_notified=True`` records the row PRE-notified — used for STALE
     backfill (fixtures that finished long ago), which must enter the accuracy
     ledger without ever triggering an end-of-match RESULT ALERT.
+
+    ``kickoff`` is when the match was PLAYED. The record is scoped by season and
+    ``settled_at`` cannot express that — a July fixture settled in August is
+    still a July fixture — so a row without it is excluded from the record.
     """
     pick, correct, brier, rps, log_loss = score_prediction(
         p_home, p_draw, p_away, actual_outcome
@@ -292,6 +297,7 @@ def record_prediction_outcome(
                     brier=brier,
                     rps=rps,
                     log_loss=log_loss,
+                    kickoff=kickoff,
                     home_goals=int(home_goals),
                     away_goals=int(away_goals),
                     result_notified=result_notified,
@@ -331,6 +337,33 @@ def _ledger_epoch() -> datetime | None:
 # made before the fix can land in the ledger dated after it (verified on the
 # live ledger 2026-08-18: a 0.000/0.000/1.000 row carried settled_at 2026-08-17
 # 18:00, i.e. inside the epoch).
+def _season_start() -> datetime | None:
+    """Start of the current club season, or None if unset/unparseable."""
+    from betbot.config import get_settings
+
+    raw = (get_settings().season_start or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw).replace(tzinfo=timezone.utc)
+    except ValueError:
+        log.warning("bad_season_start", value=raw)
+        return None
+
+
+def _is_club_competition(code: str) -> bool:
+    """True for the club competitions the record covers.
+
+    An ALLOWLIST, deliberately: a denylist of {"WC"} would silently readmit the
+    next international tournament (EURO, Nations League, friendlies), which is
+    the same class of fixture for the same reason — a different engine, neutral
+    venues, and no bearing on club-season form.
+    """
+    from betbot.config import LEAGUE_CODES
+
+    return code in LEAGUE_CODES
+
+
 _DEGENERATE_P = 1e-4
 
 
@@ -341,15 +374,27 @@ def _is_degenerate(row: PredictionOutcome) -> bool:
 def prediction_outcomes_since(days: int) -> list[PredictionOutcome]:
     """Scored predictions settled within the trailing window (newest first).
 
-    Two poison filters, both of which must hold for a row to be reported:
+    Four filters, ALL of which must hold for a row to be reported:
 
     * settled on/after the accuracy-ledger epoch
-      (``BETBOT_ACCURACY_LEDGER_EPOCH``), and
-    * a non-degenerate probability triple (see ``_DEGENERATE_P``).
+      (``BETBOT_ACCURACY_LEDGER_EPOCH``),
+    * a non-degenerate probability triple (see ``_DEGENERATE_P``),
+    * a CLUB competition (see :func:`_is_club_competition`), and
+    * kicked off on/after ``BETBOT_SEASON_START``.
 
-    Together these keep the 0/0/100-AWAY-bug era out of every user-facing
+    The first two keep the 0/0/100-AWAY-bug era out of every user-facing
     accuracy figure, including rows the bug era backfilled under a recent
-    ``settled_at``.
+    ``settled_at``. The last two keep the record to what it claims to be —
+    this season's club football. Both are needed and neither implies the
+    other: the July World Cup ties passed the epoch filter (settled 17 August)
+    and were non-degenerate, so only an explicit competition + kickoff test
+    excludes them.
+
+    While a season scope is active, a row with no ``kickoff`` is EXCLUDED — it
+    cannot be placed in a season, and a record that guesses is worse than one
+    that abstains. The startup backfill fills these from ``predictions``, so it
+    should be empty in practice. With ``BETBOT_SEASON_START`` unset there is no
+    season to place a row in, so undated rows are kept.
     """
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     epoch = _ledger_epoch()
@@ -365,6 +410,37 @@ def prediction_outcomes_since(days: int) -> list[PredictionOutcome]:
         )
         s.expunge_all()
         clean = [r for r in rows if not _is_degenerate(r)]
+        season = _season_start()
+        kept = []
+        non_club = undated = pre_season = 0
+        for r in clean:
+            if not _is_club_competition(r.competition_code):
+                non_club += 1
+                continue
+            if season is not None:
+                # Undated rows are dropped ONLY while a season scope is active:
+                # the exclusion exists so an undateable row cannot be assigned
+                # to a season it may not belong to. With no season configured
+                # there is nothing to place it in and nothing to get wrong, so
+                # dropping it would just discard a real result.
+                ko = r.kickoff
+                if ko is None:
+                    undated += 1
+                    continue
+                if ko.tzinfo is None:
+                    ko = ko.replace(tzinfo=timezone.utc)
+                if ko < season:
+                    pre_season += 1
+                    continue
+            kept.append(r)
+        if non_club or undated or pre_season:
+            log.info(
+                "accuracy_ledger_rows_out_of_scope",
+                non_club=non_club,
+                undated=undated,
+                pre_season=pre_season,
+            )
+        clean = kept
         if len(clean) != len(rows):
             log.info(
                 "accuracy_ledger_degenerate_rows_excluded",
