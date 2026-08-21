@@ -15,7 +15,10 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
+from betbot.logging import get_logger
 from betbot.storage.models import Base
+
+log = get_logger(__name__)
 
 _engine: Engine | None = None
 _SessionLocal: sessionmaker[Session] | None = None
@@ -44,6 +47,15 @@ _ADDITIVE_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("prediction_outcomes", "kickoff", "DATETIME"),
 )
 
+# Indexes for columns added by _ADDITIVE_COLUMNS. ``create_all`` only indexes
+# tables it CREATES, so a column added by ALTER on a deployed database would
+# never get the index its model declares — the schema would then differ between
+# the test suite (fresh db, indexed) and production (full scan), which is the
+# kind of drift that only shows up under load.
+_ADDITIVE_INDEXES: tuple[tuple[str, str, str], ...] = (
+    ("prediction_outcomes", "ix_prediction_outcomes_kickoff", "kickoff"),
+)
+
 
 def _apply_additive_migrations(engine: Engine) -> None:
     insp = inspect(engine)
@@ -56,6 +68,12 @@ def _apply_additive_migrations(engine: Engine) -> None:
             if column in cols:
                 continue
             conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
+        for table, index, column in _ADDITIVE_INDEXES:
+            if table not in existing_tables:
+                continue
+            conn.execute(
+                text(f"CREATE INDEX IF NOT EXISTS {index} ON {table} ({column})")
+            )
 
 
 def _backfill_outcome_kickoffs(engine: Engine) -> None:
@@ -73,19 +91,40 @@ def _backfill_outcome_kickoffs(engine: Engine) -> None:
         return
     if "kickoff" not in {c["name"] for c in insp.get_columns("prediction_outcomes")}:
         return
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                """
-                UPDATE prediction_outcomes SET kickoff = (
-                    SELECT p.kickoff FROM predictions p
-                    WHERE p.fixture_id = prediction_outcomes.fixture_id
-                    ORDER BY p.run_date DESC, p.id DESC LIMIT 1
+    # READ first, and take a write lock ONLY when there is something to write.
+    # api, bot and daemon all call init_engine simultaneously at deploy, and an
+    # unconditional UPDATE here would contend for SQLite's single writer at
+    # every boot — the collision that "took down the Telegram bot on the first
+    # deploy" (see init_engine). After the first run this SELECT finds nothing
+    # and the startup path stays write-free, exactly as the column migrations
+    # above are.
+    try:
+        with engine.connect() as conn:
+            pending = conn.execute(
+                text(
+                    "SELECT 1 FROM prediction_outcomes WHERE kickoff IS NULL LIMIT 1"
                 )
-                WHERE kickoff IS NULL
-                """
+            ).first()
+        if pending is None:
+            return
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    UPDATE prediction_outcomes SET kickoff = (
+                        SELECT p.kickoff FROM predictions p
+                        WHERE p.fixture_id = prediction_outcomes.fixture_id
+                        ORDER BY p.run_date DESC, p.id DESC LIMIT 1
+                    )
+                    WHERE kickoff IS NULL
+                    """
+                )
             )
-        )
+    except OperationalError as e:
+        # "database is locked" — another process is mid-write (a settlement
+        # pass). Backfilling is best-effort and idempotent: the next startup
+        # retries it. Never take a service down at boot for it.
+        log.warning("outcome_kickoff_backfill_skipped", error=str(e))
 
 
 def init_engine(db_path: Path) -> Engine:
