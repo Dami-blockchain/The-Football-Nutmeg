@@ -40,6 +40,8 @@ _ADDITIVE_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # Expected-goals readout (display-only) — DC lambdas for the two sides.
     ("predictions", "home_xg", "REAL"),
     ("predictions", "away_xg", "REAL"),
+    # When the match was played, so the record can be scoped to a season.
+    ("prediction_outcomes", "kickoff", "DATETIME"),
 )
 
 
@@ -54,6 +56,36 @@ def _apply_additive_migrations(engine: Engine) -> None:
             if column in cols:
                 continue
             conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
+
+
+def _backfill_outcome_kickoffs(engine: Engine) -> None:
+    """Fill ``prediction_outcomes.kickoff`` from ``predictions`` where NULL.
+
+    Rows written before the column existed have no kickoff, and the record
+    excludes what it cannot date — so without this every historical row would
+    silently vanish from the accuracy figure. The kickoff is taken from the
+    freshest prediction row for the fixture, which is the same one settlement
+    scored. Idempotent (only touches NULLs) and safe to run at every startup.
+    """
+    insp = inspect(engine)
+    tables = set(insp.get_table_names())
+    if not {"prediction_outcomes", "predictions"} <= tables:
+        return
+    if "kickoff" not in {c["name"] for c in insp.get_columns("prediction_outcomes")}:
+        return
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                UPDATE prediction_outcomes SET kickoff = (
+                    SELECT p.kickoff FROM predictions p
+                    WHERE p.fixture_id = prediction_outcomes.fixture_id
+                    ORDER BY p.run_date DESC, p.id DESC LIMIT 1
+                )
+                WHERE kickoff IS NULL
+                """
+            )
+        )
 
 
 def init_engine(db_path: Path) -> Engine:
@@ -79,6 +111,7 @@ def init_engine(db_path: Path) -> Engine:
         if "already exists" not in str(e).lower():
             raise
     _apply_additive_migrations(engine)
+    _backfill_outcome_kickoffs(engine)
     _engine = engine
     _SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, future=True)
     return engine

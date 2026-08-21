@@ -436,6 +436,14 @@ class Settings(BaseSettings):
     accuracy_ledger_epoch: str = Field(
         default="2026-08-17", alias="BETBOT_ACCURACY_LEDGER_EPOCH"
     )
+    # Start of the current CLUB season, compared against a fixture's KICKOFF.
+    # The record answers "how is the model doing this season", so it must not
+    # mix in last season or a summer international tournament: the two July
+    # World Cup ties were scored by a different engine on neutral ground and
+    # sat inside a record labelled "since 17 August" purely because that is
+    # when settlement got to them. 1 August precedes every top-5 league
+    # opening weekend of 2026/27 and follows the World Cup final.
+    season_start: str = Field(default="2026-08-01", alias="BETBOT_SEASON_START")
 
     # ---- Storage ------------------------------------------------------
     db_path: Path = Field(

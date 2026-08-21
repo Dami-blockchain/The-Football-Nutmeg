@@ -65,6 +65,31 @@ def _no_ledger_epoch(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_season_scope(monkeypatch):
+    """Disable the club-season scope on the accuracy ledger for the suite.
+
+    Same trap, same reason as :func:`_no_ledger_epoch`. Production defaults
+    BETBOT_SEASON_START=2026-08-01 so /record covers this season's club
+    football only; most settlement tests pin a frozen "now" in June 2026, and
+    a wall-clock-anchored season boundary would silently filter every one of
+    their fixtures out of the ledger they are asserting on. Off by default
+    here, switched ON explicitly by the tests that exercise it
+    (tests/test_season_record.py).
+
+    Note this disables only the DATE half of the scope. The club-competition
+    allowlist is not date-dependent and stays on everywhere, so a test that
+    scores a "WC" fixture is excluded from the ledger in the suite exactly as
+    it would be in production.
+    """
+    from betbot.config import get_settings
+
+    monkeypatch.setenv("BETBOT_SEASON_START", "")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+@pytest.fixture(autouse=True)
 def _reset_operator_notify_cooldowns():
     """Operator-notification cooldowns are process-global state.
 
