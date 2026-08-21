@@ -886,7 +886,7 @@ def run_daemon(
                 return
 
             await send_prediction_alert(
-                settings, fixture_id, rescore_fn=_rescore,
+                settings, fixture_id, rescore_fn=_rescore, alert_tag=tag,
             )
         except Exception as e:  # noqa: BLE001 — never crash
             get_logger(__name__).warning(

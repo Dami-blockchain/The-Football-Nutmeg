@@ -111,11 +111,16 @@ DEFAULT_COOLDOWN_SECONDS: float = 6 * 3600.0
 #:   floor keeps a restart loop from becoming a message loop.
 #: * ``kill_switch_tripped`` — re-evaluated on every 2h settlement pass while
 #:   the switch stays tripped. Daily floor; the first one is what matters.
+#: * ``lineup_gap`` — the dedupe_key carries the fixture id, so three matches
+#:   in an evening send three flags while a RETRY of the same fixture stays
+#:   quiet. The cooldown must therefore be non-zero (0 disables suppression
+#:   entirely and every retry would resend); 6h comfortably spans one fixture.
 COOLDOWN_SECONDS: dict[str, float] = {
     "announce": 0.0,
     "alert_coverage_gap": 6 * 3600.0,
     "scheduler_jobs_not_awaitable": 24 * 3600.0,
     "kill_switch_tripped": 24 * 3600.0,
+    "lineup_gap": 6 * 3600.0,
 }
 
 #: ``(kind, dedupe_key) -> monotonic timestamp of the last SUCCESSFUL send``.
@@ -206,7 +211,11 @@ async def notify_operator(
             )
             return False
 
-        send = send_fn or send_telegram_to
+        # `is not None`, not `or`: an injected sender can be falsy (a callable
+        # object that defines __len__/__bool__), and `or` would silently swap it
+        # for the real Telegram transport — a test would 'pass' having sent
+        # nothing, or worse, having sent for real.
+        send = send_fn if send_fn is not None else send_telegram_to
         ok = await send(settings, chat_id, text)
         if not ok:
             # Most likely cause of a rejected-but-reachable send is Markdown
