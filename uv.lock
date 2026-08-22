@@ -1986,7 +1986,7 @@ wheels = [
 ]
 
 [[package]]
-name = "the-football-smart-manager"
+name = "the-football-nutmeg-agent"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
