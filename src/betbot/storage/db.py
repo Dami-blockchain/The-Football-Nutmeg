@@ -57,20 +57,65 @@ _ADDITIVE_INDEXES: tuple[tuple[str, str, str], ...] = (
 )
 
 
+def _is_duplicate_column_error(e: OperationalError) -> bool:
+    """SQLite's error when a column being ADDed already exists.
+
+    The message is ``duplicate column name: <col>``. Matched on substring
+    because SQLAlchemy prefixes it with the failing statement.
+    """
+    return "duplicate column name" in str(e).lower()
+
+
 def _apply_additive_migrations(engine: Engine) -> None:
+    """Add columns/indexes that post-date a deployed table. Concurrency-safe.
+
+    ``deploy/start-services.sh`` boots the api, bot and daemon SIMULTANEOUSLY
+    and each calls ``init_engine``, so two processes can both see a column
+    missing and race to ``ALTER TABLE ... ADD COLUMN`` it. Only one ALTER can
+    win; the loser's ALTER runs after the winner committed and SQLite raises
+    ``duplicate column name``. ``create_all`` already guards its own three-way
+    race by swallowing "table already exists" (see ``init_engine``) — the ALTER
+    path had no such guard, so the loser died at boot and STAYED dead. Tonight's
+    rollout only papered over it by STAGGERING the starts; this makes staggering
+    unnecessary.
+
+    Each DDL runs in its OWN short transaction so a caught race on one column
+    cannot roll back or poison another. After the first successful boot the
+    pre-check finds every column present and issues no writes at all, so the
+    startup path stays write-free — the same property the backfill preserves.
+    """
     insp = inspect(engine)
     existing_tables = set(insp.get_table_names())
-    with engine.begin() as conn:
-        for table, column, ddl in _ADDITIVE_COLUMNS:
-            if table not in existing_tables:
-                continue  # create_all just made it with the column already
-            cols = {c["name"] for c in insp.get_columns(table)}
-            if column in cols:
-                continue
-            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
-        for table, index, column in _ADDITIVE_INDEXES:
-            if table not in existing_tables:
-                continue
+    for table, column, ddl in _ADDITIVE_COLUMNS:
+        if table not in existing_tables:
+            continue  # create_all just made it with the column already
+        cols = {c["name"] for c in insp.get_columns(table)}
+        if column in cols:
+            continue
+        try:
+            with engine.begin() as conn:
+                conn.execute(
+                    text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+                )
+        except OperationalError as e:
+            # A concurrent boot added the identical column between our inspector
+            # snapshot and our ALTER. The column now exists, which is all we
+            # need — swallow it exactly like the create_all "already exists"
+            # catch. Any OTHER OperationalError (e.g. a genuine lock that
+            # outlasted SQLite's busy timeout) is a real fault and re-raises.
+            if not _is_duplicate_column_error(e):
+                raise
+            log.info(
+                "additive_column_race_lost_ok",
+                table=table,
+                column=column,
+                note="another boot added it first — column present",
+            )
+    for table, index, column in _ADDITIVE_INDEXES:
+        if table not in existing_tables:
+            continue
+        # CREATE INDEX IF NOT EXISTS is already idempotent AND race-safe.
+        with engine.begin() as conn:
             conn.execute(
                 text(f"CREATE INDEX IF NOT EXISTS {index} ON {table} ({column})")
             )
@@ -98,11 +143,24 @@ def _backfill_outcome_kickoffs(engine: Engine) -> None:
     # deploy" (see init_engine). After the first run this SELECT finds nothing
     # and the startup path stays write-free, exactly as the column migrations
     # above are.
+    # A "pending" row is one that is BOTH undated AND fillable — i.e. it has a
+    # matching prediction row to take a kickoff from. An outcome with no
+    # matching prediction (an orphan) can never be filled, so it must NOT count
+    # as pending: otherwise the SELECT below finds it on every boot, the UPDATE
+    # re-runs forever, and the "write-free after the first run" property is
+    # broken. The EXISTS clause restricts both the trigger and the write to
+    # fillable rows only.
+    _FILLABLE = (
+        "EXISTS (SELECT 1 FROM predictions p "
+        "WHERE p.fixture_id = prediction_outcomes.fixture_id "
+        "AND p.kickoff IS NOT NULL)"
+    )
     try:
         with engine.connect() as conn:
             pending = conn.execute(
                 text(
-                    "SELECT 1 FROM prediction_outcomes WHERE kickoff IS NULL LIMIT 1"
+                    "SELECT 1 FROM prediction_outcomes "
+                    f"WHERE kickoff IS NULL AND {_FILLABLE} LIMIT 1"
                 )
             ).first()
         if pending is None:
@@ -110,13 +168,14 @@ def _backfill_outcome_kickoffs(engine: Engine) -> None:
         with engine.begin() as conn:
             conn.execute(
                 text(
-                    """
+                    f"""
                     UPDATE prediction_outcomes SET kickoff = (
                         SELECT p.kickoff FROM predictions p
                         WHERE p.fixture_id = prediction_outcomes.fixture_id
+                        AND p.kickoff IS NOT NULL
                         ORDER BY p.run_date DESC, p.id DESC LIMIT 1
                     )
-                    WHERE kickoff IS NULL
+                    WHERE kickoff IS NULL AND {_FILLABLE}
                     """
                 )
             )
