@@ -19,6 +19,7 @@ import pytest
 from betbot.config import Settings
 from betbot.data.models import Fixture, FixtureForm, FormSnapshot
 from betbot.data.odds import MatchOdds, OddsService
+from betbot.data.odds_names import OddsNameResolver
 from betbot.storage.db import init_engine
 from betbot.strategy.engine import StrategyEngine
 
@@ -71,9 +72,23 @@ def _settings(**over) -> Settings:
     )
 
 
+def _hermetic_resolver() -> OddsNameResolver:
+    """A resolver that does NOT read data/club_name_map.json.
+
+    That file is gitignored — the droplet generates it via
+    scripts/seed_glicko_club.py — so on a fresh checkout the canonical set is
+    empty, every fixture name resolves to None, and anchoring silently skips
+    with no_quote. Injecting the two names this test uses makes the anchor
+    path exercisable in CI, which is the only place it is currently guarded.
+    "Arsenal FC"/"Chelsea FC" normalise to "arsenal"/"chelsea", matching the
+    injected rows below.
+    """
+    return OddsNameResolver(canonical=["arsenal", "chelsea"])
+
+
 def _service(settings) -> OddsService:
-    """Offline service: no provider, rows injected. Zero network."""
-    svc = OddsService(settings, providers=[])
+    """Offline service: no provider, rows injected, explicit resolver. Zero I/O."""
+    svc = OddsService(settings, providers=[], resolver=_hermetic_resolver())
     svc.load_rows([
         MatchOdds(
             league="PL", match_date=date(2026, 6, 20), home="arsenal", away="chelsea",
@@ -149,7 +164,7 @@ async def test_missing_odds_row_still_scores_the_fixture(fresh_db, monkeypatch):
     from betbot.main import _score_and_log_one
 
     s = _settings(BETBOT_ODDS_ANCHOR="true")
-    empty = OddsService(s, providers=[])
+    empty = OddsService(s, providers=[], resolver=_hermetic_resolver())
     empty.load_rows([])
     seen = _capture(monkeypatch)
     n = await _score_and_log_one(

@@ -17,6 +17,7 @@ from datetime import date, datetime, timezone
 import pytest
 
 from betbot.data.odds import MatchOdds, OddsQuote, OddsService
+from betbot.data.odds_names import OddsNameResolver
 from betbot.strategy.engine import Prediction
 from betbot.strategy.ensemble import anchor_triple, de_vig
 from betbot.strategy.odds_anchor import anchor_prediction, engine_model_weight
@@ -255,8 +256,22 @@ def test_club_engine_exposes_its_summed_component_weight():
 # ---------------------------------------------------------------------------
 # End-to-end through the real service object (no network)
 # ---------------------------------------------------------------------------
+def _hermetic_resolver() -> OddsNameResolver:
+    """Inject the names this test uses instead of reading the gitignored
+    data/club_name_map.json (droplet-generated). Without it the canonical set
+    is empty on a fresh checkout, "Rayo Vallecano"/"Alaves" resolve to None,
+    and the anchor is skipped as no_quote — so CI would not guard this path at
+    all. name_map carries the "Rayo Vallecano" -> "vallecano" mapping the feed
+    rows use; "Alaves" is already canonical.
+    """
+    return OddsNameResolver(
+        canonical=["vallecano", "alaves"],
+        name_map={"Rayo Vallecano": "vallecano"},
+    )
+
+
 def test_end_to_end_through_a_loaded_service():
-    svc = OddsService(_Settings(), providers=[])
+    svc = OddsService(_Settings(), providers=[], resolver=_hermetic_resolver())
     svc.load_rows([_odds()])
     pred = _prediction(0.60, 0.25, 0.15)
     out = asyncio.run(
