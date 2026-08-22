@@ -69,7 +69,7 @@ def _install_fake_httpx(monkeypatch, payload: dict, status_code: int = 200):
 def _settings(**overrides) -> Settings:
     base = dict(
         GROQ_API_KEY="test-groq-key",
-        BETBOT_GROQ_MODEL="llama-3.3-70b-versatile",
+        BETBOT_GROQ_MODEL="openai/gpt-oss-120b",
         BETBOT_LLM_MAX_TOKENS=500,
         BETBOT_LLM_DAILY_LIMIT_PER_USER=20,
         TELEGRAM_BOT_TOKEN="123:TESTTOKEN",
@@ -104,7 +104,7 @@ async def test_happy_path_calls_groq_api(monkeypatch):
     assert call["headers"]["Authorization"] == "Bearer test-groq-key"
     assert "Mozilla/5.0" in call["headers"]["User-Agent"]
     body = call["json"]
-    assert body["model"] == "llama-3.3-70b-versatile"
+    assert body["model"] == "openai/gpt-oss-120b"
     assert body["max_tokens"] == 500
     # OpenAI schema: a system message carries the prompt, last message is the user.
     assert body["messages"][0]["role"] == "system"
@@ -178,7 +178,7 @@ async def test_http_error_falls_back_to_fallback_model_then_message(monkeypatch)
     assert reply == llm_agent.ERROR_MESSAGE
     # Primary model failed → one retry on the fallback model.
     assert len(calls) == 2
-    assert calls[0]["json"]["model"] == "llama-3.3-70b-versatile"
+    assert calls[0]["json"]["model"] == "openai/gpt-oss-120b"
     assert calls[1]["json"]["model"] == llm_agent._FALLBACK_MODEL
     assert len(agent._history[1]) == 0  # failed exchange not committed
 
@@ -330,7 +330,7 @@ def test_context_no_fixtures(tmp_path, monkeypatch):
 
     ctx = build_prediction_context(u, s, now=_KO)
 
-    assert "no fixtures today" in ctx
+    assert "no fixtures scheduled today" in ctx
 
 
 def test_record_label_names_the_actual_filter_scope(preds_db, tmp_path, monkeypatch):
@@ -463,13 +463,13 @@ def tg_env(tmp_path, monkeypatch):
 def test_open_registration_defaults_on():
     assert Settings.model_fields["telegram_open_registration"].default is True
     assert (
-        Settings.model_fields["groq_model"].default == "llama-3.3-70b-versatile"
+        Settings.model_fields["groq_model"].default == "openai/gpt-oss-120b"
     )
     assert (
         Settings.model_fields["groq_base_url"].default
         == "https://api.groq.com/openai/v1"
     )
-    assert Settings.model_fields["llm_max_tokens"].default == 500
+    assert Settings.model_fields["llm_max_tokens"].default == 1024
     assert Settings.model_fields["llm_daily_limit_per_user"].default == 20
 
 
