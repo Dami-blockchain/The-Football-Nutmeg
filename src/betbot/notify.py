@@ -121,6 +121,13 @@ COOLDOWN_SECONDS: dict[str, float] = {
     "scheduler_jobs_not_awaitable": 24 * 3600.0,
     "kill_switch_tripped": 24 * 3600.0,
     "lineup_gap": 6 * 3600.0,
+    # ``challenger_dual_log_stale`` — a DAILY audit reporting a condition that
+    # persists until someone writes code (no challenger writes
+    # model_predictions in this build). A 6h floor would turn a true, standing
+    # fact into four pushes a day, and an operator who learns to swipe this
+    # away is an operator who will swipe away the real staleness alarm it
+    # becomes once a challenger is wired. Weekly: loud, not nagging.
+    "challenger_dual_log_stale": 7 * 24 * 3600.0,
 }
 
 #: ``(kind, dedupe_key) -> monotonic timestamp of the last SUCCESSFUL send``.

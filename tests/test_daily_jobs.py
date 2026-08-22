@@ -619,7 +619,13 @@ async def _noop() -> None:  # pragma: no cover — never fired in tests
 def test_matchday_cron_registered_with_nairobi_timezone(settings):
     sched = FakeScheduler()
     register_daily_jobs(sched, settings, matchday_notice=_noop)
-    assert set(sched.jobs) == {"matchday_notice", "player_minutes_backfill"}
+    assert set(sched.jobs) == {
+        "matchday_notice",
+        "player_minutes_backfill",
+        # Read-only daily audit of the challenger dual-log. Added after
+        # model_predictions sat frozen for five weeks unnoticed.
+        "challenger_dual_log_audit",
+    }
     trig = sched.jobs["matchday_notice"]
     assert isinstance(trig, CronTrigger)
     assert str(trig.timezone) == "Africa/Nairobi"

@@ -190,7 +190,11 @@ def test_register_daily_jobs_registers_only_awaitable_callables(settings):
     sched = _RecordingScheduler()
     register_daily_jobs(sched, settings, matchday_notice=_notice)
 
-    assert {j.id for j in sched.jobs} == {"matchday_notice", "player_minutes_backfill"}
+    assert {j.id for j in sched.jobs} == {
+        "matchday_notice",
+        "player_minutes_backfill",
+        "challenger_dual_log_audit",
+    }
     assert unawaitable_jobs(sched) == []
 
 

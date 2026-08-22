@@ -36,6 +36,7 @@ from zoneinfo import ZoneInfo
 
 from apscheduler.triggers.cron import CronTrigger
 
+from betbot.dual_log import dual_log_audit_tick
 from betbot.entitlement import entitlement_for
 from betbot.logging import get_logger
 from betbot.notify import notify_operator
@@ -804,6 +805,19 @@ def register_daily_jobs(scheduler, settings, *, matchday_notice) -> None:
         args=(settings,),
         trigger=CronTrigger.from_crontab("15 5 * * *", timezone=timezone.utc),
         id="player_minutes_backfill",
+    )
+    # Daily 05:30 UTC: is the challenger dual-log actually accumulating?
+    #
+    # model_predictions sat frozen from 2026-07-17 to 2026-08-22 while the
+    # roadmap waited on it to reach a sample size, and nothing said a word.
+    # Read-only (three aggregate SELECTs) and best-effort, so it cannot affect
+    # scoring, settlement or alerts. See betbot/dual_log.py.
+    add_async_job(
+        scheduler,
+        dual_log_audit_tick,
+        args=(settings,),
+        trigger=CronTrigger.from_crontab("30 5 * * *", timezone=timezone.utc),
+        id="challenger_dual_log_audit",
     )
 
 
