@@ -50,7 +50,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, select
 
 from betbot.logging import get_logger
-from betbot.notify import notify_operator
+from betbot.notify import _redact, notify_operator
 from betbot.storage.db import session_scope
 from betbot.storage.models import ModelPrediction, PredictionRow
 
@@ -272,4 +272,8 @@ async def dual_log_audit_tick(settings) -> None:
     try:
         await report_dual_log_health(settings)
     except Exception as e:  # noqa: BLE001 — a monitor must not kill the daemon
-        log.error("dual_log_audit_failed", error=str(e))
+        # Log the exception's SHAPE, not its raw text: the same rule the notify
+        # path already follows. A bot-token-shaped substring in the message
+        # would otherwise reach the logs verbatim (the token-leak class of bug),
+        # so route every error string through the same redactor.
+        log.error("dual_log_audit_failed", error=_redact(e))

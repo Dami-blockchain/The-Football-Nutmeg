@@ -225,3 +225,35 @@ def test_audit_is_registered_as_an_awaitable_daily_job(settings):
 
     assert "challenger_dual_log_audit" in registered
     assert is_async_job(registered["challenger_dual_log_audit"])
+
+
+@pytest.mark.asyncio
+async def test_the_tick_redacts_a_token_shaped_error_before_logging(
+    settings, monkeypatch
+):
+    """`dual_log_audit_tick` must log the error's SHAPE, not its raw text.
+
+    The codebase's rule is "log shape, not text" (a Telegram bot token once
+    leaked through httpx INFO logs on every send). If the audit fails with a
+    message that happens to contain a token-shaped substring, the tick's
+    catch-all handler must pass it through `notify._redact` so the token never
+    reaches the logs verbatim.
+    """
+    token = "123456789:AAHkq9w6f2xVeryLongLookingBotToken12"
+
+    def _boom(**_kw):
+        raise RuntimeError(f"connect failed for bot {token}")
+
+    monkeypatch.setattr(dual_log, "audit_dual_log", _boom)
+
+    logged: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        dual_log.log, "error", lambda event, **kw: logged.append((event, kw))
+    )
+
+    await dual_log.dual_log_audit_tick(settings)  # must not raise
+
+    assert logged and logged[0][0] == "dual_log_audit_failed"
+    error_text = logged[0][1]["error"]
+    assert token not in error_text
+    assert "<REDACTED>" in error_text
