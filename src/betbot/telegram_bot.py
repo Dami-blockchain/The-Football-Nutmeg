@@ -424,8 +424,88 @@ async def chat_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(reply)
 
 
+#: How often the bot proves it is still polling, in seconds.
+#:
+#: The bot is not supervised by anything that restarts it, so "the process is
+#: up" is the ONLY signal an operator has — and it is a lie by omission. On
+#: 2026-08-22 /tmp/bot.log had been silent for 11 hours, ending in an
+#: unhandled telegram.error.NetworkError, and there was no way to tell from
+#: outside whether the updater had recovered or the process was a husk. (It
+#: had recovered. Nothing said so.) A heartbeat makes "alive" and "alive but
+#: deaf" different lines in the log.
+HEARTBEAT_SECONDS: float = 15 * 60.0
+
+
+async def _log_network_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """PTB error handler — the thing whose absence the live log complained about.
+
+    ``/tmp/bot.log`` carried "No error handlers are registered, logging
+    exception." above every traceback: PTB dispatches transport errors to the
+    application, finds nobody listening, and dumps a full traceback at ERROR.
+    Registering a handler replaces ~30 lines of library internals with one
+    structured line an operator can actually grep.
+
+    NEVER log ``str(error)`` here. Telegram embeds the bot token in the request
+    path, so httpx renders its errors as "... for url
+    'https://api.telegram.org/bot<TOKEN>/getUpdates'". Logging the message text
+    would reintroduce the exact credential leak fixed in 2bd1830 — and this
+    handler fires on every network blip, so it would leak often. Log the SHAPE
+    of the failure only: type and, when present, HTTP status.
+    """
+    err = context.error
+    status = getattr(getattr(err, "response", None), "status_code", None)
+    log.warning(
+        "telegram_polling_error",
+        error_type=type(err).__name__,
+        status_code=status,
+        note="python-telegram-bot retries this internally with backoff",
+    )
+
+
+async def _heartbeat(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Prove the updater is still polling — or say clearly that it is not.
+
+    ``Updater.running`` is the library's own view of whether the long-poll loop
+    is alive, so this cannot drift from reality the way a hand-rolled flag
+    would. A stopped updater with a live process is the zombie case: the
+    operator would otherwise see a healthy `ps` line and a bot that answers
+    nobody.
+    """
+    updater = context.application.updater
+    polling = bool(updater and updater.running)
+    if polling:
+        log.info("telegram_bot_heartbeat", polling=True)
+        return
+    log.error("telegram_bot_not_polling", polling=False)
+    try:
+        from betbot.notify import notify_operator
+
+        await notify_operator(
+            get_settings(),
+            "Telegram bot is UP but NOT POLLING — it has stopped receiving "
+            "messages. The process is alive, so nothing will restart it. It "
+            "needs a manual restart.",
+            kind="telegram_bot_not_polling",
+        )
+    except Exception as e:  # noqa: BLE001 — a monitor must not kill the bot
+        log.error("telegram_heartbeat_notify_failed", error_type=type(e).__name__)
+
+
 def build_application(settings) -> Application:
     app = Application.builder().token(settings.telegram_bot_token).build()
+    # Registered BEFORE the handlers so a failure during startup is still
+    # caught by something.
+    app.add_error_handler(_log_network_error)
+    if app.job_queue is not None:
+        app.job_queue.run_repeating(
+            _heartbeat, interval=HEARTBEAT_SECONDS, first=HEARTBEAT_SECONDS,
+            name="telegram_heartbeat",
+        )
+    else:  # pragma: no cover — job-queue extra missing
+        log.warning(
+            "telegram_heartbeat_unavailable",
+            note="no JobQueue; 'alive but deaf' will not be detectable",
+        )
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", guide_cmd))
     app.add_handler(CommandHandler("guide", guide_cmd))

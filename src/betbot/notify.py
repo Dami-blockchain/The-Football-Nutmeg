@@ -128,6 +128,11 @@ COOLDOWN_SECONDS: dict[str, float] = {
     # away is an operator who will swipe away the real staleness alarm it
     # becomes once a challenger is wired. Weekly: loud, not nagging.
     "challenger_dual_log_stale": 7 * 24 * 3600.0,
+    # ``telegram_bot_not_polling`` — re-evaluated by the bot's 15-minute
+    # heartbeat. Nothing supervises the bot, so this needs a MANUAL restart and
+    # will keep firing until the operator acts; 6h keeps it present without
+    # sending 96 pushes a day.
+    "telegram_bot_not_polling": 6 * 3600.0,
 }
 
 #: ``(kind, dedupe_key) -> monotonic timestamp of the last SUCCESSFUL send``.
