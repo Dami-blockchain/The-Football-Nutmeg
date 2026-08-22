@@ -75,6 +75,28 @@ def _booted_commit() -> str:
 _BOOTED_COMMIT = _booted_commit()
 
 
+def _kill_switch_state(db_ok: bool) -> bool | None:
+    """Kill-switch state, or ``None`` when it cannot be known.
+
+    The kill switch is a ROW IN THE DATABASE, so reading it is a second DB
+    round-trip. Reading it unconditionally is what turned a real DB outage into
+    an HTTP 500: the health handler built its payload, called this read anyway,
+    and the raised OperationalError escaped as a generic 500 — throwing away
+    the ``checks.db.error`` diagnostic and skipping ``log.error("health_degraded")``
+    at the exact moment the operator needed both.
+
+    ``None`` is deliberate and is NOT ``False``. "Not tripped" is a claim about
+    trading safety; asserting it from a probe that could not read the switch
+    would be a lie a monitor might act on. Unknown says unknown.
+    """
+    if not db_ok:
+        return None
+    try:
+        return is_kill_switch_tripped()
+    except Exception:  # noqa: BLE001 — the probe must degrade, never 500
+        return None
+
+
 def _db_ok() -> tuple[bool, str | None]:
     """Round-trip a trivial query so the probe proves the DB is REACHABLE.
 
@@ -205,13 +227,17 @@ def create_app() -> FastAPI:
         it cannot work without is down. A TRIPPED KILL SWITCH IS NOT 503 — the
         kill switch firing is the system working as designed, and paging on it
         as an outage would train the operator to ignore the probe.
+
+        Every field is resolved DEFENSIVELY: a probe that raises while
+        describing an outage reports nothing at all. See
+        :func:`_kill_switch_state`.
         """
         db_ok, db_error = _db_ok()
         payload = {
             "status": "ok" if db_ok else "degraded",
             "mode": get_settings().mode,
             "checks": {"db": {"ok": db_ok, "error": db_error}},
-            "kill_switch": {"tripped": is_kill_switch_tripped()},
+            "kill_switch": {"tripped": _kill_switch_state(db_ok)},
             "build": {"commit": _BOOTED_COMMIT},
             "uptime_seconds": round(time.time() - _BOOTED_AT, 1),
         }

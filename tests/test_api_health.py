@@ -75,16 +75,73 @@ def test_settings_exposes_mode_for_every_endpoint_that_reads_it():
     assert Settings(_env_file=None).mode in {"paper", "live"}
 
 
-def test_health_degrades_to_503_when_the_db_is_unreachable(client, monkeypatch):
-    """A probe that stays 200 through a dead DB is worse than no probe."""
-    import backend.tfsm_api.app as app_mod
+@pytest.fixture()
+def unreachable_db(monkeypatch):
+    """Point the process-global session factory at a database that cannot open.
 
-    monkeypatch.setattr(app_mod, "_db_ok", lambda: (False, "OperationalError"))
+    A GENUINE outage, not a stubbed ``_db_ok``. Stubbing that one function
+    faked the symptom while leaving a perfectly healthy test DB underneath, so
+    every OTHER database read in the handler still succeeded — which is exactly
+    how an unconditional ``is_kill_switch_tripped()`` call sat on line 214
+    unnoticed and turned a real outage into a generic HTTP 500. Here every
+    query fails, the way it does when the sqlite file is deleted, unmounted or
+    permission-changed under a running process.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    import betbot.storage.db as db_mod
+
+    # A directory that does not exist: sqlite raises "unable to open database
+    # file" on CONNECT, so nothing in the app can reach the DB at all.
+    dead = create_engine("sqlite:////nonexistent-dir-4f2a/dead.sqlite", future=True)
+    monkeypatch.setattr(db_mod, "_engine", dead)
+    monkeypatch.setattr(
+        db_mod,
+        "_SessionLocal",
+        sessionmaker(bind=dead, expire_on_commit=False, future=True),
+    )
+    return dead
+
+
+def test_health_degrades_to_503_when_the_db_is_unreachable(client, unreachable_db):
+    """A probe that stays 200 through a dead DB is worse than no probe."""
     r = client.get("/api/health")
-    assert r.status_code == 503
+    assert r.status_code == 503, r.text
     body = r.json()
     assert body["status"] == "degraded"
     assert body["checks"]["db"]["ok"] is False
+    # The diagnostic is the POINT of the 503 payload — without it the operator
+    # learns only "something is wrong".
+    assert body["checks"]["db"]["error"]
+
+
+def test_a_dead_db_does_not_turn_the_probe_into_a_500(client, unreachable_db):
+    """The regression: reading the kill switch re-entered the dead DB.
+
+    ``is_kill_switch_tripped()`` opens its own session, so building the payload
+    raised before the 503 could be returned. The handler answered 500 with a
+    generic body, the ``db.error`` diagnostic was lost, and the
+    ``health_degraded`` log line never fired.
+    """
+    r = client.get("/api/health")
+    assert r.status_code != 500, r.text
+    # Unknown must be reported as UNKNOWN. Claiming ``False`` here would tell a
+    # monitor the trading kill switch is confirmed un-tripped on the strength
+    # of a read that never happened.
+    assert r.json()["kill_switch"]["tripped"] is None
+
+
+def test_health_logs_the_degradation_when_the_db_is_dead(client, unreachable_db, monkeypatch):
+    """`log.error("health_degraded")` is how the outage reaches the logs."""
+    import backend.tfsm_api.app as app_mod
+
+    seen: list[tuple] = []
+    monkeypatch.setattr(
+        app_mod.log, "error", lambda event, **kw: seen.append((event, kw))
+    )
+    client.get("/api/health")
+    assert [e for e, _ in seen] == ["health_degraded"]
 
 
 @pytest.mark.parametrize(
