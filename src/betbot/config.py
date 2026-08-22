@@ -38,6 +38,20 @@ def _first_real_env_value(env_var: str, env_file: str = ".env") -> str:
 # Top-5 European leagues + UCL. Codes are football-data.org competition IDs.
 LEAGUE_CODES: tuple[str, ...] = ("PL", "PD", "BL1", "SA", "FL1", "CL")
 
+#: Whether this build contains ANY path that can place a real-money order.
+#:
+#: It does not. The predictions-only pivot (``3928cdc``) removed the trading +
+#: deposit bridge and ``550404e`` deleted the remaining inert order machinery,
+#: so ``exchanges/polymarket.py`` no longer carries ``place_order`` at all.
+#: Every wager this build records is a row in ``paper_bets``.
+#:
+#: This is a BUILD FACT, not a knob. It is deliberately a module constant and
+#: not a ``Settings`` field so that no value in ``.env`` — including the
+#: long-dead ``BETBOT_MODE=live`` — can flip it. Re-introducing live ordering
+#: means editing this line in the same commit that adds the order path, which
+#: is exactly the review surface we want it to have.
+LIVE_ORDER_PATH_AVAILABLE: bool = False
+
 
 class Settings(BaseSettings):
     """All runtime knobs. Loaded from .env at process start.
@@ -271,6 +285,24 @@ class Settings(BaseSettings):
                 except ValueError:
                     pass
         return ids
+
+    @property
+    def mode(self) -> str:
+        """Trading mode: ``"paper"`` while no live order path is compiled in.
+
+        ``mode`` used to be a real ``BETBOT_MODE`` field. The predictions-only
+        pivot deleted the field but left three API endpoints reading
+        ``settings.mode`` — so ``/api/health``, ``/api/status`` and
+        ``/api/settings`` all returned HTTP 500 with
+        ``AttributeError: 'Settings' object has no attribute 'mode'``.
+
+        It is back as a derived PROPERTY rather than a Field on purpose: the
+        answer is a fact about the build (see
+        :data:`LIVE_ORDER_PATH_AVAILABLE`), not something an operator can set.
+        Restoring it as a settable field would let ``BETBOT_MODE=live`` in
+        ``.env`` make the API *claim* live trading that this build cannot do.
+        """
+        return "live" if LIVE_ORDER_PATH_AVAILABLE else "paper"
 
     @property
     def secrets_dir(self) -> str:

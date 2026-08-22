@@ -10,12 +10,16 @@ bind and allows requests (with a logged warning). The built React app in
 
 from __future__ import annotations
 
+import subprocess
+import time
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from sqlalchemy import text as sa_text
 
 from betbot.backtest import backtest_mock, backtest_stored
 from betbot.config import get_settings
@@ -37,15 +41,81 @@ log = get_logger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _FRONTEND_DIST = _REPO_ROOT / "frontend" / "dist"
 
+#: Wall-clock time this process started, used for the health uptime figure.
+_BOOTED_AT = time.time()
+
+
+def _booted_commit() -> str:
+    """Short git SHA of the working tree AS THIS PROCESS IMPORTED IT.
+
+    Resolved once, at import, and never refreshed. That is the point: the
+    running daemon/API keep executing the code they loaded at boot, so after a
+    `git merge` the checkout moves on and the processes do not. On 2026-08-22
+    all three services were still running ``0e7b8db`` while ``main`` had been
+    at ``fafc83b`` for ~3.5h, and nothing exposed the gap. A monitored probe
+    that reports the BOOTED commit turns "is the deploy actually live?" into a
+    one-line diff against ``git rev-parse --short HEAD``.
+
+    Never raises: a missing git binary or a non-repo deploy yields "unknown".
+    """
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(_REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:  # noqa: BLE001 — health must never fail on its own stamp
+        return "unknown"
+    return out.stdout.strip() or "unknown" if out.returncode == 0 else "unknown"
+
+
+#: Resolved at import so it reflects the deployed commit, not the current one.
+_BOOTED_COMMIT = _booted_commit()
+
+
+def _db_ok() -> tuple[bool, str | None]:
+    """Round-trip a trivial query so the probe proves the DB is REACHABLE.
+
+    ``init_engine`` succeeding at startup says nothing about the file still
+    being readable now (a deleted/locked/permission-changed sqlite file fails
+    only at query time), so the check issues a real ``SELECT 1``.
+    """
+    try:
+        from betbot.storage.db import session_scope
+
+        with session_scope() as session:
+            session.execute(sa_text("SELECT 1"))
+        return True, None
+    except Exception as e:  # noqa: BLE001 — report the fault, never raise
+        return False, type(e).__name__
+
+# NOTE: BETBOT_MODE was deliberately REMOVED from this set. The predictions-only
+# pivot deleted the Settings field, and Settings uses ``extra="ignore"`` — so a
+# POST /api/settings writing BETBOT_MODE=live edited .env, returned 200, and
+# changed absolutely nothing. With real money in scope, a control that reports
+# success while doing nothing is worse than no control: it reads as "live
+# trading is on" (or "off") when neither is true. Trading mode is now a build
+# fact (config.LIVE_ORDER_PATH_AVAILABLE), so this endpoint correctly 400s it.
 EDITABLE_SETTINGS = {
-    "BETBOT_MODE", "BETBOT_EDGE_THRESHOLD", "BETBOT_FIXED_STAKE_USD",
+    "BETBOT_EDGE_THRESHOLD", "BETBOT_FIXED_STAKE_USD",
     "BETBOT_MAX_BET_USD", "BETBOT_DAILY_EXPOSURE_CAP_USD",
     "BETBOT_DRAWDOWN_KILL_PCT", "BETBOT_DRAWDOWN_WINDOW_DAYS",
     "BETBOT_DRAWDOWN_MIN_STAKED_USD", "BETBOT_GATE_MIN_BETS",
     "BETBOT_GATE_MIN_WINDOW_DAYS", "BETBOT_GATE_MIN_HIT_RATE", "BETBOT_GATE_MIN_ROI",
 }
-# Knobs the running daemon only re-reads on restart.
-RESTART_REQUIRED = {"BETBOT_MODE"}
+# Knobs the running daemon only re-reads on restart — which is ALL of them.
+#
+# This used to be {"BETBOT_MODE"}, implying the other eleven took effect live.
+# They do not. ``get_settings`` is an lru_cache singleton and, as config.py puts
+# it, "the production daemon only reads it once at startup". This endpoint
+# clears the cache in the API PROCESS, so the API immediately reports the new
+# value — while the daemon that actually sizes and places the bets keeps using
+# the old one until it is restarted. An operator who lowered
+# BETBOT_MAX_BET_USD, saw the dashboard agree, and believed the daemon had
+# obeyed would be wrong about a risk control, with real money live.
+RESTART_REQUIRED = set(EDITABLE_SETTINGS)
 
 
 # ---- auth ------------------------------------------------------------
@@ -122,8 +192,33 @@ def create_app() -> FastAPI:
 
     # ---- public ----
     @app.get("/api/health")
-    async def health() -> dict:
-        return {"status": "ok", "mode": get_settings().mode}
+    async def health():
+        """Liveness + the state a monitor actually needs to page on.
+
+        This is a MONITORED PROBE, so it reports facts it verifies rather than
+        a bare literal: the DB is queried, not assumed, and the trading mode is
+        the derived :attr:`Settings.mode` (a build fact — see
+        ``config.LIVE_ORDER_PATH_AVAILABLE``), not a config string that could
+        disagree with what the code can actually do.
+
+        Status codes: 200 while the process can serve, 503 once a dependency
+        it cannot work without is down. A TRIPPED KILL SWITCH IS NOT 503 — the
+        kill switch firing is the system working as designed, and paging on it
+        as an outage would train the operator to ignore the probe.
+        """
+        db_ok, db_error = _db_ok()
+        payload = {
+            "status": "ok" if db_ok else "degraded",
+            "mode": get_settings().mode,
+            "checks": {"db": {"ok": db_ok, "error": db_error}},
+            "kill_switch": {"tripped": is_kill_switch_tripped()},
+            "build": {"commit": _BOOTED_COMMIT},
+            "uptime_seconds": round(time.time() - _BOOTED_AT, 1),
+        }
+        if not db_ok:
+            log.error("health_degraded", db_error=db_error)
+            return JSONResponse(status_code=503, content=payload)
+        return payload
 
     # ---- protected ----
     @app.get("/api/status", dependencies=[Depends(require_auth)])
