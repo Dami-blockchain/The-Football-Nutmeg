@@ -333,6 +333,63 @@ def test_context_no_fixtures(tmp_path, monkeypatch):
     assert "no fixtures today" in ctx
 
 
+def test_record_label_names_the_actual_filter_scope(preds_db, tmp_path, monkeypatch):
+    """The track-record line must describe what track_record actually counts.
+
+    ``prediction_outcomes_since`` applies four filters — ledger epoch,
+    non-degenerate triple, CLUB competition, season start — so the figure is
+    this season's club football, never internationals/World Cup and never last
+    season. The old label read "ALL matches", which after the club+season
+    scoping went live would report a filtered number under an unfiltered word.
+    This pins the label to the real scope so the two cannot silently drift.
+    """
+    from betbot.storage.repos import record_prediction_outcome
+
+    # One settled CLUB (PL) outcome so the populated branch renders.
+    record_prediction_outcome(
+        fixture_id=9001,
+        competition_code="PL",
+        p_home=0.55,
+        p_draw=0.25,
+        p_away=0.20,
+        actual_outcome="HOME",
+        home_goals=1,
+        away_goals=0,
+        # Recent, so the 30-day trailing window keeps it (the suite disables
+        # the epoch + season-date cutoffs; the CLUB allowlist stays on and PL
+        # passes it).
+        settled_at=datetime.now(timezone.utc),
+        result_notified=True,
+    )
+    s = _settings(TELEGRAM_ALLOWED_USER_ID=7001)
+    u = _user(tmp_path, 7001, created_days_ago=1)
+
+    ctx = build_prediction_context(u, s, now=_KO)
+    record_line = ctx.splitlines()[0]
+
+    # The scope words the filters actually enforce.
+    assert "club" in record_line.lower()
+    assert "season" in record_line.lower()
+    # The retired, dishonest wording must be gone: "ALL matches" claimed the
+    # figure covered every match when it is club + current season only.
+    assert "ALL matches" not in record_line
+    # Still labelled ACCURACY, never edge/profit.
+    assert "ACCURACY" in ctx
+
+
+def test_record_label_empty_scope_is_still_honest(tmp_path, monkeypatch):
+    """The no-data line must also state the club+season scope, not imply more."""
+    init_engine(tmp_path / "empty2.sqlite")
+    s = _settings(TELEGRAM_ALLOWED_USER_ID=7002)
+    u = _user(tmp_path, 7002, created_days_ago=1)
+
+    ctx = build_prediction_context(u, s, now=_KO)
+    record_line = ctx.splitlines()[0]
+
+    assert "club" in record_line.lower()
+    assert "season" in record_line.lower()
+
+
 # ----------------------------------------------------------------------
 # Chat is FREE + READ-ONLY: never charges / consumes / records a reveal
 # ----------------------------------------------------------------------

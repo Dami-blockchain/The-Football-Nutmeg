@@ -115,10 +115,17 @@ def build_prediction_context(user, settings, *, now: datetime | None = None) -> 
     # Rolling accuracy line so the assistant can answer "how accurate have you
     # been?" truthfully. This is ACCURACY, not proof of profit/edge/CLV.
     tr = track_record(30)
+    # SCOPE: track_record -> prediction_outcomes_since applies four filters
+    # (ledger epoch, non-degenerate triple, CLUB competition, season start), so
+    # this figure is THIS SEASON'S CLUB football only — never internationals or
+    # the World Cup, and never last season. The label must say so; "ALL matches"
+    # here means "every club fixture this season", NOT "every match ever
+    # predicted", and is stated that way so the assistant cannot overclaim.
     if tr["n"] == 0:
         record_line = (
-            "Track record (last 30 days): no settled predictions yet — too small "
-            "a sample to quote an accuracy."
+            "Track record (last 30 days, club competitions this season): no "
+            "settled predictions in scope yet — too small a sample to quote an "
+            "accuracy."
         )
     else:
         small = " (small sample — treat as provisional)" if tr["n"] < 10 else ""
@@ -137,9 +144,12 @@ def build_prediction_context(user, settings, *, now: datetime | None = None) -> 
                 "market — never present it as such."
             )
         record_line = (
-            f"Track record (last 30 days), ALL matches: {tr['hits']}/{tr['n']} "
-            f"correct ({tr['hit_rate']:.0%}), mean RPS {tr['mean_rps']:.2f}{small}. "
-            "This is prediction ACCURACY, not a profit/edge guarantee."
+            f"Track record (last 30 days), all club fixtures this season "
+            f"(n={tr['n']}): {tr['hits']}/{tr['n']} correct "
+            f"({tr['hit_rate']:.0%}), mean RPS {tr['mean_rps']:.2f}{small}. "
+            "Scope is this season's club competitions only — no internationals "
+            "or World Cup. This is prediction ACCURACY, not a profit/edge "
+            "guarantee."
             + called_line
         )
 
