@@ -1050,6 +1050,18 @@ def run_daemon(
                     fixtures=sorted(dead_fixtures),
                 )
             plan = plan_kickoff_alert_jobs(_s, preds, now, log_suppressed=True)
+            # Count deliberate suppressions so the headline can distinguish
+            # "scheduled=0 because the gate dropped everything" from
+            # "scheduled=0 because the scheduling pass silently died" — the
+            # operator's documented health check greps prematch_alerts_scheduled
+            # for a NON-ZERO count, and an all-sub-threshold matchday under the
+            # gate would otherwise read identically to the sync-lambda outage.
+            # Same gate function as the planner (single source of truth); with
+            # the flag OFF every fixture passes, so suppressed is 0 and the line
+            # is byte-identical to before.
+            suppressed = sum(
+                1 for p in preds if not high_conf_alert_passes(_s, p)[0]
+            )
             scheduled = 0
             for job_id, run_at in plan:
                 # job_id is predict_early_<fid> / predict_late_<fid>; recover the
@@ -1069,7 +1081,9 @@ def run_daemon(
                 )
                 scheduled += 1
             get_logger(__name__).info(
-                "prematch_alerts_scheduled", scheduled=scheduled,
+                "prematch_alerts_scheduled",
+                scheduled=scheduled,
+                suppressed=suppressed,
             )
             # Self-check: everything we just planned must actually be on the
             # scheduler. A pass that quietly schedules nothing is the failure

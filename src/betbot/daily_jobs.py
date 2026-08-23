@@ -524,16 +524,39 @@ async def send_prediction_alert(
     # no live tally rather than dropping the alert.
     high_conf_body: str | None = None
     if getattr(settings, "high_conf_alerts_only", False):
+        # Lazy import: betbot.main imports this module, so a top-level import
+        # would be circular. By call time main is fully loaded.
+        from betbot.main import high_conf_alert_passes
         from betbot.notify import format_high_conf_alert
 
-        try:
-            tally = high_conf_band_tally(settings.high_conf_alert_min_p)
-        except Exception as e:  # noqa: BLE001 — never block the alert on a read
-            log.warning("high_conf_tally_failed", fixture_id=fixture_id, error=str(e))
-            tally = None
-        high_conf_body = format_high_conf_alert(
-            pred, settings, market=None, live_tally=tally,
-        )
+        # Re-check the gate on the FINAL (post-rescore) row that is actually
+        # shown. The alert ALWAYS re-scores at fire time, and a fixture stored
+        # above the bar can rescore below it (the live Celta 87->50 case). We
+        # gate on stored p, and after the rescore ``pred`` IS the freshest
+        # stored row — so a body still wearing "HIGH-CONFIDENCE" over a sub-band
+        # Model line would be self-contradictory. On drift we DROP the high-conf
+        # framing and fall back to the STANDARD body rather than suppress: the
+        # fixture already cleared the gate at planning and again at fire time,
+        # and the reveal ledger is engaged for this very send, so making it
+        # vanish this late would be worse than sending it without a banner it no
+        # longer earns. The tally read is skipped on drift (no band is quoted).
+        passes, _pick, _p = high_conf_alert_passes(settings, pred)
+        if not passes:
+            log.info(
+                "high_conf_display_drift",
+                fixture_id=fixture_id,
+                note="stored row cleared the gate but the rescored row did not;"
+                     " sending the standard body without the high-conf banner",
+            )
+        else:
+            try:
+                tally = high_conf_band_tally(settings.high_conf_alert_min_p)
+            except Exception as e:  # noqa: BLE001 — never block the alert on a read
+                log.warning("high_conf_tally_failed", fixture_id=fixture_id, error=str(e))
+                tally = None
+            high_conf_body = format_high_conf_alert(
+                pred, settings, market=None, live_tally=tally,
+            )
 
     sent = 0
     for user in users_fn():

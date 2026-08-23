@@ -238,7 +238,13 @@ def format_high_conf_alert(
     # Default NO BET, in BOLD, per the standing rule: the gate is a SELECTION on
     # short-priced favourites (higher hit rate) and is NOT an edge/value claim,
     # so the call defaults to NO BET rather than backing the favourite blind.
-    call = "*NO BET* (default; edge vs price below threshold)"
+    # With no live quote the reason must NOT claim an edge-vs-price comparison
+    # that never happened — the Market field already says the price is missing.
+    call = (
+        "*NO BET* (default; no live price to assess edge)"
+        if market is None
+        else "*NO BET* (default; edge vs price below threshold)"
+    )
 
     min_p = float(getattr(settings, "high_conf_alert_min_p", 0.65))
     return "\n".join([

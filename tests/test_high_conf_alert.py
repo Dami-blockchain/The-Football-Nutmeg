@@ -319,7 +319,8 @@ def test_high_conf_message_home_favourite_no_market(settings):
     assert "Model: HOME 71% / draw 18% / away 11%" in body
     # Matching is dead: the Market field must say so, not fabricate a price.
     assert "Market: unavailable (no live quote)" in body
-    assert "*NO BET*" in body  # BOLD, default
+    # Honest: with no quote the reason must NOT claim an edge-vs-price check.
+    assert "*NO BET* (default; no live price to assess edge)" in body
     assert "Band record: p>=0.65 hits 72.8%" in body
 
 
@@ -338,6 +339,8 @@ def test_high_conf_message_renders_a_market_quote_when_supplied(settings):
         pred, _hc(settings), market=("HOME", 0.68, 1.47), live_tally=(3, 4)
     )
     assert "Market: HOME 68% (1.47)" in body
+    # With a real quote the edge-vs-price framing is legitimate.
+    assert "*NO BET* (default; edge vs price below threshold)" in body
 
 
 # ----------------------------------------------------------------------
@@ -376,3 +379,147 @@ def test_high_conf_band_tally_counts_only_in_band_club_fixtures(tmp_path, _seaso
 
     hits, n = high_conf_band_tally(0.65)
     assert (hits, n) == (1, 2)
+
+
+# ----------------------------------------------------------------------
+# Reviewer fix 1: scheduled=0 must be distinguishable from a dead pass
+# ----------------------------------------------------------------------
+def test_scheduling_headline_reports_the_suppressed_count(monkeypatch, settings):
+    """An all-sub-threshold matchday logs scheduled=0 WITH suppressed>0, so the
+    operator's 'grep prematch_alerts_scheduled for a non-zero count' health
+    check can tell a gated no-op apart from the sync-lambda outage."""
+    from tests.test_scheduler_jobs import _RecordingScheduler, _daemon_jobs
+
+    events: list[tuple[str, dict]] = []
+
+    class _Rec:
+        def info(self, event, **kw):
+            events.append((event, kw))
+
+        def warning(self, *a, **k):
+            pass
+
+        def error(self, *a, **k):
+            pass
+
+        def debug(self, *a, **k):
+            pass
+
+    s = _hc(settings)
+    jobs = _daemon_jobs(monkeypatch, s)
+    rescan = next(j for j in jobs if j.id == "reschedule_kickoff_alerts")
+    monkeypatch.setattr(
+        main, "predictions_for_kickoff_range",
+        lambda _st, _en: [_pred(1, 0.50, 0.30, 0.20), _pred(2, 0.40, 0.35, 0.25)],
+    )
+    monkeypatch.setattr(main, "get_logger", lambda _n: _Rec())
+
+    asyncio.run(rescan.func(_RecordingScheduler(), *rescan.args[1:]))
+
+    headline = [kw for ev, kw in events if ev == "prematch_alerts_scheduled"]
+    assert headline, "the scheduling pass logged no headline"
+    assert headline[0] == {"scheduled": 0, "suppressed": 2}
+
+
+def test_scheduling_headline_suppressed_is_zero_when_flag_off(monkeypatch, settings):
+    from tests.test_scheduler_jobs import _RecordingScheduler, _daemon_jobs
+
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        main, "get_logger",
+        lambda _n: SimpleNamespace(
+            info=lambda ev, **kw: events.append((ev, kw)),
+            warning=lambda *a, **k: None,
+            error=lambda *a, **k: None,
+            debug=lambda *a, **k: None,
+        ),
+    )
+    jobs = _daemon_jobs(monkeypatch, settings)  # gate OFF
+    rescan = next(j for j in jobs if j.id == "reschedule_kickoff_alerts")
+    monkeypatch.setattr(
+        main, "predictions_for_kickoff_range",
+        lambda _st, _en: [_pred(1, 0.40, 0.35, 0.25)],
+    )
+    asyncio.run(rescan.func(_RecordingScheduler(), *rescan.args[1:]))
+    headline = [kw for ev, kw in events if ev == "prematch_alerts_scheduled"]
+    assert headline and headline[0]["suppressed"] == 0
+    assert headline[0]["scheduled"] == 2  # early + late, nothing dropped
+
+
+# ----------------------------------------------------------------------
+# Reviewer fix 2: display/gate drift after the always-fresh rescore
+# ----------------------------------------------------------------------
+def _stateful_pred_fn(first, rest):
+    state = {"n": 0}
+
+    def _fn(_fid):
+        state["n"] += 1
+        return first if state["n"] == 1 else rest
+
+    return _fn
+
+
+async def test_rescore_drift_falls_back_to_standard_body(tmp_path):
+    """Stored row clears the bar, rescored row does not -> the alert must NOT
+    wear a HIGH-CONFIDENCE banner over a sub-band Model line."""
+    from tests.test_daily_jobs import (
+        _Pred, _User, _ent, _lineup_fn_stub, _rescore_stub, _tg_settings,
+    )
+    from betbot.daily_jobs import send_prediction_alert
+
+    init_engine(tmp_path / "drift.sqlite")
+    s = _hc(_tg_settings(tmp_path))
+    sent: list[str] = []
+
+    async def fake_send(_se, _cid, txt):
+        sent.append(txt)
+        return True
+
+    pf = _stateful_pred_fn(
+        _Pred(fixture_id=1, p_home=0.72, p_draw=0.18, p_away=0.10),  # stored: clears
+        _Pred(fixture_id=1, p_home=0.55, p_draw=0.25, p_away=0.20),  # rescored: does not
+    )
+    delivered = await send_prediction_alert(
+        s, 1, send_fn=fake_send,
+        prediction_fn=pf,
+        lineup_fn=_lineup_fn_stub(),
+        rescore_fn=_rescore_stub(),
+        entitlement_fn=lambda u, se, now=None: _ent("operator"),
+        users_fn=lambda: [_User(111)],
+    )
+    assert delivered == 1
+    body = sent[0]
+    assert "HIGH-CONFIDENCE" not in body  # banner dropped on drift
+    assert "Model: H 55% / D 25% / A 20%" in body  # standard body, honest number
+
+
+async def test_rescored_row_still_clearing_keeps_the_high_conf_body(tmp_path):
+    from tests.test_daily_jobs import (
+        _Pred, _User, _ent, _lineup_fn_stub, _rescore_stub, _tg_settings,
+    )
+    from betbot.daily_jobs import send_prediction_alert
+
+    init_engine(tmp_path / "clear.sqlite")
+    s = _hc(_tg_settings(tmp_path))
+    sent: list[str] = []
+
+    async def fake_send(_se, _cid, txt):
+        sent.append(txt)
+        return True
+
+    pf = _stateful_pred_fn(
+        _Pred(fixture_id=1, p_home=0.72, p_draw=0.18, p_away=0.10),
+        _Pred(fixture_id=1, p_home=0.71, p_draw=0.18, p_away=0.11),  # still clears
+    )
+    await send_prediction_alert(
+        s, 1, send_fn=fake_send,
+        prediction_fn=pf,
+        lineup_fn=_lineup_fn_stub(),
+        rescore_fn=_rescore_stub(),
+        entitlement_fn=lambda u, se, now=None: _ent("operator"),
+        users_fn=lambda: [_User(111)],
+    )
+    body = sent[0]
+    assert "HIGH-CONFIDENCE ALERT" in body
+    assert "Model: HOME 71% / draw 18% / away 11%" in body
+    assert "Band record: p>=0.65 hits 72.8%" in body
