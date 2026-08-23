@@ -357,9 +357,45 @@ async def _score_and_log_one(
 
 
 # ----------------------------------------------------------------------
+# High-conviction alert gate (pure — unit-testable)
+# ----------------------------------------------------------------------
+def high_conf_alert_passes(settings, pred) -> tuple[bool, str, float]:
+    """Whether ``pred`` clears the high-conviction ALERT gate.
+
+    Returns ``(passes, top_pick, top_p)`` where ``top_pick`` is
+    ``"HOME"|"DRAW"|"AWAY"`` (the argmax of the STORED H/D/A triple) and
+    ``top_p`` is its probability.
+
+    Gate (ALERT PATH ONLY):
+      * when ``settings.high_conf_alerts_only`` is OFF, EVERY fixture passes —
+        the alert path is byte-identical to before;
+      * when ON, a fixture passes iff its stored ``max(p_home,p_draw,p_away)``
+        is at least ``settings.high_conf_alert_min_p`` AND the top pick is NOT
+        the draw (draws are effectively unpickable and were never part of the
+        measured band).
+
+    Gates on the STORED model probabilities carried on ``pred`` (a
+    :class:`PredictionRow` or :class:`Prediction`) ONLY — never on a live
+    market quote. The Polymarket matching path has been dead for weeks and must
+    not become a dependency of whether an alert fires. Pure and offline.
+
+    When the flag is OFF this returns ``(True, "", 0.0)`` WITHOUT reading the
+    probability fields, so the planner keeps working over the minimal fixture
+    doubles (id/competition/kickoff only) it always accepted — "flag off =
+    unchanged behaviour" holds right down to the attributes touched.
+    """
+    if not getattr(settings, "high_conf_alerts_only", False):
+        return True, "", 0.0
+    triples = [("HOME", pred.p_home), ("DRAW", pred.p_draw), ("AWAY", pred.p_away)]
+    top_pick, top_p = max(triples, key=lambda kv: kv[1])
+    passes = top_p >= float(settings.high_conf_alert_min_p) and top_pick != "DRAW"
+    return passes, top_pick, top_p
+
+
+# ----------------------------------------------------------------------
 # Two-alert pre-match scheduling plan (pure — unit-testable)
 # ----------------------------------------------------------------------
-def plan_kickoff_alert_jobs(settings, preds, now):
+def plan_kickoff_alert_jobs(settings, preds, now, *, log_suppressed: bool = False):
     """Return the per-fixture DateTrigger job plan for the two-alert model.
 
     For each prediction in ``preds`` this yields UP TO two entries:
@@ -369,9 +405,32 @@ def plan_kickoff_alert_jobs(settings, preds, now):
     offline: no scheduler, no network — just ``[(job_id, run_at_utc), ...]`` in
     schedule order, so ``_schedule_kickoff_alerts`` and its test share one source
     of truth for the offsets.
+
+    When the high-conviction alert gate is ON
+    (``settings.high_conf_alerts_only``) a fixture that does NOT clear it
+    (see :func:`high_conf_alert_passes`) yields NO jobs — it is deliberately
+    suppressed. Because the planner is the SINGLE source of truth for both
+    scheduling and the coverage audit, a suppressed fixture is simply absent
+    from the plan, so the coverage watchdog cannot mistake it for a missing
+    alert. ``log_suppressed`` emits one ``prematch_alert_suppressed_low_conf``
+    log line per suppressed fixture; it defaults False so the audit-only
+    callers (report_alert_coverage / the watchdog's pre-heal audit) stay quiet
+    and only the scheduling pass records the suppression.
     """
     plan: list[tuple[str, datetime]] = []
     for p in preds:
+        passes, top_pick, top_p = high_conf_alert_passes(settings, p)
+        if not passes:
+            if log_suppressed:
+                get_logger(__name__).info(
+                    "prematch_alert_suppressed_low_conf",
+                    fixture_id=p.fixture_id,
+                    competition=getattr(p, "competition_code", None),
+                    top_pick=top_pick,
+                    p=round(top_p, 4),
+                    min_p=float(settings.high_conf_alert_min_p),
+                )
+            continue
         early_lead = timedelta(
             minutes=settings.early_alert_lead_minutes(p.competition_code)
         )
@@ -874,6 +933,25 @@ def run_daemon(
             # an hour before kickoff on a fixture that had moved — no charge,
             # since the re-show is free, but lineups that do not exist yet.
             baseline = prediction_for_fixture(fixture_id)
+            # Belt-and-braces: re-apply the high-conviction gate at FIRE time,
+            # since settings (or the flag) may have changed between scheduling
+            # and now. Gate on the STORED baseline triple, exactly as the
+            # planner did. A fixture that no longer clears the bar is suppressed
+            # here too, so flipping the flag ON mid-day can never let a job
+            # scheduled earlier fire an off-band alert.
+            if baseline is not None:
+                passes, top_pick, top_p = high_conf_alert_passes(settings, baseline)
+                if not passes:
+                    get_logger(__name__).info(
+                        "prematch_alert_suppressed_low_conf",
+                        fixture_id=fixture_id,
+                        competition=baseline.competition_code,
+                        top_pick=top_pick,
+                        p=round(top_p, 4),
+                        min_p=float(settings.high_conf_alert_min_p),
+                        at="fire",
+                    )
+                    return
             league = baseline.competition_code if baseline else ""
             lead = (
                 settings.early_alert_lead_minutes(league)
@@ -971,7 +1049,7 @@ def run_daemon(
                     "prematch_alerts_skipped_dead_fixtures",
                     fixtures=sorted(dead_fixtures),
                 )
-            plan = plan_kickoff_alert_jobs(_s, preds, now)
+            plan = plan_kickoff_alert_jobs(_s, preds, now, log_suppressed=True)
             scheduled = 0
             for job_id, run_at in plan:
                 # job_id is predict_early_<fid> / predict_late_<fid>; recover the

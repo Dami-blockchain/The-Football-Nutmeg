@@ -461,6 +461,31 @@ class Settings(BaseSettings):
     club_confidence_draw_margin: float = Field(
         default=0.05, alias="BETBOT_CONFIDENCE_DRAW_MARGIN"
     )
+    # High-conviction ALERT filter (alert-path only; independent of the trading
+    # edge threshold and of the club_confidence_filter storage shaping). When
+    # ON, the pre-match alert path sends an alert ONLY for a fixture whose
+    # STORED model top-pick probability (max of H/D/A) clears
+    # ``high_conf_alert_min_p`` AND whose top pick is NOT the draw. Everything
+    # else is deliberately SUPPRESSED — logged as suppressed, and treated as
+    # covered by the alert-coverage watchdog (a suppressed fixture is not a
+    # missing alert).
+    #
+    # HONESTY: the gate raises the alert HIT RATE, not profit. Measured
+    # walk-forward (top-5 leagues 2022–2026, n=7,082) the p>=0.65 band hits
+    # 72.8% [70.1, 75.4] — but on gated subsets ROI was −1.3% [−4.3, +1.9]:
+    # backing short-priced favourites at a fair price is ~0 EV. This flag must
+    # NEVER be presented as an edge/+EV filter. Default OFF: with it off the
+    # alert path is byte-identical to before.
+    high_conf_alerts_only: bool = Field(
+        default=False, alias="BETBOT_HIGH_CONF_ALERTS_ONLY"
+    )
+    # Minimum stored model top-pick probability for a high-conviction alert.
+    # 0.65 is the chosen default: it clears >=70% under BOTH anchor states
+    # (72.8% unanchored, 75.6% anchored), so it is safe whether or not
+    # BETBOT_ODDS_ANCHOR is ever enabled.
+    high_conf_alert_min_p: float = Field(
+        default=0.65, alias="BETBOT_HIGH_CONF_ALERT_MIN_P"
+    )
     # Accuracy-ledger epoch: outcomes settled BEFORE this date are excluded
     # from every accuracy read. Predictions made before 2026-08-17 are poisoned
     # by the degenerate 0/0/100-AWAY rating bug, so quoting them to a user

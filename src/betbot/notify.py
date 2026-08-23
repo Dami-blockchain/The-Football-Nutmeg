@@ -23,7 +23,7 @@ from __future__ import annotations
 import re
 import asyncio
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
 import httpx
@@ -90,6 +90,163 @@ _TOKEN_RE = re.compile(r"\d{6,}:[A-Za-z0-9_-]{20,}")
 def _redact(exc: BaseException) -> str:
     """Error text with any bot-token-shaped substring removed."""
     return _TOKEN_RE.sub("<REDACTED>", str(exc))
+
+
+# --------------------------------------------------------------------------
+# High-conviction alert message format (BETBOT_HIGH_CONF_ALERTS_ONLY)
+# --------------------------------------------------------------------------
+#
+# The band statistics below are a fixed table derived from ONE measured
+# walk-forward run: top-5 leagues 2022–2026, n = 7,082 settled fixtures, gating
+# on the model top-pick probability. They are baked in as constants (not
+# recomputed live) so the copy is stable and auditable.
+#
+# HONESTY: every number here is an ACCURACY KPI — hit rate on short-priced
+# favourites. It is NOT edge, NOT +EV, NOT beating the market. On gated subsets
+# the measured ROI was −1.3% [−4.3, +1.9]. This table must never be captioned
+# as profit. The live-season tally rendered alongside it is computed fresh from
+# the settled ledger so a hot streak on a handful of games cannot masquerade as
+# the track record.
+HIGH_CONF_WALKFORWARD_N = 7082
+#: ``threshold -> (keep_fraction, hit_pct, ci_low_pct, ci_high_pct)``. ``n`` per
+#: band is derived as ``round(keep_fraction * HIGH_CONF_WALKFORWARD_N)`` so the
+#: fixture count shown is always consistent with the keep fraction (at 0.65:
+#: round(0.147 * 7082) = 1,041).
+HIGH_CONF_BANDS: dict[float, tuple[float, float, float, float]] = {
+    0.55: (0.342, 66.4, 64.5, 68.3),
+    0.60: (0.234, 70.2, 68.1, 72.3),
+    0.65: (0.147, 72.8, 70.1, 75.4),
+    0.70: (0.076, 76.5, 73.0, 80.1),
+}
+#: Below this many settled in-season fixtures the live tally is meaningless and
+#: is captioned as such — a hot streak on n=6 is noise, not a track record.
+HIGH_CONF_MIN_MEANINGFUL_N = 30
+
+
+def band_fixture_count(threshold: float) -> int:
+    """Walk-forward fixture count for a band = round(keep_fraction * N)."""
+    keep, *_ = HIGH_CONF_BANDS[threshold]
+    return round(keep * HIGH_CONF_WALKFORWARD_N)
+
+
+def _band_for(min_p: float) -> tuple[float, tuple[float, float, float, float]]:
+    """Return ``(threshold, stats)`` for ``min_p``.
+
+    Exact table match wins; otherwise the largest defined threshold at or below
+    ``min_p`` (report the WEAKER, wider band rather than overclaim), and below
+    the smallest defined threshold the smallest band.
+    """
+    if min_p in HIGH_CONF_BANDS:
+        return min_p, HIGH_CONF_BANDS[min_p]
+    below = [t for t in HIGH_CONF_BANDS if t <= min_p]
+    t = max(below) if below else min(HIGH_CONF_BANDS)
+    return t, HIGH_CONF_BANDS[t]
+
+
+def format_band_line(min_p: float, live_tally: tuple[int, int] | None) -> str:
+    """One-line band record + honest live-season tally.
+
+    ``live_tally`` is ``(hits, n)`` from
+    :func:`betbot.storage.repos.high_conf_band_tally` (club-only, current
+    season, World Cup excluded) or ``None`` when it could not be read. The band
+    stats come from the fixed :data:`HIGH_CONF_BANDS` table; the live tally is
+    captioned "too few to mean anything yet" until it reaches
+    :data:`HIGH_CONF_MIN_MEANINGFUL_N`.
+    """
+    threshold, (_keep, hit, lo, hi) = _band_for(min_p)
+    n_wf = band_fixture_count(threshold)
+    band = (
+        f"Band record: p>={threshold:g} hits {hit:.1f}% "
+        f"[{lo:.1f}–{hi:.1f}] on {n_wf:,} walk-forward fixtures (2022–26)."
+    )
+    if live_tally is None:
+        live = "This season live: not available."
+    else:
+        hits, n = live_tally
+        if n == 0:
+            live = "This season live: none settled yet."
+        elif n < HIGH_CONF_MIN_MEANINGFUL_N:
+            live = f"This season live: {hits}/{n} — too few to mean anything yet."
+        else:
+            live = f"This season live: {hits}/{n} ({hits / n:.0%})."
+    return f"{band} {live}"
+
+
+def _kickoff_eat(pred) -> str:
+    """Stored (UTC) kickoff rendered as ``HH:MM`` EAT (UTC+3, no DST); '' if absent."""
+    ko = getattr(pred, "kickoff", None)
+    if ko is None:
+        return ""
+    if ko.tzinfo is None:
+        ko = ko.replace(tzinfo=timezone.utc)
+    return ko.astimezone(timezone(timedelta(hours=3))).strftime("%H:%M")
+
+
+def _model_triple_line(pred, top_pick: str, market: str) -> str:
+    """``Model: HOME 71% / draw 18% / away 11%   Market: <market>`` with the
+    model's top pick's side token upper-cased (home/away designation always
+    present)."""
+    home_tok = "HOME" if top_pick == "HOME" else "home"
+    away_tok = "AWAY" if top_pick == "AWAY" else "away"
+    draw_tok = "DRAW" if top_pick == "DRAW" else "draw"
+    model = (
+        f"Model: {home_tok} {pred.p_home:.0%} / "
+        f"{draw_tok} {pred.p_draw:.0%} / {away_tok} {pred.p_away:.0%}"
+    )
+    return f"{model}   Market: {market}"
+
+
+def format_high_conf_alert(
+    pred,
+    settings,
+    *,
+    market: tuple[str, float, float] | None = None,
+    live_tally: tuple[int, int] | None = None,
+) -> str:
+    """The high-conviction alert body for one fixture.
+
+    Standing format rules: home/away designation on both teams, market
+    anchoring, a BOLD bet/no-bet call defaulting to NO BET, and honest band
+    stats. ``market`` is ``(side, implied_prob, decimal_price)`` when a quote is
+    available; the Polymarket matching path has been dead for weeks, so it is
+    normally ``None`` and the Market field says so HONESTLY rather than
+    fabricating a price. ``live_tally`` is passed straight to
+    :func:`format_band_line`.
+
+    Gates/probabilities are read off the stored triple carried on ``pred``; this
+    is display only and performs no gating itself (the caller has already
+    decided the fixture clears the bar).
+    """
+    home, away = pred.home_team, pred.away_team
+    code = getattr(pred, "competition_code", "") or ""
+    triples = [("HOME", pred.p_home), ("DRAW", pred.p_draw), ("AWAY", pred.p_away)]
+    top_pick, _top_p = max(triples, key=lambda kv: kv[1])
+
+    ko = _kickoff_eat(pred)
+    header = f"\U0001f3af *HIGH-CONFIDENCE ALERT* — {home} (HOME) v {away} (AWAY)"
+    if code:
+        header += f", {code}"
+    if ko:
+        header += f", KO {ko} EAT"
+
+    if market is None:
+        market_str = "unavailable (no live quote)"
+    else:
+        m_side, m_prob, m_price = market
+        market_str = f"{m_side} {m_prob:.0%} ({m_price:.2f})"
+
+    # Default NO BET, in BOLD, per the standing rule: the gate is a SELECTION on
+    # short-priced favourites (higher hit rate) and is NOT an edge/value claim,
+    # so the call defaults to NO BET rather than backing the favourite blind.
+    call = "*NO BET* (default; edge vs price below threshold)"
+
+    min_p = float(getattr(settings, "high_conf_alert_min_p", 0.65))
+    return "\n".join([
+        header,
+        _model_triple_line(pred, top_pick, market_str),
+        call,
+        format_band_line(min_p, live_tally),
+    ])
 
 
 # --------------------------------------------------------------------------

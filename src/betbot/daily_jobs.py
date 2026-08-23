@@ -43,6 +43,7 @@ from betbot.notify import notify_operator
 from betbot.scheduling import add_async_job
 from betbot.storage.repos import (
     has_revealed,
+    high_conf_band_tally,
     increment_predictions_consumed,
     list_users,
     predictions_for_kickoff_range,
@@ -300,6 +301,7 @@ def render_user_lineup_prediction(
     entitlement_fn=entitlement_for,
     already_revealed_fn=has_revealed,
     edge_threshold: float | None = None,
+    high_conf_body: str | None = None,
 ) -> tuple[str, list[tuple[int, bool]]]:
     """One user's gated body for a SINGLE fixture's lineup-adjusted prediction.
 
@@ -308,6 +310,12 @@ def render_user_lineup_prediction(
     charged once per NEW fixture, locked -> teaser), but the revealed body
     carries the confirmed XIs via :func:`format_prediction_with_lineup`. Pure —
     no DB writes; the caller commits reveals only after a confirmed send.
+
+    When ``high_conf_body`` is supplied (the high-conviction alert path is ON)
+    it REPLACES the standing revealed body — the entitlement/reveal-ledger
+    semantics are untouched, so LOCKED users still see only the teaser and the
+    Model triple stays behind the paywall exactly as before. With it ``None``
+    (flag OFF) the output is byte-identical to before.
     """
     if edge_threshold is None:
         edge_threshold = settings.edge_threshold
@@ -316,6 +324,8 @@ def render_user_lineup_prediction(
     fid = pred.fixture_id
 
     def _revealed_body() -> str:
+        if high_conf_body is not None:
+            return high_conf_body
         return format_prediction_with_lineup(
             pred, lineup, edge_threshold=edge_threshold,
             adj_note=adj_note, absences=absences,
@@ -506,12 +516,32 @@ async def send_prediction_alert(
     if not lineup:
         adj_note = "⚠️ lineup not yet confirmed — model prediction"
 
+    # High-conviction alert format (BETBOT_HIGH_CONF_ALERTS_ONLY). Built ONCE
+    # per fixture (match-level, same for every user) and only when the flag is
+    # ON. The live-season tally is read fresh here at send time from the settled
+    # ledger (club-only, current season, World Cup excluded) so the copy can
+    # never quote a stale streak. Best-effort: a ledger read failure degrades to
+    # no live tally rather than dropping the alert.
+    high_conf_body: str | None = None
+    if getattr(settings, "high_conf_alerts_only", False):
+        from betbot.notify import format_high_conf_alert
+
+        try:
+            tally = high_conf_band_tally(settings.high_conf_alert_min_p)
+        except Exception as e:  # noqa: BLE001 — never block the alert on a read
+            log.warning("high_conf_tally_failed", fixture_id=fixture_id, error=str(e))
+            tally = None
+        high_conf_body = format_high_conf_alert(
+            pred, settings, market=None, live_tally=tally,
+        )
+
     sent = 0
     for user in users_fn():
         text, reveals = render_user_lineup_prediction(
             user, pred, lineup, settings, now=now,
             adj_note=adj_note, absences=absences,
             entitlement_fn=entitlement_fn,
+            high_conf_body=high_conf_body,
         )
         # Honest header: the EARLY alert fires before the XI is posted, so
         # only claim "confirmed lineup" when one is actually attached.

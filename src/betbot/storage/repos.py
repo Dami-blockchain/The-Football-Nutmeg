@@ -547,6 +547,42 @@ def track_record(days: int = 30) -> dict:
     }
 
 
+def high_conf_band_tally(min_p: float, *, days: int = 366) -> tuple[int, int]:
+    """``(hits, n)`` for settled fixtures that would have cleared the high-conf
+    alert gate this season.
+
+    Reuses :func:`prediction_outcomes_since`, so the SAME four scope filters
+    apply — ledger epoch, non-degenerate triple, CLUB competition, current
+    season kickoff — which is exactly "club-only, current season, World Cup
+    excluded, bug-era excluded". A row counts when its stored model top-pick
+    probability ``max(predicted_home, predicted_draw, predicted_away)`` is at
+    least ``min_p`` AND the top pick is NOT the draw, mirroring
+    :func:`betbot.main.high_conf_alert_passes` so the live tally measures the
+    same population the band statistics describe.
+
+    ``days`` is a generous trailing window (default a full year); the season /
+    epoch filters inside ``prediction_outcomes_since`` do the real scoping, so
+    the number is "this season" regardless of the window as long as it spans
+    the season start. This is a HIT-RATE tally, never edge/ROI — the caller
+    presents it honestly and flags a small sample.
+    """
+    rows = prediction_outcomes_since(days)
+    hits = n = 0
+    for r in rows:
+        triple = [
+            ("HOME", r.predicted_home),
+            ("DRAW", r.predicted_draw),
+            ("AWAY", r.predicted_away),
+        ]
+        top_pick, top_p = max(triple, key=lambda kv: kv[1])
+        if top_p < min_p or top_pick == "DRAW":
+            continue
+        n += 1
+        if r.correct:
+            hits += 1
+    return hits, n
+
+
 def outcome_result_notified(fixture_id: int) -> bool:
     """True once the RESULT ALERT has been broadcast for this fixture."""
     with session_scope() as s:
