@@ -1,0 +1,58 @@
+[
+ {
+  "id": 3,
+  "sport": "lal",
+  "name": "LaLiga",
+  "tags": "1,780,100639,100350",
+  "primaryTagId": 780
+ },
+ {
+  "id": 11,
+  "sport": "fl1",
+  "name": "Ligue 1",
+  "tags": "1,100639,102070,100350",
+  "primaryTagId": 102070
+ },
+ {
+  "id": 7,
+  "sport": "bun",
+  "name": "Bundesliga",
+  "tags": "1,1494,100639,100350",
+  "primaryTagId": 1494
+ },
+ {
+  "id": 12,
+  "sport": "sea",
+  "name": "Serie A",
+  "tags": "1,100639,101962,100350,100618",
+  "primaryTagId": 100618
+ },
+ {
+  "id": 2,
+  "sport": "epl",
+  "name": "Premier League",
+  "tags": "1,82,306,100639,100350",
+  "primaryTagId": 306
+ },
+ {
+  "id": 13,
+  "sport": "ucl",
+  "name": "UEFA Champions League",
+  "tags": "1,100977,100639,1234,100350",
+  "primaryTagId": 1234
+ },
+ {
+  "id": 630,
+  "sport": "ufl",
+  "name": "UFL",
+  "tags": "1,100639,1186,105925",
+  "primaryTagId": 105925
+ },
+ {
+  "id": 134,
+  "sport": "cricipl",
+  "name": "Indian Premier League",
+  "tags": "1,100639,517,101988",
+  "primaryTagId": 101988
+ }
+]

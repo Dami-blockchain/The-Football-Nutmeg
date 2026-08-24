@@ -214,6 +214,16 @@ class PolymarketAdapter:
             candidates.append((score, ref))
 
         if not candidates:
+            # No open event named BOTH teams as a HOME/AWAY winner pair — i.e.
+            # neither a per-match H2H nor even an outright that lists both. This
+            # is the genuinely-unlisted case (e.g. Serie A, whose per-match 1X2
+            # markets Polymarket does not currently offer). Distinct from the
+            # outright-only case below, which DID find both teams in a market.
+            log.info(
+                "polymarket_no_market",
+                home=home_team, away=away_team,
+                note="no event lists both teams — league/fixture likely unlisted",
+            )
             return None
         # Highest score wins; ties keep discovery order (stable).
         best_score = max(s for s, _ in candidates)

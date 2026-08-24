@@ -1,0 +1,204 @@
+[
+ {
+  "slug": "ballon-dor-winner-2026",
+  "title": "Ballon d'Or Winner 2026",
+  "markets": [
+   {
+    "question": "Will Kylian Mbapp\u00e9 win the 2026 Ballon d'Or?",
+    "groupItemTitle": "Kylian Mbapp\u00e9",
+    "outcomes": "[\"Yes\", \"No\"]",
+    "clobTokenIds": "[\"95640549996905293510297955529586737178285694064878854803914367446504739764113\", \"43681720319477188597878188429504394796986333625436226983885469009299707562545\"]",
+    "outcomePrices": "[\"0.0655\", \"0.9345\"]"
+   },
+   {
+    "question": "Will Erling Haaland win the 2026 Ballon d'Or?",
+    "groupItemTitle": "Erling Haaland",
+    "outcomes": "[\"Yes\", \"No\"]",
+    "clobTokenIds": "[\"28452090262595806306683841543702974671789939255165753137157118490078999198778\", \"41582690056299530319797949041927935989019869883198101581541874744777936907826\"]",
+    "outcomePrices": "[\"0.0025\", \"0.9975\"]"
+   },
+   {
+    "question": "Will Jude Bellingham win the 2026 Ballon d'Or?",
+    "groupItemTitle": "Jude Bellingham",
+    "outcomes": "[\"Yes\", \"No\"]",
+    "clobTokenIds": "[\"35466012767924254839738113787085950010503473575312851228505226571790709275819\", \"24122299862711914013738626986097179741774791999132542027561549123320843148963\"]",
+    "outcomePrices": "[\"0.0015\", \"0.9985\"]"
+   }
+  ]
+ },
+ {
+  "slug": "will-cristiano-ronaldo-announce-his-retirement-in-2026",
+  "title": "Will Cristiano Ronaldo announce his retirement in 2026?",
+  "markets": [
+   {
+    "question": "Will Cristiano Ronaldo announce his retirement in 2026?",
+    "groupItemTitle": "",
+    "outcomes": "[\"Yes\", \"No\"]",
+    "clobTokenIds": "[\"14567729406691418357747178297562164584743402164952344800418847122564648895833\", \"28111719564081459330891369100818298028900479873636165351232752462119507773785\"]",
+    "outcomePrices": "[\"0.1345\", \"0.8655\"]"
+   }
+  ]
+ },
+ {
+  "slug": "which-club-will-cristiano-ronaldo-play-for-next",
+  "title": "Which club will Cristiano Ronaldo play for next?",
+  "markets": [
+   {
+    "question": "Will Cristiano Ronaldo play for Atlanta United FC next?",
+    "groupItemTitle": "Atlanta United FC",
+    "outcomes": "[\"Yes\", \"No\"]",
+    "clobTokenIds": "[\"41946486613598076059686322735171621696201256573159700098612207088523328116545\", \"86067593415905215687408419297511672051669367317562743757502840208248218603342\"]",
+    "outcomePrices": "[\"0.0065\", \"0.9935\"]"
+   },
+   {
+    "question": "Will Cristiano Ronaldo play for Austin FC next?",
+    "groupItemTitle": "Austin FC",
+    "outcomes": "[\"Yes\", \"No\"]",
+    "clobTokenIds": "[\"18318854269672644211363075826099774810663732942638767189268871652880497061276\", \"81589206545501716902702738673000768010891558552417136872719761731008829421861\"]",
+    "outcomePrices": "[\"0.0055\", \"0.9945\"]"
+   },
+   {
+    "question": "Will Cristiano Ronaldo play for CF Montr\u00e9al next?",
+    "groupItemTitle": "CF Montr\u00e9al",
+    "outcomes": "[\"Yes\", \"No\"]",
+    "clobTokenIds": "[\"3544816887208061858547851063500632656734577172601893235101508633959429679126\", \"41976437670091783801615453608963596824707140338601385293589652593727034534793\"]",
+    "outcomePrices": "[\"0.038\", \"0.962\"]"
+   }
+  ]
+ },
+ {
+  "slug": "2025-2026-pfa-players-player-of-the-year-winner",
+  "title": "2025-2026 PFA Players' Player of the Year Winner",
+  "markets": [
+   {
+    "question": "Will Declan Rice win the 2026 PFA Player of the Year?",
+    "groupItemTitle": "Declan Rice",
+    "outcomes": "[\"Yes\", \"No\"]",
+    "clobTokenIds": "[\"26576131833030042760177427498292420402508847894270058586141365101378492140850\", \"9491873854826334512629366681007334909800188093857697590242283766681321394809\"]",
+    "outcomePrices": "[\"0.11\", \"0.89\"]"
+   },
+   {
+    "question": "Will Erling Haaland win the 2026 PFA Player of the Year?",
+    "groupItemTitle": "Erling Haaland",
+    "outcomes": "[\"Yes\", \"No\"]",
+    "clobTokenIds": "[\"75175569130956436373037532521073255799869932496107360488546826801959963894401\", \"35736549988574099455710604896770777865544697667084352093927291090790595954875\"]",
+    "outcomePrices": "[\"0.017\", \"0.983\"]"
+   },
+   {
+    "question": "Will Bukayo Saka win the 2026 PFA Player of the Year?",
+    "groupItemTitle": "Bukayo Saka",
+    "outcomes": "[\"Yes\", \"No\"]",
+    "clobTokenIds": "[\"54664767722191411551893396679303439429264622563228848583119786621941289765456\", \"33203905161235191249723008445594120054974365364756981387818582473748188471340\"]",
+    "outcomePrices": "[\"0.0005\", \"0.9995\"]"
+   }
+  ]
+ },
+ {
+  "slug": "mls-2026-defender-of-the-year",
+  "title": "MLS: 2026 Defender of the Year",
+  "markets": [
+   {
+    "question": "Will Aaron Long win 2026 MLS Defender of the Year?",
+    "groupItemTitle": "Aaron Long",
+    "outcomes": "[\"Yes\", \"No\"]",
+    "clobTokenIds": "[\"101152691569786981282198455265923930443613250893212808538678802669758716052879\", \"11599725155315953766084326540223133329577723612420852169820989477448902780841\"]",
+    "outcomePrices": "[\"0.249\", \"0.751\"]"
+   },
+   {
+    "question": "Will Eddie Segura win 2026 MLS Defender of the Year?",
+    "groupItemTitle": "Eddie Segura",
+    "outcomes": "[\"Yes\", \"No\"]",
+    "clobTokenIds": "[\"39779908410922808963740332602464278514125201094744018234351130450865887415987\", \"24224099435668584905002191489858453737400055689843690693321511719106460743692\"]",
+    "outcomePrices": "[\"0.008\", \"0.992\"]"
+   },
+   {
+    "question": "Will Matt Miazga win 2026 MLS Defender of the Year?",
+    "groupItemTitle": "Matt Miazga",
+    "outcomes": "[\"Yes\", \"No\"]",
+    "clobTokenIds": "[\"100152487489792918062638058817701741785372975150311633355380695730154850998900\", \"30945674690002083021279341151626262886313654508504001679253425600794742613709\"]",
+    "outcomePrices": "[\"0.004\", \"0.996\"]"
+   }
+  ]
+ },
+ {
+  "slug": "mls-2026-coach-of-the-year",
+  "title": "MLS: 2026 Coach of the Year",
+  "markets": [
+   {
+    "question": "Will Gerardo \u201cTata\u201d Martino win 2026 MLS Coach of the Year?",
+    "groupItemTitle": "Gerardo \u201cTata\u201d Martino",
+    "outcomes": "[\"Yes\", \"No\"]",
+    "clobTokenIds": "[\"46967480815506044266391098267840180619537382680325555745752869178037284518944\", \"76185641916001691971133734752302399006835786338980470144594428423623401584881\"]",
+    "outcomePrices": "[\"0.115\", \"0.885\"]"
+   },
+   {
+    "question": "Will Nico Est\u00e9vez win 2026 MLS Coach of the Year?",
+    "groupItemTitle": "Nico Est\u00e9vez",
+    "outcomes": "[\"Yes\", \"No\"]",
+    "clobTokenIds": "[\"106739793887236814071283683786307937706100395966366251914234160216122608313156\", \"20886826141949970469096590440060307111742618737884207154666734755688492931455\"]",
+    "outcomePrices": "[\"0.01\", \"0.99\"]"
+   },
+   {
+    "question": "Will Marco Donadel win 2026 MLS Coach of the Year?",
+    "groupItemTitle": "Marco Donadel",
+    "outcomes": "[\"Yes\", \"No\"]",
+    "clobTokenIds": "[\"104648493826451421423923853445737629174238051958718767135682367191471432378503\", \"111714157505542573121166031089304332609366961512589809662472896324805052103167\"]",
+    "outcomePrices": "[\"0.245\", \"0.755\"]"
+   }
+  ]
+ },
+ {
+  "slug": "mls-cup-winner-2026",
+  "title": "MLS Cup Winner 2026",
+  "markets": [
+   {
+    "question": "Will Atlanta United FC win the 2026 MLS Cup?",
+    "groupItemTitle": "Atlanta United FC",
+    "outcomes": "[\"Yes\", \"No\"]",
+    "clobTokenIds": "[\"98860253812823050063139637560732946426096668703679673601434971154563134664716\", \"37277864974493024577055646517486369679989000172963448781524519316902530886432\"]",
+    "outcomePrices": "[\"0.003\", \"0.997\"]"
+   },
+   {
+    "question": "Will Austin FC win the 2026 MLS Cup?",
+    "groupItemTitle": "Austin FC",
+    "outcomes": "[\"Yes\", \"No\"]",
+    "clobTokenIds": "[\"105542566695304445999109338936258060254747699547624769683563292779086534879492\", \"105650410390479590484165236384795776597143947548830639737148700144687437988338\"]",
+    "outcomePrices": "[\"0.0015\", \"0.9985\"]"
+   },
+   {
+    "question": "Will Charlotte FC win the 2026 MLS Cup?",
+    "groupItemTitle": "Charlotte FC",
+    "outcomes": "[\"Yes\", \"No\"]",
+    "clobTokenIds": "[\"64915347545172379244677979694997883696947214572976500616776600777820871917355\", \"114333634635479313137964828635669787874292139556461773178065958136035174121652\"]",
+    "outcomePrices": "[\"0.0175\", \"0.9825\"]"
+   }
+  ]
+ },
+ {
+  "slug": "mls-2026-golden-boot-winner",
+  "title": "MLS: 2026 Golden Boot Winner",
+  "markets": [
+   {
+    "question": "Will Lionel Messi win the 2026 MLS Golden Boot?",
+    "groupItemTitle": "Lionel Messi",
+    "outcomes": "[\"Yes\", \"No\"]",
+    "clobTokenIds": "[\"63593281801252167348815330583070810022994380999078418194471517046153113945021\", \"93716070493546565992484814532757559120348640988418266367172984050625721371394\"]",
+    "outcomePrices": "[\"0.431\", \"0.569\"]"
+   },
+   {
+    "question": "Will Denis Bouanga win the 2026 MLS Golden Boot?",
+    "groupItemTitle": "Denis Bouanga",
+    "outcomes": "[\"Yes\", \"No\"]",
+    "clobTokenIds": "[\"51755965453913857230099649184667351820293428211963723625021043655352464299366\", \"74387167874659353499660095870175924273397963174366012171790118340737657659595\"]",
+    "outcomePrices": "[\"0.088\", \"0.912\"]"
+   },
+   {
+    "question": "Will Sam Surridge win the 2026 MLS Golden Boot?",
+    "groupItemTitle": "Sam Surridge",
+    "outcomes": "[\"Yes\", \"No\"]",
+    "clobTokenIds": "[\"70304024093533802097512641771283116115076785566756653228465157323522603017248\", \"95593783690119440978807805375171032021359020290149911989174168043881982094755\"]",
+    "outcomePrices": "[\"0.057\", \"0.943\"]"
+   }
+  ]
+ }
+]

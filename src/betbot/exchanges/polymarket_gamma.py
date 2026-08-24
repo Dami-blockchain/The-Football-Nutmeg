@@ -42,9 +42,31 @@ SOCCER_TAG_ID = 100350
 # price-sanity guard rejects every WC fixture).
 WC_TAG_SLUG = "fifa-world-cup"
 
-# football-data competition_code -> Gamma `sport` slug, used to intersect tag
-# sets during auto-discovery of the soccer tag.
-_FOOTBALL_SPORT_SLUGS = frozenset({"epl", "lal", "sa", "bundesliga", "ligue1", "ucl", "wc"})
+# The football leagues we route fixtures for, keyed by their Gamma ``/sports``
+# ``sport`` slug (verified live 2026-08-24). Used both to intersect tag sets
+# when auto-discovering the generic soccer tag AND to look up each league's own
+# per-match H2H tag in :meth:`GammaClient.discover_league_tags`.
+#
+# NOTE: these slugs changed at some point in Polymarket's Gamma restructuring —
+# the old values ("sa", "bundesliga", "ligue1") no longer exist and matched
+# nothing, which quietly broke tag discovery. Current slugs:
+#   epl=Premier League, lal=LaLiga, bun=Bundesliga, fl1=Ligue 1,
+#   sea=Serie A, ucl=UEFA Champions League.
+_FOOTBALL_SPORT_SLUGS = frozenset({"epl", "lal", "bun", "fl1", "sea", "ucl"})
+
+# Known-good ``primaryTagId`` per football-league slug (verified live
+# 2026-08-24). Used as a fallback if ``/sports`` is unavailable or its shape
+# changes, so per-match H2H discovery keeps working. These are the ONLY tags
+# that reliably surface per-match 1X2 events — the generic soccer tag buries
+# them behind thousands of long-running outright/awards markets.
+_LEAGUE_TAG_FALLBACK: dict[str, int] = {
+    "epl": 306,
+    "lal": 780,
+    "bun": 1494,
+    "fl1": 102070,
+    "sea": 100618,
+    "ucl": 1234,
+}
 
 _JSON_STRING_FIELDS = ("clobTokenIds", "outcomes", "outcomePrices")
 
@@ -146,6 +168,43 @@ class GammaClient:
             return SOCCER_TAG_ID
         return min(common) if common else SOCCER_TAG_ID
 
+    async def discover_league_tags(self) -> list[int]:
+        """Per-league ``primaryTagId`` for the leagues we route fixtures for.
+
+        The generic soccer tag holds 2000+ open events dominated by
+        long-running outright / season-winner / awards markets. Ordered by
+        start date, the actual per-match H2H events (EPL, La Liga, Bundesliga,
+        Ligue 1, + UCL) overflow any reasonable fetch window and were never
+        discovered — the matcher then only ever saw outright candidates and
+        logged ``polymarket_no_h2h_match``. Each league's own tag is small and
+        H2H-dense, so we fetch those directly.
+
+        Discovered from ``/sports`` by ``sport`` slug; falls back to the
+        known-good ids in :data:`_LEAGUE_TAG_FALLBACK` for any league the
+        endpoint doesn't return (or if ``/sports`` fails entirely). Serie A's
+        tag is included even though it currently lists no H2H markets — fetching
+        it yields only outright events, which the matcher correctly rejects, so
+        Serie A keeps missing cleanly rather than being silently unqueried.
+        """
+        tags: dict[str, int] = {}
+        try:
+            sports = await self.get_sports()
+        except GammaError:
+            sports = []
+        for s in sports:
+            slug = (s.get("sport") or "").lower()
+            if slug not in _FOOTBALL_SPORT_SLUGS:
+                continue
+            raw = s.get("primaryTagId")
+            try:
+                tags[slug] = int(raw)
+            except (TypeError, ValueError):
+                continue
+        # Fill any league the endpoint didn't hand us from the verified map.
+        for slug, tid in _LEAGUE_TAG_FALLBACK.items():
+            tags.setdefault(slug, tid)
+        return sorted(set(tags.values()))
+
     # ------------------------------------------------------------------
     async def list_events(
         self,
@@ -208,33 +267,65 @@ class GammaClient:
     async def list_soccer_events(
         self, *, tag_id: int | None = None, limit: int = 200
     ) -> list[dict[str, Any]]:
-        """Open football events. Pages through the numeric soccer tag, then
-        merges in per-match WC events (which that tag misses), deduped by
-        event slug/id."""
+        """Open football events for discovery, deduped by event slug/id.
+
+        Three sources, merged in priority order:
+
+        1. **Per-league H2H tags** (EPL/La Liga/Bundesliga/Ligue 1/Serie A/UCL).
+           These are the routing targets. The generic soccer tag buries per-match
+           1X2 events behind thousands of long-running outright/awards markets, so
+           we fetch each league's own (small, H2H-dense) tag directly. Fetched
+           FIRST so they can never be trimmed by a downstream cap.
+        2. **The generic numeric soccer tag**, paged — coverage for any other
+           competition the app may predict, and Layout-A markets.
+        3. **Per-match WC events** (a slug tag the numeric tag misses).
+        """
         resolved_tag = tag_id if tag_id is not None else await self.discover_soccer_tag()
         collected: list[dict[str, Any]] = []
+        seen: set[Any] = set()
+
+        def _merge(events: list[dict[str, Any]]) -> None:
+            for e in events:
+                key = e.get("slug") or e.get("id")
+                if key in seen:
+                    continue
+                seen.add(key)
+                collected.append(e)
+
+        # 1) Per-league H2H tags — the fix for `polymarket_no_h2h_match`.
+        try:
+            league_tags = await self.discover_league_tags()
+        except GammaError:
+            league_tags = []
+        for lt in league_tags:
+            try:
+                _merge(
+                    await self.list_events(tag_id=lt, closed=False, limit=100)
+                )
+            except GammaError:
+                continue  # one league failing must not sink discovery
+
+        # 2) Generic numeric soccer tag, paged (bounded by its own quota).
         page = 100
         offset = 0
-        while len(collected) < limit:
+        fetched_generic = 0
+        while fetched_generic < limit:
             batch = await self.list_events(
                 tag_id=resolved_tag, closed=False, limit=page, offset=offset
             )
             if not batch:
                 break
-            collected.extend(batch)
+            _merge(batch)
+            fetched_generic += len(batch)
             if len(batch) < page:
                 break
             offset += page
 
-        # Merge in WC match events (slug tag), which the numeric tag omits.
+        # 3) Per-match WC events (slug tag), which the numeric tag omits.
         try:
             wc = await self.list_events_by_slug(WC_TAG_SLUG, limit=limit)
         except GammaError:
             wc = []  # never let the WC supplement break club discovery
-        seen = {e.get("slug") or e.get("id") for e in collected}
-        for e in wc:
-            key = e.get("slug") or e.get("id")
-            if key not in seen:
-                seen.add(key)
-                collected.append(e)
-        return collected[: limit * 2]
+        _merge(wc)
+
+        return collected
