@@ -68,6 +68,14 @@ _LEAGUE_TAG_FALLBACK: dict[str, int] = {
     "ucl": 1234,
 }
 
+# Hard ceiling on pages fetched per league tag (100 events/page). Gamma's
+# startDate ordering is listing-time, not kickoff, and prop/side-market events
+# inflate each tag 3-4x per fixture, so a single page can miss the tail where
+# upcoming main 1X2 events sit. We page through, but cap so a runaway tag can't
+# balloon a discovery tick. 5 pages = 500 events comfortably covers a league's
+# open slate (live max observed ~154 for EPL, 2026-08-24).
+_LEAGUE_TAG_MAX_PAGES = 5
+
 _JSON_STRING_FIELDS = ("clobTokenIds", "outcomes", "outcomePrices")
 
 
@@ -108,6 +116,9 @@ class GammaClient:
         self._base_url = base_url.rstrip("/")
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(timeout=timeout_seconds)
+        # /sports is hit by both discover_soccer_tag and discover_league_tags in
+        # a single discovery pass; cache it so we fetch it once per client.
+        self._sports_cache: list[dict[str, Any]] | None = None
 
     async def __aenter__(self) -> "GammaClient":
         return self
@@ -131,8 +142,11 @@ class GammaClient:
 
     # ------------------------------------------------------------------
     async def get_sports(self) -> list[dict[str, Any]]:
+        if self._sports_cache is not None:
+            return self._sports_cache
         data = await self._get("/sports")
-        return data if isinstance(data, list) else []
+        self._sports_cache = data if isinstance(data, list) else []
+        return self._sports_cache
 
     async def discover_soccer_tag(self) -> int:
         """Best-effort soccer tag id from /sports; fall back to the constant.
@@ -274,8 +288,12 @@ class GammaClient:
         1. **Per-league H2H tags** (EPL/La Liga/Bundesliga/Ligue 1/Serie A/UCL).
            These are the routing targets. The generic soccer tag buries per-match
            1X2 events behind thousands of long-running outright/awards markets, so
-           we fetch each league's own (small, H2H-dense) tag directly. Fetched
-           FIRST so they can never be trimmed by a downstream cap.
+           we fetch each league's own (H2H-dense) tag directly, FIRST and fully
+           paged. A league tag is not tiny — prop/side markets inflate it (EPL
+           held 154 open events on 2026-08-24) — and Gamma orders by listing
+           time, not kickoff, so upcoming main 1X2 events can sit past page 0.
+           We page each league up to :data:`_LEAGUE_TAG_MAX_PAGES` and merge
+           before the generic tag so its own quota can never crowd them out.
         2. **The generic numeric soccer tag**, paged — coverage for any other
            competition the app may predict, and Layout-A markets.
         3. **Per-match WC events** (a slug tag the numeric tag misses).
@@ -292,18 +310,29 @@ class GammaClient:
                 seen.add(key)
                 collected.append(e)
 
-        # 1) Per-league H2H tags — the fix for `polymarket_no_h2h_match`.
+        # 1) Per-league H2H tags — the fix for `polymarket_no_h2h_match`. Page
+        #    each tag (bounded) so a full page 0 of props can't hide the tail
+        #    where upcoming main 1X2 events live.
         try:
             league_tags = await self.discover_league_tags()
         except GammaError:
             league_tags = []
+        page = 100
         for lt in league_tags:
-            try:
-                _merge(
-                    await self.list_events(tag_id=lt, closed=False, limit=100)
-                )
-            except GammaError:
-                continue  # one league failing must not sink discovery
+            offset = 0
+            for _ in range(_LEAGUE_TAG_MAX_PAGES):
+                try:
+                    batch = await self.list_events(
+                        tag_id=lt, closed=False, limit=page, offset=offset
+                    )
+                except GammaError:
+                    break  # one league page failing must not sink discovery
+                if not batch:
+                    break
+                _merge(batch)
+                if len(batch) < page:
+                    break
+                offset += page
 
         # 2) Generic numeric soccer tag, paged (bounded by its own quota).
         page = 100

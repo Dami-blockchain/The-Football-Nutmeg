@@ -167,3 +167,63 @@ async def test_serie_a_outright_is_never_misrouted_as_home_away():
     async with _gamma() as g:
         ref = await _adapter(g).find_market("Napoli", "AS Roma", KICKOFF)
     assert ref is None
+
+
+# ----------------------------------------------------------------------
+# Paged league fetch — a full page 0 must not hide a page-1 H2H event
+# ----------------------------------------------------------------------
+def _prop_filler(i: int) -> dict:
+    """A benign non-1X2 event (won't classify): props/side markets like the
+    ones that inflate a real league tag and push main events past page 0."""
+    return {
+        "slug": f"epl-filler-{i}-exact-score",
+        "title": f"Filler {i} - Exact Score",
+        "markets": [],
+    }
+
+
+def _paged_epl_handler(request: httpx.Request) -> httpx.Response:
+    """Same as the default handler, but tag 306 (EPL) returns a FULL page 0 of
+    100 filler events with the real H2H event only on page 1 (offset 100)."""
+    path = request.url.path
+    if path == "/sports":
+        return httpx.Response(200, json=_load("sports.json"))
+    if path == "/events":
+        params = request.url.params
+        if params.get("tag_slug"):
+            return httpx.Response(200, json=[])
+        tag_id = int(params.get("tag_id", "0"))
+        offset = int(params.get("offset", "0"))
+        if tag_id == _EPL_TAG:
+            if offset == 0:
+                return httpx.Response(200, json=[_prop_filler(i) for i in range(100)])
+            if offset == 100:
+                return httpx.Response(200, json=_load("epl_h2h_event.json"))
+            return httpx.Response(200, json=[])
+        if tag_id == _SERIE_A_TAG:
+            return httpx.Response(200, json=_load("seriea_outright_event.json"))
+        if tag_id in _OTHER_LEAGUE_TAGS:
+            return httpx.Response(200, json=[])
+        if tag_id == _GENERIC_SOCCER_TAG:
+            return httpx.Response(
+                200, json=_load("generic_tag_page0.json") if offset == 0 else []
+            )
+        return httpx.Response(200, json=[])
+    return httpx.Response(404)
+
+
+@pytest.mark.asyncio
+async def test_league_tag_is_paged_past_a_full_first_page():
+    """Regression for the Fable finding on 48b3241: a single-page league fetch
+    would miss a main 1X2 event sitting behind a full page 0 of prop events.
+    The EPL H2H event is on page 1 here and must still be discovered + routed."""
+    gamma = GammaClient(
+        client=httpx.AsyncClient(transport=httpx.MockTransport(_paged_epl_handler))
+    )
+    async with gamma as g:
+        events = await g.list_soccer_events()
+        slugs = {e.get("slug") for e in events}
+        assert "epl-ful-che-2026-08-24" in slugs, "page-1 H2H event must be fetched"
+        ref = await _adapter(g).find_market("Fulham FC", "Chelsea FC", KICKOFF)
+    assert ref is not None
+    assert ref.market_id == "epl-ful-che-2026-08-24"
