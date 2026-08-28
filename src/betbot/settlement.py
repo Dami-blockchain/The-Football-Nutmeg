@@ -29,6 +29,7 @@ from betbot.storage.repos import (
     rating_exists,
     record_prediction_outcome,
     record_settlement,
+    score_model_prediction,
     settled_pnl_window,
     trip_kill_switch,
     upsert_rating,
@@ -270,6 +271,17 @@ class SettlementWatcher:
             if not newly:
                 continue  # already scored — idempotent (no double rating update)
             scored += 1
+            # Passive dual-log: score the pure-Glicko vs raw-ensemble challenger
+            # ledger for this fixture. Best-effort; never aborts settlement.
+            try:
+                score_model_prediction(
+                    fixture_id=pred.fixture_id, actual_outcome=outcome.value
+                )
+            except Exception as e:  # noqa: BLE001 — never abort settlement
+                log.warning(
+                    "dual_log_score_failed",
+                    fixture_id=pred.fixture_id, error=str(e),
+                )
             log.info(
                 "prediction_scored",
                 fixture_id=pred.fixture_id,

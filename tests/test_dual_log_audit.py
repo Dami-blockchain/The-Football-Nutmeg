@@ -70,14 +70,15 @@ def _add_dual_row(created_at: datetime, *, settled: bool = False) -> None:
 # ---------------------------------------------------------------------
 # The build fact
 # ---------------------------------------------------------------------
-def test_no_code_path_writes_the_dual_log_in_this_build():
+def test_club_dual_log_is_wired_and_the_flag_matches():
     """The flag must not drift from reality.
 
-    6abc132 deleted the dispersion + MOV challengers and the Hedge selector
-    with the World Cup engine. If someone rebuilds a challenger they flip this
-    constant in the same commit, which is what arms the staleness alarm.
+    6abc132 left this table dead; it was RE-ARMED for the club engine
+    (betbot.main._score_and_log_one -> repos.upsert_model_prediction, scored at
+    settlement), and the flag was flipped in that same commit — which is what
+    arms the staleness alarm below.
     """
-    assert CHALLENGER_DUAL_LOG_ENABLED is False
+    assert CHALLENGER_DUAL_LOG_ENABLED is True
 
 
 def test_the_removed_challenger_flags_are_genuinely_unread():
@@ -93,19 +94,20 @@ def test_the_removed_challenger_flags_are_genuinely_unread():
 # ---------------------------------------------------------------------
 # The audit
 # ---------------------------------------------------------------------
-def test_frozen_dual_log_is_reported_as_not_accumulating(db):
-    """The exact live shape: main path writing today, dual log 5 weeks old."""
+def test_frozen_dual_log_now_trips_the_stale_alarm(db):
+    """The 2026-07-17 live shape, re-judged: now that the club dual-log is
+    wired, a main path writing today against a five-week-old dual log is a
+    STALE FAULT, not a declared gap."""
     _add_dual_row(datetime(2026, 7, 17, 8, 1, tzinfo=timezone.utc), settled=True)
     _add_main_prediction(datetime(2026, 8, 22, 8, 8, tzinfo=timezone.utc))
 
     a = audit_dual_log(now=NOW)
-    assert a.enabled is False
+    assert a.enabled is True
     assert a.rows == 1
     assert a.settled == 1
     assert a.lag_days > 35
-    assert "frozen" in a.reason
-    # It must NOT read as a healthy, progressing ledger.
-    assert "accumulation frozen" in a.summary
+    assert a.healthy is False
+    assert "behind the main prediction path" in a.reason
 
 
 def test_audit_survives_a_completely_empty_ledger(db):
@@ -115,8 +117,9 @@ def test_audit_survives_a_completely_empty_ledger(db):
 
 
 @pytest.mark.asyncio
-async def test_operator_is_told_the_counts_are_final_not_in_progress(db, settings):
-    """The misleading belief was 'we're gathering data'. Kill that belief."""
+async def test_operator_is_paged_when_the_club_dual_log_goes_stale(db, settings):
+    """With the club dual-log wired, a stale ledger pages the human as a STALE
+    fault (not the old 'not accumulating' notice)."""
     _add_dual_row(datetime(2026, 7, 17, 8, 1, tzinfo=timezone.utc), settled=True)
     _add_main_prediction(datetime(2026, 8, 22, 8, 8, tzinfo=timezone.utc))
     sent: list[str] = []
@@ -128,11 +131,8 @@ async def test_operator_is_told_the_counts_are_final_not_in_progress(db, setting
     settings.telegram_allowed_user_id = 123
     await report_dual_log_health(settings, send_fn=_send, now=NOW)
 
-    assert sent, "a frozen dual log must reach the human"
-    body = sent[0]
-    assert "NOT accumulating" in body
-    assert "FINAL, not in progress" in body
-    assert "6abc132" in body  # points at the commit that removed it
+    assert sent, "a stale dual log must reach the human"
+    assert "STALE" in sent[0]
 
 
 # ---------------------------------------------------------------------

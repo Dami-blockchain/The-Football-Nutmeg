@@ -16,6 +16,7 @@ from betbot.storage.models import (
     GasTopup,
     GlickoRating,
     KillSwitch,
+    ModelPrediction,
     PaperBet,
     PredictionOutcome,
     PredictionReveal,
@@ -867,6 +868,57 @@ def upsert_rating(team_name: str, rating: Glicko2Rating, *, team_id: int | None 
                 row.team_id = team_id
 
 
+def upsert_rating_if_fresher(
+    team_name: str, rating: Glicko2Rating, *, team_id: int | None = None
+) -> bool:
+    """Upsert a rating ONLY when it is at least as fresh as the stored row.
+
+    The weekly re-seed (``scripts/seed_glicko_club.py``) rebuilds every rating
+    from the football-data.co.uk history CSV and would otherwise SET each row
+    back to the CSV's end-state — clobbering the in-season Glicko nudges that
+    settlement applies between re-seeds whenever the CSV lags the live results
+    (football-data.co.uk publishes only a few times a week, so mid-week it is
+    always behind the DB).
+
+    Freshness is the ISO ``last_period`` date both writers stamp: the re-seed
+    stamps the last CSV match date per team; the settlement nudge stamps the
+    settle date. We overwrite the rating fields only when the incoming
+    ``last_period >=`` the stored one (or the stored row has no period yet), so
+
+    * a re-seed whose history has caught up to (or past) the DB takes over
+      cleanly — it is a full-history replay, so there is no double counting; and
+    * a re-seed whose CSV still lags a nudged row leaves that row's RATING
+      untouched, preserving the in-season learning.
+
+    Creation is never blocked, so the re-seed remains the only writer that
+    CREATES ratings (settlement's unknown-team guard relies on that). ``team_id``
+    metadata is always refreshed when supplied, even when the rating is kept.
+
+    Returns True iff the rating fields were written.
+    """
+    with session_scope() as s:
+        row = s.execute(
+            select(GlickoRating).where(GlickoRating.team_name == team_name)
+        ).scalar_one_or_none()
+        if row is None:
+            s.add(GlickoRating(
+                team_name=team_name, team_id=team_id, rating=rating.rating,
+                rd=rating.rd, volatility=rating.volatility,
+                last_period=rating.last_period,
+            ))
+            return True
+        incoming, existing = rating.last_period, row.last_period
+        fresher = existing is None or (incoming is not None and incoming >= existing)
+        if fresher:
+            row.rating, row.rd, row.volatility = (
+                rating.rating, rating.rd, rating.volatility
+            )
+            row.last_period = incoming
+        if team_id is not None:
+            row.team_id = team_id
+        return fresher
+
+
 def all_ratings() -> list[tuple[str, Glicko2Rating]]:
     with session_scope() as s:
         rows = list(
@@ -908,6 +960,79 @@ def apply_rating_period(
     for t in teams:
         upsert_rating(t, update_rating(current[t], per_team[t], tau=tau, period=period))
     return len(teams)
+
+
+# ----------------------------------------------------------------------
+# Model dual-log (model_predictions) — passive head-to-head ledger
+# ----------------------------------------------------------------------
+# Re-armed for the CLUB engine (the World Cup Hedge writer was removed in
+# 6abc132). This is a PASSIVE, decision-neutral ledger: it records the pure
+# Glicko challenger vs the RAW pre-calibration ensemble the club engine serves,
+# and scores each with RPS at settlement. It changes NOTHING about what the
+# daemon predicts or trades. It is also the raw-triple store the calibration
+# fit trains on (scripts/fit_ensemble_calibration_club.py), which is why the
+# ensemble triple stored here is the log-pool BEFORE calibration.
+def upsert_model_prediction(
+    *,
+    fixture_id: int,
+    home_team: str,
+    away_team: str,
+    glicko: tuple[float, float, float],
+    ensemble: tuple[float, float, float],
+    w_glicko: float,
+    w_ensemble: float,
+) -> None:
+    """Store/refresh one fixture's (pure-Glicko, RAW-ensemble) pre-match pair.
+
+    Upserts on ``fixture_id`` (unique). While the row is unsettled the triples
+    are refreshed each scoring tick — mirroring the main prediction path's
+    always-fresh rescore. Once ``outcome`` is filled the row is frozen so the
+    RPS is scored against the pre-match snapshot that stood at settlement.
+    """
+    gh, gd, ga = glicko
+    eh, ed, ea = ensemble
+    with session_scope() as s:
+        row = s.execute(
+            select(ModelPrediction).where(ModelPrediction.fixture_id == fixture_id)
+        ).scalar_one_or_none()
+        if row is not None and row.outcome is not None:
+            return  # settled — frozen snapshot
+        if row is None:
+            s.add(ModelPrediction(
+                fixture_id=fixture_id, home_team=home_team, away_team=away_team,
+                g_home=gh, g_draw=gd, g_away=ga,
+                e_home=eh, e_draw=ed, e_away=ea,
+                w_glicko=w_glicko, w_ensemble=w_ensemble,
+            ))
+        else:
+            row.home_team, row.away_team = home_team, away_team
+            row.g_home, row.g_draw, row.g_away = gh, gd, ga
+            row.e_home, row.e_draw, row.e_away = eh, ed, ea
+            row.w_glicko, row.w_ensemble = w_glicko, w_ensemble
+
+
+def score_model_prediction(*, fixture_id: int, actual_outcome: str) -> bool:
+    """Fill a dual-log row's outcome + RPS for both models. Idempotent.
+
+    Returns True iff a row was newly scored (present and previously unsettled).
+    """
+    idx = {"HOME": 0, "DRAW": 1, "AWAY": 2}.get(actual_outcome)
+    if idx is None:
+        return False
+    with session_scope() as s:
+        row = s.execute(
+            select(ModelPrediction).where(ModelPrediction.fixture_id == fixture_id)
+        ).scalar_one_or_none()
+        if row is None or row.outcome is not None:
+            return False
+        row.outcome = actual_outcome
+        row.rps_glicko = ranked_probability_score(
+            (row.g_home, row.g_draw, row.g_away), idx
+        )
+        row.rps_ensemble = ranked_probability_score(
+            (row.e_home, row.e_draw, row.e_away), idx
+        )
+        return True
 
 
 # ----------------------------------------------------------------------
