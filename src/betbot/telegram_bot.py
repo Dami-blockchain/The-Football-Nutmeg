@@ -91,6 +91,12 @@ def build_onboarding_guide(user, settings) -> str:
         settings.telegram_allowed_user_id
         and user.telegram_user_id == settings.telegram_allowed_user_id
     )
+    # When the high-conviction gate is ON the product only offers the
+    # matches the model is most confident in, so the copy must not promise
+    # "every prediction". Flag OFF -> unit == "prediction" and every
+    # conditional below collapses to the original text (byte-identical).
+    hc = bool(getattr(settings, "high_conf_alerts_only", False))
+    unit = "high-confidence call" if hc else "prediction"
 
     if is_operator:
         pricing = (
@@ -102,15 +108,24 @@ def build_onboarding_guide(user, settings) -> str:
     else:
         pricing = (
             "*Pricing*\n"
-            "• Your first *7 days are FREE* — every prediction, no charge.\n"
-            "• After that it's *1 USDC per prediction*, paid in USDC on "
-            "*Polygon* (1 USDC unlocks 1 prediction).\n"
+            f"• Your first *7 days are FREE* — every {unit}, no charge.\n"
+            f"• After that it's *1 USDC per {unit}*, paid in USDC on "
+            f"*Polygon* (1 USDC unlocks 1 {unit}).\n"
             "• Top up by sending USDC (on *Polygon*) to your personal deposit "
             "address below — I detect it on-chain automatically.\n"
             f"• *Your deposit address (Polygon):*\n`{user.wallet_address}`\n"
             "• Check your credits any time with /balance.\n\n"
         )
 
+    hc_note = (
+        "*I only alert the matches I'm most confident in* — not every "
+        "fixture qualifies, and some match days none do.\n\n"
+        if hc else ""
+    )
+    predictions_cmd_line = (
+        "/predictions – today's high-confidence picks\n"
+        if hc else "/predictions – today's fixtures + picks\n"
+    )
     return (
         "⚽ *Football Nutmeg Bot*\n\n"
         "Welcome! I send *data-driven predictions* for the big-5 European "
@@ -127,9 +142,10 @@ def build_onboarding_guide(user, settings) -> str:
         "4️⃣ At *full time*, the *result vs the model's pick* (✅ / ❌).\n\n"
         "*Just chat with me* — message me any time to ask about a match: why a "
         "pick, the xG, form, anything about today's matches.\n\n"
+        f"{hc_note}"
         f"{pricing}"
         "*Commands*\n"
-        "/predictions – today's fixtures + picks\n"
+        f"{predictions_cmd_line}"
         "/title – who's winning La Liga? (or /title PL, /title CL)\n"
         "/balance – your balance + credits\n"
         "/status – trial / credits status\n"

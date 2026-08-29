@@ -111,6 +111,40 @@ def _entitlement_header(ent) -> str:
     return "🔒 trial ended — send 1 USDC (Polygon) per prediction to unlock"
 
 
+def high_conf_visible(
+    settings,
+    predictions,
+    user_id: int,
+    already_revealed_fn=has_revealed,
+):
+    """Predictions a user may be OFFERED under the high-conviction gate.
+
+    The SINGLE definition of "what the paywall shows", shared by
+    :func:`render_user_predictions` (/predictions + any daily push) and the
+    chat context builder, so every surface agrees. A prediction is visible
+    iff:
+
+    * it clears the high-conviction ALERT gate
+      (:func:`betbot.main.high_conf_alert_passes`) — the SAME predicate the
+      pre-match and result-alert paths use, so NO fourth threshold knob is
+      introduced; OR
+    * the user ALREADY revealed it (``already_revealed_fn`` True) — a fixture
+      paid for before this gate existed is never retroactively hidden.
+
+    With ``settings.high_conf_alerts_only`` OFF the predicate passes every
+    fixture, so the output equals ``predictions`` and behaviour is unchanged.
+    Pure: no DB writes. ``already_revealed_fn`` is injected for tests.
+    """
+    from betbot.main import high_conf_alert_passes
+
+    return [
+        p
+        for p in predictions
+        if high_conf_alert_passes(settings, p)[0]
+        or already_revealed_fn(user_id, p.fixture_id)
+    ]
+
+
 def render_user_predictions(
     user,
     predictions,
@@ -154,13 +188,27 @@ def render_user_predictions(
         parts.append("\nNo fixtures today.")
         return "\n".join(parts), reveals
 
+    # HIGH-CONVICTION GATE — the SINGLE paywall choke point. Only fixtures
+    # clearing high_conf_alert_passes are OFFERED: listed, revealable,
+    # chargeable. Already-revealed fixtures stay visible free even if they no
+    # longer clear it (paid for before this gate; never retroactively hidden).
+    # Flag OFF -> passes everything -> visible == predictions (unchanged).
+    visible = high_conf_visible(
+        settings, predictions, user.telegram_user_id, already_revealed_fn
+    )
+    if not visible:
+        # Fixtures existed but none cleared the bar (common at 0.65). Honest
+        # message, and NO reveals -> commit_reveals charges nobody.
+        parts.append("\nNo high-confidence calls today.")
+        return "\n".join(parts), reveals
+
     free_reason = ent.reason in ("operator", "trial")
     # Paid credits fund only NEW fixtures; already-revealed ones are free and
     # don't draw down the budget.
     credits = max(0, ent.credits_remaining) if ent.reason == "credit" else 0
     paid_revealed = 0
 
-    for p in predictions:
+    for p in visible:
         # Already paid for on a prior path/repeat — always free, never re-charged.
         if already_revealed_fn(user.telegram_user_id, p.fixture_id):
             parts.append("\n" + format_prediction(p, edge_threshold=edge_threshold))

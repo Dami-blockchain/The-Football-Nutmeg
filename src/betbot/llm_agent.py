@@ -155,6 +155,12 @@ def build_prediction_context(user, settings, *, now: datetime | None = None) -> 
 
     start, end, _day = nairobi_day_bounds(now)
     preds = predictions_for_kickoff_range(start, end)
+    # Same high-conviction gate as the paywall (single shared predicate) so
+    # the chat never offers a low-confidence fixture as buyable — "nothing
+    # more". Already-revealed fixtures stay visible; flag OFF -> unchanged.
+    from betbot.daily_jobs import high_conf_visible
+
+    visible = high_conf_visible(settings, preds, user.telegram_user_id, has_revealed)
 
     ent = entitlement_for(user, settings, now=now)
     all_free = ent.reason in ("operator", "trial")
@@ -174,16 +180,26 @@ def build_prediction_context(user, settings, *, now: datetime | None = None) -> 
             "unlocked; fixtures marked LOCKED need 1 USDC to reveal."
         )
 
-    if not preds:
+    if not visible:
+        if preds:
+            empty_note = (
+                "(no HIGH-CONFIDENCE calls today — the bot only offers "
+                "fixtures it is highly confident in, and none qualify today). "
+                "Tell the user plainly there are no high-confidence calls "
+                "today; do NOT mention locking or paying."
+            )
+        else:
+            empty_note = (
+                "(no fixtures scheduled today). Tell the user plainly there "
+                "are no matches today; do NOT mention locking or paying."
+            )
         return "\n".join([
             record_line, "", access_note, "",
-            "Today's predictions available to this user: (no fixtures scheduled "
-            "today). Tell the user plainly there are no matches today; do NOT "
-            "mention locking or paying.",
+            "Today's predictions available to this user: " + empty_note,
         ])
 
     lines = [record_line, "", access_note, "", "Today's predictions available to this user:"]
-    for p in preds:
+    for p in visible:
         entitled = all_free or has_revealed(
             user.telegram_user_id, p.fixture_id
         )

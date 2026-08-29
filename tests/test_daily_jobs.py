@@ -18,6 +18,7 @@ from betbot.config import Settings
 from betbot.daily_jobs import (
     broadcast_chat_ids,
     commit_reveals,
+    high_conf_visible,
     nairobi_day_bounds,
     register_daily_jobs,
     render_matchday_notice,
@@ -164,6 +165,147 @@ def test_no_fixtures_message():
 
 def _tg_settings_stub() -> Settings:
     return Settings(FOOTBALL_DATA_API_KEY="x", BETBOT_EDGE_THRESHOLD=0.05)
+
+
+# ----------------------------------------------------------------------
+# HIGH-CONVICTION GATE on the paywall (only high-confidence fixtures are
+# listed / revealable / chargeable). Same predicate as the alert paths.
+# ----------------------------------------------------------------------
+def _hc_settings_stub() -> Settings:
+    """Settings stub with the high-conviction gate ON (live config: min_p 0.65)."""
+    return Settings(
+        FOOTBALL_DATA_API_KEY="x",
+        BETBOT_EDGE_THRESHOLD=0.05,
+        BETBOT_HIGH_CONF_ALERTS_ONLY=True,
+        BETBOT_HIGH_CONF_ALERT_MIN_P=0.65,
+    )
+
+
+def _hp(fid, home="High FC"):
+    """High-conviction prediction: top pick HOME 0.72 >= 0.65, non-draw."""
+    return _Pred(fixture_id=fid, home_team=home, p_home=0.72, p_draw=0.18, p_away=0.10)
+
+
+def _lp(fid, home="Low FC"):
+    """Low-conviction prediction: top pick 0.39 < 0.65 -> a coin-flip."""
+    return _Pred(fixture_id=fid, home_team=home, p_home=0.39, p_draw=0.31, p_away=0.30)
+
+
+def test_high_conf_visible_helper_filters_and_passes_through():
+    hi, lo = _hp(1), _lp(2)
+    on = _hc_settings_stub()
+    # Flag ON: only the high-conf fixture is visible...
+    assert [p.fixture_id for p in high_conf_visible(on, [hi, lo], 7,
+            lambda u, f: False)] == [1]
+    # ...unless the low-conf one was already revealed (never retroactively hidden).
+    assert [p.fixture_id for p in high_conf_visible(on, [hi, lo], 7,
+            lambda u, f: f == 2)] == [1, 2]
+    # Flag OFF: byte-for-byte passthrough.
+    off = _tg_settings_stub()
+    assert [p.fixture_id for p in high_conf_visible(off, [hi, lo], 7,
+            lambda u, f: False)] == [1, 2]
+
+
+def test_gate_filters_low_conf_from_reveal_and_charge():
+    """Point 1/4/6: a credit user is offered ONLY the high-conf fixtures; the
+    low-conf coin-flip vanishes entirely (never listed, revealed or charged)."""
+    preds = [_hp(1, "Alpha"), _lp(2, "Beta"), _hp(3, "Gamma")]
+    text, reveals = render_user_predictions(
+        _User(5), preds, _hc_settings_stub(),
+        entitlement_fn=lambda u, s, now=None: _ent("credit", credits=5),
+        already_revealed_fn=_never_revealed,
+    )
+    assert reveals == [(1, True), (3, True)]  # only the two high-conf, charged
+    assert "Beta" not in text                 # low-conf fixture vanished
+    assert "Alpha" in text and "Gamma" in text
+
+
+def test_gate_zero_qualifying_message_and_no_charge():
+    """Point 2: fixtures exist but none clear 0.65 -> honest message, NO reveals
+    (so commit_reveals charges nobody)."""
+    preds = [_lp(1), _lp(2)]
+    text, reveals = render_user_predictions(
+        _User(5), preds, _hc_settings_stub(),
+        entitlement_fn=lambda u, s, now=None: _ent("trial", trial=3),
+        already_revealed_fn=_never_revealed,
+    )
+    assert reveals == []
+    assert "No high-confidence calls today" in text
+    assert "No fixtures today" not in text  # distinct from the truly-empty day
+    assert "%" not in text                  # nothing revealed
+
+
+def test_gate_zero_qualifying_draws_no_credit(db, tmp_path):
+    """Point 2 (DB): a payer whose day has only low-conf fixtures is NOT charged."""
+    u = _paying_user(tmp_path, tid=901)
+    _t, reveals = render_user_predictions(
+        u, [_lp(1), _lp(2)], _hc_settings_stub(),
+        entitlement_fn=lambda usr, se, now=None: _ent("credit", credits=5),
+        already_revealed_fn=has_revealed,
+    )
+    assert reveals == []
+    commit_reveals(u, reveals)  # no-op
+    assert get_user(u.telegram_user_id).predictions_consumed == 0
+
+
+def test_gate_already_revealed_low_conf_stays_visible_free():
+    """Point 3: a low-conf fixture already revealed BEFORE this gate stays shown,
+    free, and is never re-charged; an unrevealed low-conf one still vanishes."""
+    revealed = _lp(1, "Everton")
+    hidden = _lp(2, "Fulham")
+    text, reveals = render_user_predictions(
+        _User(5), [revealed, hidden], _hc_settings_stub(),
+        entitlement_fn=lambda u, s, now=None: _ent("locked"),
+        already_revealed_fn=lambda uid, fid: fid == 1,
+    )
+    assert reveals == []          # nothing charged
+    assert "Everton" in text      # paid-for low-conf stays visible...
+    assert "%" in text            # ...as a real reveal (probabilities shown)
+    assert "Fulham" not in text   # unrevealed low-conf vanishes (no teaser)
+
+
+def test_gate_low_conf_never_shown_as_locked_teaser():
+    """Point 4: a locked user sees high-conf fixtures as teasers (they CAN buy
+    them) but low-conf fixtures vanish entirely -- never a locked teaser."""
+    preds = [_hp(1, "Chelsea"), _lp(2, "Burnley")]
+    text, reveals = render_user_predictions(
+        _User(5), preds, _hc_settings_stub(),
+        entitlement_fn=lambda u, s, now=None: _ent("locked"),
+        already_revealed_fn=_never_revealed,
+    )
+    assert reveals == []
+    assert "Chelsea" in text                       # high-conf teaser remains
+    assert "Burnley" not in text                    # low-conf vanished
+    assert text.count("\U0001f512") == 2            # header lock + ONE teaser lock
+    assert "%" not in text                          # teaser hides probabilities
+
+
+def test_gate_off_is_unchanged():
+    """Point 5: with the flag OFF, low-conf fixtures are all offered as before."""
+    preds = [_lp(1), _lp(2)]
+    text, reveals = render_user_predictions(
+        _User(5), preds, _tg_settings_stub(),  # flag OFF (default)
+        entitlement_fn=lambda u, s, now=None: _ent("trial", trial=3),
+        already_revealed_fn=_never_revealed,
+    )
+    assert reveals == [(1, False), (2, False)]  # nothing filtered
+    assert "No high-confidence calls today" not in text
+
+
+def test_gate_credits_charged_exactly_for_qualifying(db, tmp_path):
+    """Point 6 (DB): 5 credits, only 2 qualifying fixtures -> reveal 2, charge 2,
+    no off-by-one and no charge for the low-conf fixtures."""
+    u = _paying_user(tmp_path, tid=902)
+    preds = [_hp(1), _lp(2), _hp(3), _lp(4)]
+    _t, reveals = render_user_predictions(
+        u, preds, _hc_settings_stub(),
+        entitlement_fn=lambda usr, se, now=None: _ent("credit", credits=5),
+        already_revealed_fn=has_revealed,
+    )
+    assert reveals == [(1, True), (3, True)]
+    commit_reveals(u, reveals)
+    assert get_user(u.telegram_user_id).predictions_consumed == 2  # exactly 2
+
 
 
 # ----------------------------------------------------------------------

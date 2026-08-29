@@ -530,15 +530,25 @@ async def test_result_gate_on_missing_prediction_suppressed_and_consumed(
     _seed_outcome(901)
     record_reveal(111, 901, charged=False)
 
-    async def _boom_send(s, chat_id, text):
-        raise AssertionError("missing-prediction fixture must not alert when gated")
+    # RECORD sends rather than raising: run_result_alerts wraps each send in
+    # a per-send try/except, so a raised AssertionError inside the sender is
+    # swallowed (logged result_alert_send_failed) and the old _boom_send made
+    # this test inert — it passed even on ungated base code. Asserting the
+    # sender was NEVER reached proves the gate suppresses UPSTREAM of the
+    # send loop.
+    calls: list[tuple[int, str]] = []
+
+    async def _recording_send(s, chat_id, text):
+        calls.append((chat_id, text))
+        return True
 
     n = await daily_jobs.run_result_alerts(
-        settings, send_fn=_boom_send,
+        settings, send_fn=_recording_send,
         users_fn=lambda: [_User(111)],
         prediction_fn=lambda fid: None,  # no stored prediction
     )
     assert n == 0
+    assert calls == []  # send was NEVER reached (gate suppressed upstream)
     assert _notified_flag(901) is True  # consumed, never re-queues
 
 

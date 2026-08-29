@@ -323,6 +323,86 @@ def test_context_locked_user_all_locked_no_probabilities(
         assert pct not in ctx
 
 
+@pytest.fixture
+def hc_preds_db(tmp_path, monkeypatch):
+    """DB with ONE high-conviction (0.72) and ONE low-conviction (0.40) fixture."""
+    init_engine(tmp_path / "hc.sqlite")
+    upsert_prediction(
+        _mk_prediction(7001, "Spurs", "Wolves",
+                       p_home=0.72, p_draw=0.18, p_away=0.10),
+        kickoff=_KO,
+    )
+    upsert_prediction(
+        _mk_prediction(7002, "Leeds", "Brighton",
+                       p_home=0.40, p_draw=0.32, p_away=0.28),
+        kickoff=_KO,
+    )
+    return _KO
+
+
+def test_context_gate_hides_low_conf_entirely(hc_preds_db, tmp_path, monkeypatch):
+    """Chat surface honours the gate: a low-conf fixture is not offered at all --
+    not even as a LOCKED line (the operator's 'nothing more')."""
+    s = _settings(
+        BETBOT_HIGH_CONF_ALERTS_ONLY=True, BETBOT_HIGH_CONF_ALERT_MIN_P=0.65
+    )
+    u = _user(tmp_path, 6001, created_days_ago=1)  # inside trial
+
+    ctx = build_prediction_context(u, s, now=_KO)
+
+    assert "Spurs" in ctx        # high-conf fixture is offered
+    assert "Leeds" not in ctx    # low-conf vanishes...
+    assert "Brighton" not in ctx  # ...entirely (no LOCKED teaser either)
+
+
+def test_context_gate_keeps_already_revealed_low_conf(
+    hc_preds_db, tmp_path, monkeypatch
+):
+    """A low-conf fixture the payer already revealed stays visible (never
+    retroactively hidden)."""
+    _no_balance(monkeypatch)
+    s = _settings(BETBOT_HIGH_CONF_ALERTS_ONLY=True)
+    u = _user(tmp_path, 6002, created_days_ago=99)  # trial ended, no credits
+    record_reveal(6002, 7002, charged=True)  # paid for the low-conf fixture
+
+    ctx = build_prediction_context(u, s, now=_KO)
+
+    assert "Leeds" in ctx  # paid-for low-conf fixture is still shown
+
+
+def test_context_gate_all_low_conf_says_none(preds_db, tmp_path, monkeypatch):
+    """A day whose only fixtures are below the bar reports no high-confidence
+    calls -- distinct from a genuinely empty day."""
+    s = _settings(BETBOT_HIGH_CONF_ALERTS_ONLY=True)
+    u = _user(tmp_path, 6003, created_days_ago=1)  # inside trial
+
+    ctx = build_prediction_context(u, s, now=_KO)
+
+    assert "no high-confidence calls today" in ctx.lower()
+    assert "Arsenal" not in ctx and "Liverpool" not in ctx
+
+
+def test_onboarding_guide_high_conf_copy(tmp_path):
+    """Point 7: with the gate ON the guide must frame the product as
+    high-confidence-only; with it OFF the original copy is byte-preserved."""
+    init_engine(tmp_path / "guide.sqlite")
+    u = get_or_create_user(
+        7777, "guy", secrets_dir=str(tmp_path / "s"), keyfile=None
+    )
+    g_on = tb.build_onboarding_guide(u, _settings(BETBOT_HIGH_CONF_ALERTS_ONLY=True))
+    g_off = tb.build_onboarding_guide(u, _settings())
+
+    # Flag ON: product framed as high-confidence-only.
+    assert "1 USDC per high-confidence call" in g_on
+    assert "high-confidence picks" in g_on
+    assert "most confident" in g_on
+
+    # Flag OFF: original copy preserved (equivalence discipline).
+    assert "1 USDC per prediction" in g_off
+    assert "high-confidence" not in g_off
+    assert "fixtures + picks" in g_off
+
+
 def test_context_no_fixtures(tmp_path, monkeypatch):
     init_engine(tmp_path / "empty.sqlite")
     s = _settings(TELEGRAM_ALLOWED_USER_ID=5555)
