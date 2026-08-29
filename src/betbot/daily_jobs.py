@@ -634,7 +634,38 @@ async def run_result_alerts(
     prediction REVEALED (``has_revealed`` True) — the operator always. After the
     batch for a fixture completes it is flagged ``result_notified`` so it never
     re-sends. Returns total messages delivered. Injected fns keep it testable.
+
+    HIGH-CONVICTION GATE (result path). To keep the RESULT path consistent with
+    the PRE-MATCH path by construction, each pending fixture is filtered through
+    the SAME predicate — :func:`betbot.main.high_conf_alert_passes` — reading the
+    STORED prediction triple resolved via ``prediction_fn``:
+
+      * ``settings.high_conf_alerts_only`` OFF: the predicate returns ``True``
+        without touching the prediction, so EVERY settled fixture alerts and a
+        missing prediction is harmless — byte-identical to the legacy behaviour.
+      * ON: a fixture alerts iff its stored top-pick probability clears
+        ``settings.high_conf_alert_min_p`` AND the top pick is NOT the draw
+        (exactly the pre-match band). A fixture with NO stored prediction could
+        not have cleared the pre-match gate, so it is SUPPRESSED (never
+        dereferenced). No second config knob is introduced — one concept, one
+        gate.
+
+    NOTIFIED-FLAG DECISION: a SUPPRESSED fixture is STILL flagged
+    ``result_notified`` (it is consumed, just not sent). Leaving it unflagged
+    would re-queue it on every run and grow an unbounded pending backlog that is
+    re-filtered forever — the silent-death failure mode this path must avoid.
+    Marking it also mirrors the pre-match path, where a suppressed fixture is
+    simply absent from the plan and the coverage watchdog treats it as COVERED
+    (not a missing alert). So here ``result_notified`` means "handled by the
+    result path" — whether by a send or a deliberate suppression. A consequence:
+    a fixture suppressed while the flag was ON is not retroactively alerted if
+    the flag is later turned OFF (its outcome is already consumed) — symmetric
+    with the pre-match path, whose scheduled fire time is likewise long gone.
+    Every suppression is logged (``result_alert_suppressed_low_conf`` per
+    fixture + a ``result_alerts_suppressed_total`` count) so it can never die
+    silently the way the alert scheduler once did.
     """
+    from betbot.main import high_conf_alert_passes
     from betbot.notify import send_telegram_to
     from betbot.storage.repos import (
         mark_result_notified,
@@ -656,8 +687,28 @@ async def run_result_alerts(
     users = users_fn()
     operator_id = settings.telegram_allowed_user_id
     sent = 0
+    suppressed = 0
     for row in pending:
         pred = prediction_fn(row.fixture_id)
+
+        # Gate the RESULT path through the SAME predicate as the pre-match path
+        # so the two agree by construction. When high_conf_alerts_only is OFF
+        # the predicate returns True WITHOUT reading pred, so a missing
+        # prediction still alerts (legacy behaviour). When ON, a fixture with no
+        # stored prediction could not have cleared the pre-match gate, so it is
+        # suppressed rather than dereferenced (a None pred must not raise here).
+        if pred is None:
+            passes = not getattr(settings, "high_conf_alerts_only", False)
+        else:
+            passes = high_conf_alert_passes(settings, pred)[0]
+        if not passes:
+            # Consume the suppressed fixture (mark notified) so it is never
+            # re-queued — see the NOTIFIED-FLAG DECISION in the docstring.
+            mark_notified_fn(row.fixture_id)
+            suppressed += 1
+            log.info("result_alert_suppressed_low_conf", fixture_id=row.fixture_id)
+            continue
+
         home = pred.home_team if pred is not None else "Home"
         away = pred.away_team if pred is not None else "Away"
         body = "*⚽ Result*\n\n" + format_result(row, home, away)
@@ -686,6 +737,8 @@ async def run_result_alerts(
         log.info(
             "result_alert_sent", fixture_id=row.fixture_id, delivered=len(audience),
         )
+    if suppressed:
+        log.info("result_alerts_suppressed_total", count=suppressed)
     return sent
 
 

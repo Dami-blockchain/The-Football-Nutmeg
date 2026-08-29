@@ -418,3 +418,150 @@ async def test_lineup_service_does_not_cache_empty_day_list():
     # …and the good result IS cached.
     assert len(await svc._day_matches("La Liga", "2026-08-16")) == 1
     assert hl.calls == 2
+
+
+# ----------------------------------------------------------------------
+# Result-alert HIGH-CONVICTION gate — the result path must agree with the
+# pre-match path by construction (reuses main.high_conf_alert_passes).
+# ----------------------------------------------------------------------
+class _GatePred:
+    """Minimal stored-prediction stand-in carrying the H/D/A triple + names."""
+
+    def __init__(self, home, away, ph, pd, pa):
+        self.home_team = home
+        self.away_team = away
+        self.p_home = ph
+        self.p_draw = pd
+        self.p_away = pa
+
+
+def _notified_flag(fixture_id):
+    """Read result_notified straight from the DB for the given fixture."""
+    from betbot.storage.db import session_scope
+
+    with session_scope() as s:
+        row = (
+            s.query(PredictionOutcome)
+            .filter(PredictionOutcome.fixture_id == fixture_id)
+            .one()
+        )
+        return row.result_notified
+
+
+async def test_result_gate_off_alerts_everything(db, settings, monkeypatch):
+    # Flag OFF (the fixture default): a LOW-confidence, DRAW-topped fixture that
+    # would fail the gate must STILL alert — byte-identical legacy behaviour.
+    from betbot import daily_jobs
+
+    assert settings.high_conf_alerts_only is False  # guard the premise
+    _seed_outcome(701)
+    record_reveal(111, 701, charged=False)
+    object.__setattr__(settings, "telegram_allowed_user_id", 999)
+
+    preds = {701: _GatePred("A", "B", 0.30, 0.45, 0.25)}  # top pick DRAW, p<0.65
+    sent: list[int] = []
+
+    async def fake_send(s, chat_id, text):
+        sent.append(chat_id)
+        return True
+
+    n = await daily_jobs.run_result_alerts(
+        settings, send_fn=fake_send,
+        users_fn=lambda: [_User(111)],
+        prediction_fn=lambda fid: preds.get(fid),
+    )
+    assert set(sent) == {999, 111}  # operator + revealed user both alerted
+    assert n == 2
+    assert _notified_flag(701) is True  # consumed as usual
+
+
+async def test_result_gate_on_only_high_conf_non_draw_alerts(db, settings, monkeypatch):
+    # Flag ON: three settled fixtures — one clears the gate, two do not
+    # (one low-p, one high-p but DRAW-topped). Only the clearing one alerts;
+    # the two suppressed ones are marked notified so they never re-queue.
+    from betbot import daily_jobs
+
+    object.__setattr__(settings, "high_conf_alerts_only", True)
+    object.__setattr__(settings, "high_conf_alert_min_p", 0.65)
+    object.__setattr__(settings, "telegram_allowed_user_id", 999)
+
+    _seed_outcome(801)  # PASS: HOME 0.72
+    _seed_outcome(802)  # FAIL: top p 0.50 (< 0.65)
+    _seed_outcome(803)  # FAIL: DRAW-topped even though 0.70
+    for fid in (801, 802, 803):
+        record_reveal(111, fid, charged=False)
+
+    preds = {
+        801: _GatePred("Arsenal", "Spurs", 0.72, 0.18, 0.10),
+        802: _GatePred("C", "D", 0.50, 0.30, 0.20),
+        803: _GatePred("E", "F", 0.20, 0.70, 0.10),
+    }
+    sent: list[tuple[int, str]] = []
+
+    async def fake_send(s, chat_id, text):
+        sent.append((chat_id, text))
+        return True
+
+    n = await daily_jobs.run_result_alerts(
+        settings, send_fn=fake_send,
+        users_fn=lambda: [_User(111)],
+        prediction_fn=lambda fid: preds.get(fid),
+    )
+    # Only fixture 801 alerted (operator + revealed user = 2 messages).
+    assert n == 2
+    assert {cid for cid, _ in sent} == {999, 111}
+    assert all("Arsenal" in body for _, body in sent)  # only the passing fixture
+    # All three are flagged notified: the passing one after send, the two
+    # suppressed ones as a deliberate consume (no backlog).
+    assert _notified_flag(801) is True
+    assert _notified_flag(802) is True
+    assert _notified_flag(803) is True
+
+
+async def test_result_gate_on_missing_prediction_suppressed_and_consumed(
+    db, settings
+):
+    # Flag ON + NO stored prediction: cannot have cleared the pre-match gate,
+    # so it is suppressed WITHOUT raising, and still marked notified.
+    from betbot import daily_jobs
+
+    object.__setattr__(settings, "high_conf_alerts_only", True)
+    object.__setattr__(settings, "telegram_allowed_user_id", 999)
+    _seed_outcome(901)
+    record_reveal(111, 901, charged=False)
+
+    async def _boom_send(s, chat_id, text):
+        raise AssertionError("missing-prediction fixture must not alert when gated")
+
+    n = await daily_jobs.run_result_alerts(
+        settings, send_fn=_boom_send,
+        users_fn=lambda: [_User(111)],
+        prediction_fn=lambda fid: None,  # no stored prediction
+    )
+    assert n == 0
+    assert _notified_flag(901) is True  # consumed, never re-queues
+
+
+async def test_result_gate_off_missing_prediction_still_alerts(db, settings):
+    # Flag OFF + None prediction must NOT raise and must still alert with the
+    # "Home"/"Away" placeholders (legacy behaviour preserved end to end).
+    from betbot import daily_jobs
+
+    assert settings.high_conf_alerts_only is False
+    object.__setattr__(settings, "telegram_allowed_user_id", 999)
+    _seed_outcome(1001)
+
+    sent: list[tuple[int, str]] = []
+
+    async def fake_send(s, chat_id, text):
+        sent.append((chat_id, text))
+        return True
+
+    n = await daily_jobs.run_result_alerts(
+        settings, send_fn=fake_send,
+        users_fn=lambda: [],
+        prediction_fn=lambda fid: None,
+    )
+    assert n == 1  # operator only
+    assert "Home" in sent[0][1] and "Away" in sent[0][1]
+    assert _notified_flag(1001) is True
