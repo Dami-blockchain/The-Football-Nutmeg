@@ -377,6 +377,50 @@ def test_matchday_notice_no_fixtures_returns_none():
     assert render_matchday_notice(_tg_settings_stub(), [], date(2026, 8, 1)) is None
 
 
+def test_matchday_notice_gate_on_advertises_prediction_only_for_high_conf():
+    """Gate ON (option b): the high-conf fixture carries the 🔮 prediction time;
+    the low-conf one is still LISTED (free schedule) but promises no prediction
+    that will never arrive. Same predicate as the alert/paywall paths."""
+    s = _hc_settings_stub()
+    hi = _hp(1, "Man City")   # top pick 0.72 >= 0.65 -> qualifies
+    lo = _lp(2, "Burnley")    # 0.39 < 0.65 -> listed, no prediction promise
+    text = render_matchday_notice(s, [hi, lo], date(2026, 8, 1))
+    # Both fixtures are still on the schedule.
+    assert "Man City (H)" in text
+    assert "Burnley (H)" in text
+    # Exactly ONE prediction promise (the high-conf fixture), and one lineup
+    # update — the low-conf line carries KO only.
+    assert text.count("🔮 prediction at") == 1
+    assert text.count("confirmed-lineup update") == 1
+    # Honest footer, and no probability leakage.
+    assert "only for the high-confidence matches" in text
+    assert "%" not in text
+
+
+def test_matchday_notice_gate_on_zero_qualifying_promises_nothing():
+    """Gate ON, an all-low-conf card (common at 0.65): the schedule is still
+    sent, but NOTHING advertises a prediction time, and the footer says so."""
+    text = render_matchday_notice(
+        _hc_settings_stub(), [_lp(1, "Inter"), _lp(2, "Milan")], date(2026, 8, 1)
+    )
+    assert text is not None                       # schedule still broadcast
+    assert "Inter (H)" in text and "Milan (H)" in text
+    assert "🔮 prediction at" not in text         # nothing promised
+    assert "confirmed-lineup update" not in text
+    assert "No high-confidence calls in today's card" in text
+
+
+def test_matchday_notice_gate_off_advertises_every_fixture():
+    """Flag OFF: every fixture (even sub-threshold) carries the prediction time
+    and the ORIGINAL footer — byte-identical to the pre-gate notice."""
+    text = render_matchday_notice(
+        _tg_settings_stub(), [_lp(1, "Inter"), _lp(2, "Milan")], date(2026, 8, 1)
+    )
+    assert text.count("🔮 prediction at") == 2    # both advertised
+    assert "An early model prediction is sent per match" in text  # original footer
+    assert "high-confidence" not in text
+
+
 async def test_run_matchday_notice_broadcasts_free_no_ledger(db, tmp_path):
     s = _tg_settings(tmp_path)
     u = _paying_user(tmp_path, tid=901)  # a real, post-trial user

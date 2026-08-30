@@ -212,7 +212,13 @@ def test_scheduling_pass_stays_silent_when_the_only_omission_is_suppressed(
     jobs = _daemon_jobs(monkeypatch, s)
     rescan = next(j for j in jobs if j.id == "reschedule_kickoff_alerts")
 
-    preds = [_pred(1, 0.72, 0.18, 0.10), _pred(2, 0.50, 0.30, 0.20)]
+    # The scheduling pass reads the WALL clock (datetime.now), NOT the frozen
+    # module NOW above, so fixtures must kick off in the real future or every
+    # job is dropped as past-time and nothing schedules — scheduled=0 for the
+    # WRONG reason. Anchor to now, exactly as the healthy sibling in
+    # test_scheduler_jobs does (kickoff = now + 6h).
+    _ko = datetime.now(timezone.utc) + timedelta(hours=6)
+    preds = [_pred(1, 0.72, 0.18, 0.10, ko=_ko), _pred(2, 0.50, 0.30, 0.20, ko=_ko)]
     monkeypatch.setattr(
         main, "predictions_for_kickoff_range", lambda _st, _en: preds
     )
@@ -245,9 +251,13 @@ def test_fire_time_recheck_suppresses_when_flag_flips_on(monkeypatch, settings):
     # Schedule with the gate OFF so the fixture gets a job at all.
     jobs = _daemon_jobs(monkeypatch, settings)
     rescan = next(j for j in jobs if j.id == "reschedule_kickoff_alerts")
+    # Wall-clock anchor (the rescan drops past-time jobs; a frozen-NOW kickoff
+    # would schedule nothing to later re-check). See the note in the scheduling
+    # pass test above.
+    _ko = datetime.now(timezone.utc) + timedelta(hours=6)
     monkeypatch.setattr(
         main, "predictions_for_kickoff_range",
-        lambda _st, _en: [_pred(999, 0.72, 0.18, 0.10)],
+        lambda _st, _en: [_pred(999, 0.72, 0.18, 0.10, ko=_ko)],
     )
     sched = _RecordingScheduler()
     asyncio.run(rescan.func(sched, *rescan.args[1:]))
@@ -436,9 +446,12 @@ def test_scheduling_headline_suppressed_is_zero_when_flag_off(monkeypatch, setti
     )
     jobs = _daemon_jobs(monkeypatch, settings)  # gate OFF
     rescan = next(j for j in jobs if j.id == "reschedule_kickoff_alerts")
+    # Wall-clock anchor so the rescan actually schedules (early + late); a
+    # frozen-NOW kickoff is past-time now and would drop both jobs. See above.
+    _ko = datetime.now(timezone.utc) + timedelta(hours=6)
     monkeypatch.setattr(
         main, "predictions_for_kickoff_range",
-        lambda _st, _en: [_pred(1, 0.40, 0.35, 0.25)],
+        lambda _st, _en: [_pred(1, 0.40, 0.35, 0.25, ko=_ko)],
     )
     asyncio.run(rescan.func(_RecordingScheduler(), *rescan.args[1:]))
     headline = [kw for ev, kw in events if ev == "prematch_alerts_scheduled"]

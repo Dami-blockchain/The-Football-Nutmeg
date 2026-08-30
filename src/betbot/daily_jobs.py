@@ -247,20 +247,31 @@ def commit_reveals(user, reveals: list[tuple[int, bool]]) -> None:
 def render_matchday_notice(settings, fixtures, day) -> str | None:
     """Build the FREE morning heads-up body, or ``None`` when there are none.
 
-    One line per fixture, stating BOTH pre-match alert times (the two-alert
-    model): ``*Home (H) v Away (A)* — KO HH:MM · 🔮 prediction at HH:MM,
-    confirmed-lineup update ~HH:MM``. Times are the **Africa/Nairobi wall
-    clock** (EAT). The early prediction time is
+    Every kicking-off fixture is listed (this is a FREE schedule, not a buy
+    surface), but the two pre-match alert times are advertised ONLY for the
+    fixtures that will actually produce an alert under the high-conviction gate
+    (:func:`betbot.main.high_conf_alert_passes` — the SAME predicate the
+    scheduler and paywall use, so NO new threshold knob is introduced). A
+    qualifying line reads ``*Home (H) v Away (A)* — KO HH:MM · 🔮 prediction at
+    HH:MM, confirmed-lineup update ~HH:MM``; a non-qualifying line carries the
+    kickoff only, promising nothing it will not deliver. Times are the
+    **Africa/Nairobi wall clock** (EAT); the early time is
     ``kickoff - early_alert_lead_minutes(competition)`` and the confirmed-lineup
     time is ``kickoff - lineup_confirm_lead_minutes()`` — the SAME leads the
-    scheduler uses to fire the two alerts, so the stated times are the real
-    ones. Deliberately carries NO probabilities/edge/xG: the prediction can
-    still change once the confirmed XI is out.
+    scheduler fires on. Deliberately carries NO probabilities/edge/xG.
+
+    With ``settings.high_conf_alerts_only`` OFF the gate passes every fixture,
+    so every line carries the prediction time and the footer is byte-identical
+    to the pre-gate notice.
     """
     if not fixtures:
         return None
+    from betbot.main import high_conf_alert_passes
+
+    gate_on = getattr(settings, "high_conf_alerts_only", False)
     tz = ZoneInfo(REPORT_TZ)
     lines = [f"*⚽ Today's fixtures — {day.isoformat()}*", ""]
+    qualifying = 0
     for f in fixtures:
         ko = f.kickoff
         if ko.tzinfo is None:
@@ -271,14 +282,34 @@ def render_matchday_notice(settings, fixtures, day) -> str | None:
         ko_local = ko.astimezone(tz)
         early_local = (ko - timedelta(minutes=early_lead)).astimezone(tz)
         late_local = (ko - timedelta(minutes=late_lead)).astimezone(tz)
-        lines.append(
-            f"*{f.home_team} (H) v {f.away_team} (A)* — "
-            f"KO {ko_local:%H:%M} · 🔮 prediction at {early_local:%H:%M}, "
-            f"confirmed-lineup update ~{late_local:%H:%M}"
-        )
+        # Advertise the two alert times ONLY for fixtures that will actually
+        # alert under the gate. Flag OFF -> passes everything -> every line
+        # carries the prediction time (byte-identical to before). A fixture
+        # that will never alert is still listed but promised nothing.
+        if high_conf_alert_passes(settings, f)[0]:
+            qualifying += 1
+            lines.append(
+                f"*{f.home_team} (H) v {f.away_team} (A)* — "
+                f"KO {ko_local:%H:%M} · 🔮 prediction at {early_local:%H:%M}, "
+                f"confirmed-lineup update ~{late_local:%H:%M}"
+            )
+        else:
+            lines.append(
+                f"*{f.home_team} (H) v {f.away_team} (A)* — KO {ko_local:%H:%M}"
+            )
     lines.append("")
-    lines.append("_Times EAT. An early model prediction is sent per match, then "
-                 "a confirmed-XI update once the lineup is out._")
+    if not gate_on:
+        # Flag OFF: byte-identical to the pre-gate notice.
+        lines.append("_Times EAT. An early model prediction is sent per match, then "
+                     "a confirmed-XI update once the lineup is out._")
+    elif qualifying:
+        lines.append("_Times EAT. Predictions are sent only for the high-confidence "
+                     "matches marked 🔮 above; the rest are listed for your schedule "
+                     "only._")
+    else:
+        lines.append("_Times EAT. No high-confidence calls in today's card — this is a "
+                     "schedule only; predictions are sent only for high-confidence "
+                     "matches._")
     return "\n".join(lines)
 
 
