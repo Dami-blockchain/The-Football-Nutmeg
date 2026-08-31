@@ -40,8 +40,11 @@ DIV_TO_LEAGUE = {
 
 BASE_URL = "https://www.football-data.co.uk/mmz4281/{season}/{div}.csv"
 
-# Last 6 completed seasons (football-data.co.uk 4-digit form: "2324" = 2023-24).
-DEFAULT_SEASONS = ("2021", "2122", "2223", "2324", "2425", "2526")
+# Completed seasons PLUS the current one (football-data.co.uk 4-digit form:
+# "2324" = 2023-24; "2627" = 2026-27, published live from matchday 1). Adding
+# the current season is what lets the weekly re-seed advance in-season instead
+# of freezing ratings at the end of 2025-26 every Monday.
+DEFAULT_SEASONS = ("2021", "2122", "2223", "2324", "2425", "2526", "2627")
 
 
 def _iso_date(raw: str) -> str | None:

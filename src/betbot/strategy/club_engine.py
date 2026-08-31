@@ -191,6 +191,53 @@ class ClubStrategyEngine:
         probs = log_pool(components)
         return calibrate(probs, self._calibrators), home_xg, away_xg
 
+    def dual_triples(
+        self,
+        home_name: str,
+        away_name: str,
+        *,
+        home_rating_adj: float = 0.0,
+        away_rating_adj: float = 0.0,
+        form_probs: tuple[float, float, float] | None = None,
+    ) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:
+        """``(pure_glicko_triple, RAW pre-calibration ensemble_triple)`` or None.
+
+        Returns ``None`` unless BOTH sides are rated — i.e. exactly when
+        :meth:`predict` prices off the club ensemble rather than deferring to the
+        naive form engine — so the dual-log only ever records real ensemble
+        predictions. The second triple is the log-pool BEFORE :func:`calibrate`;
+        logging the RAW ensemble (not the served, calibrated one) is what lets
+        the calibration fit train on the same distribution it will later
+        transform, avoiding a train/serve skew
+        (scripts/fit_ensemble_calibration_club.py).
+
+        The component assembly mirrors :meth:`probability_triple` exactly
+        (minus the final calibrate step); keep the two in sync.
+        """
+        if not self.is_rated(home_name, away_name):
+            return None
+        s = self._settings
+        rh = self._get_rating(home_name)
+        ra = self._get_rating(away_name)
+        if home_rating_adj:
+            rh = dataclasses.replace(rh, rating=rh.rating + home_rating_adj)
+        if away_rating_adj:
+            ra = dataclasses.replace(ra, rating=ra.rating + away_rating_adj)
+        glicko_probs = match_probabilities(
+            rh, ra, home_field_mu=s.glicko_club_home_mu,
+            draw_rho=s.glicko_club_draw_rho,
+        )
+        components: list[tuple[float, tuple[float, float, float]]] = [
+            (s.club_weight_glicko, glicko_probs)
+        ]
+        if self._dc_params is not None:
+            hk, ak = self._dc_key(home_name), self._dc_key(away_name)
+            components.append((s.club_weight_dc, dc.match_probabilities(
+                self._dc_params, hk, ak, home_field=True)))
+        if s.club_weight_form > 0 and form_probs is not None:
+            components.append((s.club_weight_form, form_probs))
+        return glicko_probs, log_pool(components)
+
     def predict(
         self,
         fixture_form: FixtureForm,

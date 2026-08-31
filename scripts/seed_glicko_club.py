@@ -33,7 +33,7 @@ from pathlib import Path
 from betbot.config import LEAGUE_CODES, get_settings
 from betbot.logging import configure_logging, get_logger
 from betbot.storage.db import init_engine
-from betbot.storage.repos import upsert_rating
+from betbot.storage.repos import upsert_rating_if_fresher
 from betbot.strategy.glicko import Glicko2Rating, update_rating
 
 log = get_logger("seed_glicko_club")
@@ -129,7 +129,8 @@ async def _alias_to_footballdata(ratings: dict[str, Glicko2Rating], settings) ->
                 if match is not None:
                     # Always store the rating under the LIVE football-data.org
                     # name — that's the key the scoring loop looks up.
-                    upsert_rating(name, ratings[match], team_id=t.get("id"))
+                    upsert_rating_if_fresher(
+                        name, ratings[match], team_id=t.get("id"))
                     name_map[nf] = normalize(match)
                     log.info("club_glicko_alias_seeded", league=league,
                              fd_team=name, dataset_team=match,
@@ -160,8 +161,11 @@ def main() -> None:
 
     rows = _load_rows(args.csv, args.years_back)
     ratings = _replay(rows, settings)
+    # MERGE, don't SET: never regress a rating the in-season settlement
+    # nudge has advanced past what this CSV knows (see
+    # repos.upsert_rating_if_fresher).
     for name, r in ratings.items():
-        upsert_rating(name, r)
+        upsert_rating_if_fresher(name, r)
     print(f"seeded {len(ratings)} club ratings from {len(rows)} matches "
           f"(last {args.years_back} yrs)")
 

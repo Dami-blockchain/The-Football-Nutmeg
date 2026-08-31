@@ -58,6 +58,7 @@ from betbot.storage.repos import (
     prediction_for_fixture,
     predictions_for_kickoff_range,
     reset_kill_switch,
+    upsert_model_prediction,
     upsert_prediction,
 )
 from betbot.strategy.engine import StrategyEngine
@@ -272,6 +273,30 @@ async def _score_and_log_one(
     )
 
     pred_id = upsert_prediction(prediction, kickoff=kickoff)
+
+    # Passive dual-log (model_predictions): record the pure-Glicko challenger
+    # vs the RAW pre-calibration ensemble for this CLUB fixture. Re-arms the
+    # head-to-head RPS ledger that froze when 6abc132 removed the WC/Hedge
+    # engine, and stores the raw triples the calibration fit trains on. Purely
+    # observational — it never changes the prediction the daemon serves — and
+    # best-effort, so it can never raise into the scoring loop. dual_triples
+    # exists only on the club engine and returns None for unrated ties, so CL /
+    # naive-form fixtures are naturally skipped.
+    _dual = getattr(engine, "dual_triples", None)
+    if _dual is not None:
+        try:
+            _triples = _dual(prediction.home_team, prediction.away_team)
+            if _triples is not None:
+                _g, _e = _triples
+                upsert_model_prediction(
+                    fixture_id=fixture_id,
+                    home_team=prediction.home_team,
+                    away_team=prediction.away_team,
+                    glicko=_g, ensemble=_e,
+                    w_glicko=0.0, w_ensemble=1.0,
+                )
+        except Exception as e:  # noqa: BLE001 — dual-log must never break scoring
+            log.warning("dual_log_write_failed", fixture_id=fixture_id, error=str(e))
 
     # Predictions-only: recos are NEVER suppressed (there is no trading and no
     # drawdown kill switch gating them). They always flow.

@@ -59,16 +59,16 @@ log = get_logger(__name__)
 #: Does ANY code path in this build write a challenger row to
 #: ``model_predictions``?
 #:
-#: It does not. ``6abc132`` removed the dispersion challenger, the MOV
-#: challenger and the Hedge model-selection layer together with the World Cup
-#: engine that hosted them; ``grep -rn "model_predictions" src`` now finds only
-#: the ORM model and its migrations.
+#: It does now. ``6abc132`` removed the dispersion/MOV challengers and the
+#: Hedge layer with the World Cup engine, leaving this table dead. It was
+#: re-armed for the CLUB engine: the scoring loop's dual-log hook
+#: (``betbot.main._score_and_log_one`` -> ``repos.upsert_model_prediction``)
+#: records the pure-Glicko challenger vs the raw ensemble for every rated
+#: club fixture, and settlement scores both with RPS.
 #:
-#: This is a BUILD FACT and is deliberately not a ``Settings`` field: no ``.env``
-#: edit can make a deleted challenger start logging. Whoever rebuilds the
-#: dual-log for the club engine flips this in the SAME commit that adds the
-#: write, which is what arms the staleness alarm below.
-CHALLENGER_DUAL_LOG_ENABLED: bool = False
+#: Flipped in the SAME commit that added that write, which is what arms the
+#: staleness alarm below (a write path that silently dies is now caught).
+CHALLENGER_DUAL_LOG_ENABLED: bool = True
 
 #: How far the dual log may lag the main prediction path before it is stale.
 #: Only meaningful once :data:`CHALLENGER_DUAL_LOG_ENABLED` is True. Generous
