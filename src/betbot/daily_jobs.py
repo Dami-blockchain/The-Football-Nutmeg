@@ -507,8 +507,8 @@ async def report_lineup_gap(
 #: "display drift" case). The result is still sent — see run_result_alerts,
 #: which honours the alert-time promise via fixture_was_ever_revealed.
 HIGH_CONF_DOWNGRADE_NOTE = (
-    "ℹ️ Update: since the earlier alert, a fresh model run has eased "
-    "this call below our high-confidence bar. We're still sending it, and the "
+    "ℹ️ Update: since this call was first flagged, a fresh model run has eased "
+    "it below our high-confidence bar. We're still sending it, and the "
     "full-time result will follow."
 )
 
@@ -864,6 +864,15 @@ async def run_result_alerts(
                 continue
             if already_revealed_fn(u.telegram_user_id, row.fixture_id):
                 audience.append(u.telegram_user_id)
+
+        if not audience:
+            # No operator and nobody revealed it: the audience cannot grow after
+            # settlement, so retrying is pointless. Consume it (mark notified) so
+            # it never re-queues, rather than logging all_sends_failed every 2h
+            # for 3 days over a send that can never happen.
+            mark_notified_fn(row.fixture_id)
+            log.info("result_alert_no_audience", fixture_id=row.fixture_id)
+            continue
 
         any_success = False
         for uid in audience:
