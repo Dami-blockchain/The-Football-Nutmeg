@@ -756,7 +756,11 @@ async def run_result_alerts(
     Marking it also mirrors the pre-match path, where a suppressed fixture is
     simply absent from the plan and the coverage watchdog treats it as COVERED
     (not a missing alert). So here ``result_notified`` means "handled by the
-    result path" — whether by a send or a deliberate suppression. A consequence:
+    result path" — a DELIBERATE SUPPRESSION, or a broadcast in which AT LEAST
+    ONE recipient actually received the result. On a TOTAL send failure (every
+    recipient errored) the flag is left False so the 2-hourly pass retries the
+    fixture inside the 3-day pending window rather than recording a result
+    "sent" that nobody got. A consequence:
     a fixture suppressed while the flag was ON is not retroactively alerted if
     the flag is later turned OFF (its outcome is already consumed) — symmetric
     with the pre-match path, whose scheduled fire time is likewise long gone.
@@ -839,20 +843,33 @@ async def run_result_alerts(
             if already_revealed_fn(u.telegram_user_id, row.fixture_id):
                 audience.append(u.telegram_user_id)
 
+        any_success = False
         for uid in audience:
             try:
                 if await send(settings, uid, body):
                     sent += 1
+                    any_success = True
             except Exception as e:  # noqa: BLE001 — one bad send mustn't drop the rest
                 log.warning(
                     "result_alert_send_failed",
                     telegram_user_id=uid, fixture_id=row.fixture_id, error=str(e),
                 )
-        # Flag AFTER attempting the whole audience so a fixture is broadcast once.
-        mark_notified_fn(row.fixture_id)
-        log.info(
-            "result_alert_sent", fixture_id=row.fixture_id, delivered=len(audience),
-        )
+        # Flag ONLY once at least one recipient actually received it, so
+        # ``result_notified`` never lies. On a TOTAL send failure the flag is
+        # left False and the fixture stays pending for the 2-hourly retry inside
+        # the 3-day window (outcomes_pending_result_alert) — better a retry than
+        # a result marked "sent" that nobody got.
+        if any_success:
+            mark_notified_fn(row.fixture_id)
+            log.info(
+                "result_alert_sent", fixture_id=row.fixture_id, delivered=len(audience),
+            )
+        else:
+            log.warning(
+                "result_alert_all_sends_failed",
+                fixture_id=row.fixture_id, audience=len(audience),
+                note="left un-notified for retry on the next 2-hourly pass",
+            )
     if suppressed:
         log.info("result_alerts_suppressed_total", count=suppressed)
     return sent
