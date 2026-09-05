@@ -721,20 +721,33 @@ async def run_result_alerts(
     batch for a fixture completes it is flagged ``result_notified`` so it never
     re-sends. Returns total messages delivered. Injected fns keep it testable.
 
-    HIGH-CONVICTION GATE (result path). To keep the RESULT path consistent with
-    the PRE-MATCH path by construction, each pending fixture is filtered through
-    the SAME predicate — :func:`betbot.main.high_conf_alert_passes` — reading the
-    STORED prediction triple resolved via ``prediction_fn``:
+    HIGH-CONVICTION GATE (result path). The old claim that this path agreed
+    with the PRE-MATCH path "by construction" was FALSE: the alert fires on the
+    row as it stood at alert time, but ``upsert_prediction`` overwrites
+    ``p_home/p_draw/p_away`` IN PLACE on every later rescore, so a fixture that
+    cleared the 0.65 bar when we alerted can read BELOW it by settlement (real
+    cases 2026-09-04: Stuttgart 0.654->0.617, Ipswich v Liverpool AWAY
+    0.691->0.639 — both alerted, both correct, both silently dropped their
+    result). The governing product rule is "high confidence AT ALERT TIME": if
+    we alerted it, we owe the outcome. So each pending fixture passes iff::
+
+        high_conf_alert_passes(live stored row)  OR  fixture_was_ever_revealed
+
+    exactly the ``passes OR already_revealed`` shape :func:`high_conf_visible`
+    already uses. NO second threshold, hysteresis band, or grace margin is
+    introduced — the ONE 0.65 gate, plus an honest memory of what we alerted.
 
       * ``settings.high_conf_alerts_only`` OFF: the predicate returns ``True``
         without touching the prediction, so EVERY settled fixture alerts and a
         missing prediction is harmless — byte-identical to the legacy behaviour.
-      * ON: a fixture alerts iff its stored top-pick probability clears
-        ``settings.high_conf_alert_min_p`` AND the top pick is NOT the draw
-        (exactly the pre-match band). A fixture with NO stored prediction could
-        not have cleared the pre-match gate, so it is SUPPRESSED (never
-        dereferenced). No second config knob is introduced — one concept, one
-        gate.
+      * ON: a fixture alerts iff its live stored top-pick probability clears
+        ``settings.high_conf_alert_min_p`` and is NOT the draw, OR the fixture
+        was ever revealed to any user (the drift case above). A fixture that
+        was never revealed AND whose stored row is below the bar (or has no
+        stored prediction — it could not have cleared the pre-match gate) is
+        SUPPRESSED (never dereferenced). Each honoured-on-drift fixture logs
+        ``result_alert_honoured_prior_reveal`` so the drift population stays
+        countable.
 
     NOTIFIED-FLAG DECISION: a SUPPRESSED fixture is STILL flagged
     ``result_notified`` (it is consumed, just not sent). Leaving it unflagged
@@ -754,6 +767,7 @@ async def run_result_alerts(
     from betbot.main import high_conf_alert_passes
     from betbot.notify import send_telegram_to
     from betbot.storage.repos import (
+        fixture_was_ever_revealed,
         mark_result_notified,
         outcomes_pending_result_alert,
     )
@@ -777,19 +791,35 @@ async def run_result_alerts(
     for row in pending:
         pred = prediction_fn(row.fixture_id)
 
-        # Gate the RESULT path through the SAME predicate as the pre-match path
-        # so the two agree by construction. When high_conf_alerts_only is OFF
-        # the predicate returns True WITHOUT reading pred, so a missing
-        # prediction still alerts (legacy behaviour). When ON, a fixture with no
-        # stored prediction could not have cleared the pre-match gate, so it is
-        # suppressed rather than dereferenced (a None pred must not raise here).
+        # Gate the RESULT path on the LIVE stored row, but honour the alert-time
+        # promise: upsert_prediction overwrites p_* in place on rescore, so the
+        # live row can have drifted below the bar since we alerted. When
+        # high_conf_alerts_only is OFF the predicate returns True WITHOUT reading
+        # pred, so a missing prediction still alerts (legacy behaviour). When ON,
+        # a fixture with no stored prediction could not have cleared the
+        # pre-match gate (a None pred must not raise here). The OR-clause
+        # (fixture_was_ever_revealed) mirrors high_conf_visible and rescues a
+        # drifted-but-alerted fixture — see the HIGH-CONVICTION GATE docstring.
         if pred is None:
-            passes = not getattr(settings, "high_conf_alerts_only", False)
+            gate_passes = not getattr(settings, "high_conf_alerts_only", False)
         else:
-            passes = high_conf_alert_passes(settings, pred)[0]
-        if not passes:
-            # Consume the suppressed fixture (mark notified) so it is never
-            # re-queued — see the NOTIFIED-FLAG DECISION in the docstring.
+            gate_passes = high_conf_alert_passes(settings, pred)[0]
+        ever_revealed = fixture_was_ever_revealed(row.fixture_id)
+        if not gate_passes and ever_revealed:
+            # Below the bar now, but we alerted it — the promise is "high
+            # confidence AT ALERT TIME", so we still owe the result. Distinct
+            # event so the drift population is countable later. A revealed
+            # fixture with no stored prediction row lands here too (has_pred
+            # False): logged, never dereferenced, never raised.
+            log.info(
+                "result_alert_honoured_prior_reveal",
+                fixture_id=row.fixture_id,
+                has_pred=pred is not None,
+            )
+        if not gate_passes and not ever_revealed:
+            # Never alerted AND below the bar (or no stored prediction): consume
+            # it (mark notified) so it is never re-queued — see the
+            # NOTIFIED-FLAG DECISION in the docstring.
             mark_notified_fn(row.fixture_id)
             suppressed += 1
             log.info("result_alert_suppressed_low_conf", fixture_id=row.fixture_id)
