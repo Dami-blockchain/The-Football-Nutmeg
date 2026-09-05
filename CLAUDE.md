@@ -919,3 +919,10 @@ strategy has nothing to trade there. **Polymarket is the live venue.**
   the droplet, not the GitHub API.
 - **Strategy honesty:** the Qatar-2022 backtest favourite-hit rate (54.7%) is
   accuracy, NOT a proven edge over market prices. Don't claim the strategy is ±EV.
+- **Testing in a git worktree:** a plain `pytest` inside a `git worktree`
+  imports the LIVE `~/tfsm` tree (the editable install `.pth` points at
+  `/home/tfsm/tfsm/src`), so worktree-only test files fail collection and a
+  review can get a FALSE pass. Always run the worktree suite with its own src on
+  the path:
+  `cd <worktree> && PYTHONPATH=$PWD/src ~/tfsm/.venv/bin/python -m pytest -q`
+  (same for `ruff`). This shadows the editable install with the branch code.
