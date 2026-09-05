@@ -782,3 +782,86 @@ async def test_prematch_no_drift_note_when_above_bar(db, settings):
     sent = await _capture_prematch(settings, pred)
     assert len(sent) == 1
     assert HIGH_CONF_DOWNGRADE_NOTE not in sent[0]
+
+# ----------------------------------------------------------------------
+# F2: empty audience is consumed, never retried on an impossible send.
+# ----------------------------------------------------------------------
+async def test_result_no_audience_is_consumed_not_retried(db, settings):
+    from betbot import daily_jobs
+
+    assert settings.high_conf_alerts_only is False
+    object.__setattr__(settings, "telegram_allowed_user_id", None)  # no operator
+    _seed_outcome(1106)  # revealed to nobody
+
+    sent: list[int] = []
+
+    async def fake_send(s, chat_id, text):
+        sent.append(chat_id)
+        return True
+
+    n = await daily_jobs.run_result_alerts(
+        settings, send_fn=fake_send, users_fn=lambda: [],
+        prediction_fn=lambda fid: None,
+    )
+    assert n == 0 and sent == []          # nobody to send to
+    assert _notified_flag(1106) is True   # consumed, not retried every 2h
+
+
+# ----------------------------------------------------------------------
+# F4: with NO lineup, the "lineup not yet confirmed" caveat and the drift
+# downgrade note both ride on adj_note (the f"{adj_note}\n{NOTE}" branch).
+# Assert the caveat precedes the note and both precede the team line.
+# ----------------------------------------------------------------------
+class _KickoffPred:
+    def __init__(self, fixture_id, home, away, ph, pd, pa, kickoff):
+        self.fixture_id = fixture_id
+        self.competition_code = "PL"
+        self.home_team = home
+        self.away_team = away
+        self.p_home = ph
+        self.p_draw = pd
+        self.p_away = pa
+        self.home_xg = None
+        self.away_xg = None
+        self.kickoff = kickoff
+
+
+async def test_prematch_drift_note_stacks_after_lineup_caveat(db, settings):
+    from betbot import daily_jobs
+    from betbot.daily_jobs import HIGH_CONF_DOWNGRADE_NOTE
+
+    object.__setattr__(settings, "high_conf_alerts_only", True)
+    object.__setattr__(settings, "high_conf_alert_min_p", 0.65)
+    object.__setattr__(settings, "telegram_allowed_user_id", 999)
+
+    ko = datetime(2026, 9, 6, 18, 30, tzinfo=timezone.utc)
+    pred = _KickoffPred(1203, "Stuttgart", "Augsburg", 0.617, 0.23, 0.153, ko)
+
+    sent: list[str] = []
+
+    async def fake_send(s, chat_id, text):
+        sent.append(text)
+        return True
+
+    async def noop_operator(*a, **k):
+        return True
+
+    async def lineup_fn(_baseline):
+        return (None, 0.0, 0.0, None)  # NO lineup -> caveat + downgrade stack
+
+    await daily_jobs.send_prediction_alert(
+        settings, pred.fixture_id,
+        send_fn=fake_send,
+        prediction_fn=lambda fid: pred,
+        lineup_fn=lineup_fn,
+        rescore_fn=None,
+        entitlement_fn=_free_operator_entitlement,
+        users_fn=lambda: [_User(999)],
+        operator_send_fn=noop_operator,
+    )
+    assert len(sent) == 1
+    body = sent[0]
+    caveat_i = body.index("lineup not yet confirmed")
+    note_i = body.index(HIGH_CONF_DOWNGRADE_NOTE)
+    team_i = body.index("Stuttgart (H)")
+    assert caveat_i < note_i < team_i
