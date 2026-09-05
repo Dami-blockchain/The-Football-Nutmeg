@@ -502,6 +502,17 @@ async def report_lineup_gap(
     )
 
 
+#: Plain, non-alarming note appended to a pre-match alert whose call has
+#: rescored BELOW the high-confidence bar since it was first alerted (the
+#: "display drift" case). The result is still sent — see run_result_alerts,
+#: which honours the alert-time promise via fixture_was_ever_revealed.
+HIGH_CONF_DOWNGRADE_NOTE = (
+    "ℹ️ Update: since the earlier alert, a fresh model run has eased "
+    "this call below our high-confidence bar. We're still sending it, and the "
+    "full-time result will follow."
+)
+
+
 async def send_prediction_alert(
     settings,
     fixture_id: int,
@@ -633,6 +644,17 @@ async def send_prediction_alert(
                 fixture_id=fixture_id,
                 note="stored row cleared the gate but the rescored row did not;"
                      " sending the standard body without the high-conf banner",
+            )
+            # Tell the reader plainly that the call has slipped below the bar
+            # since the earlier alert, and that the result still follows. Plumbed
+            # through the existing ``adj_note`` (appended, so a lineup caveat is
+            # kept) — the standard body already carries the "NO BET — below our
+            # confidence bar" line when the filter is live, and this reads
+            # coherently above it.
+            adj_note = (
+                f"{adj_note}\n{HIGH_CONF_DOWNGRADE_NOTE}"
+                if adj_note
+                else HIGH_CONF_DOWNGRADE_NOTE
             )
         else:
             try:
