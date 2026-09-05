@@ -28,13 +28,16 @@ Messages use Telegram Markdown (``parse_mode="Markdown"``), matching
 
 from __future__ import annotations
 
+from betbot.timefmt import eat_time
+
 
 def _kickoff_str(pred) -> str:
-    """Kickoff as ``HH:MM`` UTC; empty if absent."""
-    ko = getattr(pred, "kickoff", None)
-    if ko is None:
-        return ""
-    return ko.strftime("%H:%M")
+    """Kickoff as ``HH:MM EAT`` (Africa/Nairobi); empty if absent.
+
+    The stored kickoff is UTC; every user-facing surface shows EAT via the
+    shared :func:`betbot.timefmt.eat_time` helper.
+    """
+    return eat_time(getattr(pred, "kickoff", None))
 
 
 def _confidence_line(pred, settings=None) -> str:

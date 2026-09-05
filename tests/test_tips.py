@@ -39,7 +39,7 @@ def test_format_prediction_has_home_away_tags_probs_and_no_bet_line():
     assert "Arsenal (A)" in text
     # Model probabilities and kickoff are present.
     assert "H 39% / D 31% / A 30%" in text
-    assert "19:30" in text
+    assert "22:30 EAT" in text  # 19:30 UTC rendered in EAT (UTC+3)
     # Pure tipster: NO bet / no-bet / market / edge language anywhere.
     assert "Bet" not in text
     assert "NO BET" not in text
@@ -95,7 +95,7 @@ def test_format_locked_hides_probabilities():
     text = format_locked(_Pred())
     assert "Man City (H)" in text
     assert "Arsenal (A)" in text
-    assert "19:30" in text
+    assert "22:30 EAT" in text  # 19:30 UTC rendered in EAT (UTC+3)
     assert "🔒" in text
     assert "1 USDC" in text
     # No probabilities leak in the teaser.

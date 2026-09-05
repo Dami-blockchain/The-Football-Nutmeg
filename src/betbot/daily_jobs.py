@@ -41,6 +41,7 @@ from betbot.entitlement import entitlement_for
 from betbot.logging import get_logger
 from betbot.notify import notify_operator
 from betbot.scheduling import add_async_job
+from betbot.timefmt import to_eat
 from betbot.storage.repos import (
     has_revealed,
     high_conf_band_tally,
@@ -270,7 +271,6 @@ def render_matchday_notice(settings, fixtures, day) -> str | None:
     from betbot.main import high_conf_alert_passes
 
     gate_on = getattr(settings, "high_conf_alerts_only", False)
-    tz = ZoneInfo(REPORT_TZ)
     header = (
         f"*⚽ High-confidence calls — {day.isoformat()}*" if gate_on
         else f"*⚽ Today's fixtures — {day.isoformat()}*"
@@ -284,9 +284,9 @@ def render_matchday_notice(settings, fixtures, day) -> str | None:
         code = getattr(f, "competition_code", None)
         early_lead = settings.early_alert_lead_minutes(code)
         late_lead = settings.lineup_confirm_lead_minutes()
-        ko_local = ko.astimezone(tz)
-        early_local = (ko - timedelta(minutes=early_lead)).astimezone(tz)
-        late_local = (ko - timedelta(minutes=late_lead)).astimezone(tz)
+        ko_local = to_eat(ko)
+        early_local = to_eat(ko - timedelta(minutes=early_lead))
+        late_local = to_eat(ko - timedelta(minutes=late_lead))
         # Option (a): list ONLY fixtures that clear the high-conviction gate.
         # Flag OFF -> the predicate passes every fixture, so nothing is skipped
         # and this loop is byte-identical to the pre-gate notice. Flag ON -> a
