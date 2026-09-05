@@ -270,7 +270,7 @@ def test_the_announcement_carries_the_change_and_the_rollback():
     assert "unset BETBOT_MOV_FIX; systemctl restart tfsm" in body
     assert "Rollback" in body
     assert "ronaldo" in body
-    assert "2026-08-20 09:30 UTC" in body
+    assert "2026-08-20 12:30 EAT" in body  # 09:30 UTC shown in EAT
     assert "NOT yet applied" in body
 
 

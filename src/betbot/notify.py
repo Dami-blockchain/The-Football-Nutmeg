@@ -23,12 +23,13 @@ from __future__ import annotations
 import re
 import asyncio
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
 import httpx
 
 from betbot.logging import get_logger
+from betbot.timefmt import eat_datetime, eat_time
 
 log = get_logger(__name__)
 
@@ -173,13 +174,12 @@ def format_band_line(min_p: float, live_tally: tuple[int, int] | None) -> str:
 
 
 def _kickoff_eat(pred) -> str:
-    """Stored (UTC) kickoff rendered as ``HH:MM`` EAT (UTC+3, no DST); '' if absent."""
-    ko = getattr(pred, "kickoff", None)
-    if ko is None:
-        return ""
-    if ko.tzinfo is None:
-        ko = ko.replace(tzinfo=timezone.utc)
-    return ko.astimezone(timezone(timedelta(hours=3))).strftime("%H:%M")
+    """Stored (UTC) kickoff as bare ``HH:MM`` in EAT; '' if absent.
+
+    Bare (no label) because the one caller appends " EAT" itself. Uses the
+    shared named-zone helper rather than a hardcoded +3 offset.
+    """
+    return eat_time(getattr(pred, "kickoff", None), label=False)
 
 
 def _model_triple_line(pred, top_pick: str, market: str) -> str:
@@ -483,7 +483,7 @@ def format_change_announcement(
     rollback is part of the format because "how do we undo this" is the
     question that gets skipped at exactly the wrong moment.
     """
-    ts = (when or datetime.now(timezone.utc)).strftime("%Y-%m-%d %H:%M UTC")
+    ts = eat_datetime(when or datetime.now(timezone.utc))
     lines = [
         "*\U0001f6e0 Change announcement*",
         "",

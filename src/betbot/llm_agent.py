@@ -76,7 +76,7 @@ NO_KEY_MESSAGE = (
 )
 
 RATE_LIMIT_MESSAGE = (
-    "You've reached today's chat limit — it resets at midnight UTC. "
+    "You've reached today's chat limit — it resets at 03:00 EAT. "
     "Meanwhile the commands are always available: /predictions, /balance, "
     "/status."
 )

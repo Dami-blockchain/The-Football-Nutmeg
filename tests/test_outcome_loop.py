@@ -488,8 +488,10 @@ async def test_result_gate_on_only_high_conf_non_draw_alerts(db, settings, monke
     _seed_outcome(801)  # PASS: HOME 0.72
     _seed_outcome(802)  # FAIL: top p 0.50 (< 0.65)
     _seed_outcome(803)  # FAIL: DRAW-topped even though 0.70
-    for fid in (801, 802, 803):
-        record_reveal(111, fid, charged=False)
+    # Only the PASSING fixture (801) was revealed at alert time. 802/803 were
+    # never revealed, so with the drift fix they stay suppressible — the
+    # reveal-honouring OR-clause rescues only fixtures a user actually saw.
+    record_reveal(111, 801, charged=False)
 
     preds = {
         801: _GatePred("Arsenal", "Spurs", 0.72, 0.18, 0.10),
@@ -528,7 +530,8 @@ async def test_result_gate_on_missing_prediction_suppressed_and_consumed(
     object.__setattr__(settings, "high_conf_alerts_only", True)
     object.__setattr__(settings, "telegram_allowed_user_id", 999)
     _seed_outcome(901)
-    record_reveal(111, 901, charged=False)
+    # NOT revealed to anyone: a missing prediction that was never alerted
+    # cannot have cleared the pre-match gate, so it is suppressed.
 
     # RECORD sends rather than raising: run_result_alerts wraps each send in
     # a per-send try/except, so a raised AssertionError inside the sender is
@@ -575,3 +578,290 @@ async def test_result_gate_off_missing_prediction_still_alerts(db, settings):
     assert n == 1  # operator only
     assert "Home" in sent[0][1] and "Away" in sent[0][1]
     assert _notified_flag(1001) is True
+
+
+# ----------------------------------------------------------------------
+# High-conf DRIFT — the alert-time promise on the RESULT path.
+# upsert_prediction overwrites p_* in place on rescore, so the live stored
+# row can read BELOW the bar by settlement. If we ALERTED it (any user has a
+# reveal row) we still owe the result; if we never alerted it, suppress.
+# Real 2026-09-04 cases: Stuttgart 0.654->0.617, Ipswich v Liverpool AWAY
+# 0.691->0.639 (both alerted, both correct, both silently dropped).
+# ----------------------------------------------------------------------
+def _make_pred(fixture_id, home, away, ph, pd, pa):
+    return Prediction(
+        fixture_id=fixture_id, competition_code="PL", home_team=home, away_team=away,
+        p_home=ph, p_draw=pd, p_away=pa, home_score=1.0, away_score=0.0, draw_score=2.4,
+    )
+
+
+async def test_result_drift_below_bar_with_reveal_still_alerts(db, settings):
+    from betbot import daily_jobs
+
+    object.__setattr__(settings, "high_conf_alerts_only", True)
+    object.__setattr__(settings, "high_conf_alert_min_p", 0.65)
+    object.__setattr__(settings, "telegram_allowed_user_id", 999)
+
+    _seed_outcome(1101)
+    record_reveal(111, 1101, charged=False)  # revealed at alert time
+
+    # Live stored row has DRIFTED below 0.65 since the alert fired.
+    preds = {1101: _GatePred("Stuttgart", "Augsburg", 0.617, 0.23, 0.153)}
+    sent: list[int] = []
+
+    async def fake_send(s, chat_id, text):
+        sent.append(chat_id)
+        return True
+
+    n = await daily_jobs.run_result_alerts(
+        settings, send_fn=fake_send,
+        users_fn=lambda: [_User(111)],
+        prediction_fn=lambda fid: preds.get(fid),
+    )
+    assert set(sent) == {999, 111}  # honoured: operator + the user who saw it
+    assert n == 2
+    assert _notified_flag(1101) is True
+
+
+async def test_result_drift_below_bar_without_reveal_suppressed(db, settings):
+    from betbot import daily_jobs
+
+    object.__setattr__(settings, "high_conf_alerts_only", True)
+    object.__setattr__(settings, "high_conf_alert_min_p", 0.65)
+    object.__setattr__(settings, "telegram_allowed_user_id", 999)
+
+    _seed_outcome(1102)  # never revealed to anyone
+
+    preds = {1102: _GatePred("C", "D", 0.60, 0.25, 0.15)}
+    sent: list[int] = []
+
+    async def fake_send(s, chat_id, text):
+        sent.append(chat_id)
+        return True
+
+    n = await daily_jobs.run_result_alerts(
+        settings, send_fn=fake_send,
+        users_fn=lambda: [_User(111)],
+        prediction_fn=lambda fid: preds.get(fid),
+    )
+    assert n == 0 and sent == []          # below bar + never revealed -> suppressed
+    assert _notified_flag(1102) is True   # consumed, never re-queues
+
+
+async def test_result_gate_off_below_bar_unchanged(db, settings):
+    # Flag OFF: the reveal-honouring OR-clause must not change legacy behaviour —
+    # a below-bar fixture NEVER revealed still alerts (operator).
+    from betbot import daily_jobs
+
+    assert settings.high_conf_alerts_only is False
+    object.__setattr__(settings, "telegram_allowed_user_id", 999)
+    _seed_outcome(1103)
+
+    preds = {1103: _GatePred("E", "F", 0.55, 0.25, 0.20)}
+    sent: list[int] = []
+
+    async def fake_send(s, chat_id, text):
+        sent.append(chat_id)
+        return True
+
+    n = await daily_jobs.run_result_alerts(
+        settings, send_fn=fake_send,
+        users_fn=lambda: [],
+        prediction_fn=lambda fid: preds.get(fid),
+    )
+    assert sent == [999] and n == 1
+    assert _notified_flag(1103) is True
+
+
+async def test_result_gate_on_missing_prediction_but_revealed_is_honoured(db, settings):
+    # Flag ON + NO stored prediction row, but the fixture WAS revealed at alert
+    # time (item 2: honour it, log it, DO NOT raise on the None pred). The
+    # result goes out with the Home/Away placeholders.
+    from betbot import daily_jobs
+
+    object.__setattr__(settings, "high_conf_alerts_only", True)
+    object.__setattr__(settings, "telegram_allowed_user_id", 999)
+    _seed_outcome(1105)
+    record_reveal(111, 1105, charged=False)
+
+    sent: list[tuple[int, str]] = []
+
+    async def fake_send(s, chat_id, text):
+        sent.append((chat_id, text))
+        return True
+
+    n = await daily_jobs.run_result_alerts(
+        settings, send_fn=fake_send,
+        users_fn=lambda: [_User(111)],
+        prediction_fn=lambda fid: None,
+    )
+    assert {cid for cid, _ in sent} == {999, 111}
+    assert n == 2
+    assert "Home" in sent[0][1] and "Away" in sent[0][1]  # placeholder names
+    assert _notified_flag(1105) is True
+
+
+async def test_result_total_send_failure_leaves_unnotified_for_retry(db, settings):
+    # Item 4: every recipient errors -> result_notified stays False so the
+    # 2-hourly pass retries inside the 3-day window (the column means "handled",
+    # never "sent to nobody").
+    from betbot import daily_jobs
+
+    object.__setattr__(settings, "telegram_allowed_user_id", 999)
+    _seed_outcome(1104)
+
+    async def boom_send(s, chat_id, text):
+        raise RuntimeError("telegram down")
+
+    n = await daily_jobs.run_result_alerts(
+        settings, send_fn=boom_send, users_fn=lambda: [],
+        prediction_fn=lambda fid: None,
+    )
+    assert n == 0
+    assert _notified_flag(1104) is False  # NOT consumed -> will retry
+
+
+# ----------------------------------------------------------------------
+# Pre-match DRIFT downgrade note (item 3): present when the rescored row
+# has slipped below the bar, absent when it still clears it.
+# ----------------------------------------------------------------------
+def _free_operator_entitlement(user, settings, *, now=None):
+    from betbot.entitlement import Entitlement
+
+    return Entitlement(
+        allowed=True, reason="operator", trial_days_left=-1, credits_remaining=-1
+    )
+
+
+async def _capture_prematch(settings, pred):
+    from betbot import daily_jobs
+
+    object.__setattr__(settings, "telegram_allowed_user_id", 999)
+    sent: list[str] = []
+
+    async def fake_send(s, chat_id, text):
+        sent.append(text)
+        return True
+
+    async def lineup_fn(_baseline):
+        # Non-empty lineup so the no-XI gap-report path (which reads a
+        # PredictionRow.kickoff the injected Prediction lacks) is skipped.
+        return ({"home": {"xi": []}, "away": {"xi": []}}, 0.0, 0.0, None)
+
+    await daily_jobs.send_prediction_alert(
+        settings, pred.fixture_id,
+        send_fn=fake_send,
+        prediction_fn=lambda fid: pred,
+        lineup_fn=lineup_fn,
+        rescore_fn=None,
+        entitlement_fn=_free_operator_entitlement,
+        users_fn=lambda: [_User(999)],
+    )
+    return sent
+
+
+async def test_prematch_drift_note_present_when_below_bar(db, settings):
+    from betbot.daily_jobs import HIGH_CONF_DOWNGRADE_NOTE
+
+    object.__setattr__(settings, "high_conf_alerts_only", True)
+    object.__setattr__(settings, "high_conf_alert_min_p", 0.65)
+
+    pred = _make_pred(1201, "Stuttgart", "Augsburg", 0.617, 0.23, 0.153)
+    sent = await _capture_prematch(settings, pred)
+    assert len(sent) == 1
+    assert HIGH_CONF_DOWNGRADE_NOTE in sent[0]
+
+
+async def test_prematch_no_drift_note_when_above_bar(db, settings):
+    from betbot.daily_jobs import HIGH_CONF_DOWNGRADE_NOTE
+
+    object.__setattr__(settings, "high_conf_alerts_only", True)
+    object.__setattr__(settings, "high_conf_alert_min_p", 0.65)
+
+    pred = _make_pred(1202, "Arsenal", "Spurs", 0.72, 0.18, 0.10)
+    sent = await _capture_prematch(settings, pred)
+    assert len(sent) == 1
+    assert HIGH_CONF_DOWNGRADE_NOTE not in sent[0]
+
+# ----------------------------------------------------------------------
+# F2: empty audience is consumed, never retried on an impossible send.
+# ----------------------------------------------------------------------
+async def test_result_no_audience_is_consumed_not_retried(db, settings):
+    from betbot import daily_jobs
+
+    assert settings.high_conf_alerts_only is False
+    object.__setattr__(settings, "telegram_allowed_user_id", None)  # no operator
+    _seed_outcome(1106)  # revealed to nobody
+
+    sent: list[int] = []
+
+    async def fake_send(s, chat_id, text):
+        sent.append(chat_id)
+        return True
+
+    n = await daily_jobs.run_result_alerts(
+        settings, send_fn=fake_send, users_fn=lambda: [],
+        prediction_fn=lambda fid: None,
+    )
+    assert n == 0 and sent == []          # nobody to send to
+    assert _notified_flag(1106) is True   # consumed, not retried every 2h
+
+
+# ----------------------------------------------------------------------
+# F4: with NO lineup, the "lineup not yet confirmed" caveat and the drift
+# downgrade note both ride on adj_note (the f"{adj_note}\n{NOTE}" branch).
+# Assert the caveat precedes the note and both precede the team line.
+# ----------------------------------------------------------------------
+class _KickoffPred:
+    def __init__(self, fixture_id, home, away, ph, pd, pa, kickoff):
+        self.fixture_id = fixture_id
+        self.competition_code = "PL"
+        self.home_team = home
+        self.away_team = away
+        self.p_home = ph
+        self.p_draw = pd
+        self.p_away = pa
+        self.home_xg = None
+        self.away_xg = None
+        self.kickoff = kickoff
+
+
+async def test_prematch_drift_note_stacks_after_lineup_caveat(db, settings):
+    from betbot import daily_jobs
+    from betbot.daily_jobs import HIGH_CONF_DOWNGRADE_NOTE
+
+    object.__setattr__(settings, "high_conf_alerts_only", True)
+    object.__setattr__(settings, "high_conf_alert_min_p", 0.65)
+    object.__setattr__(settings, "telegram_allowed_user_id", 999)
+
+    ko = datetime(2026, 9, 6, 18, 30, tzinfo=timezone.utc)
+    pred = _KickoffPred(1203, "Stuttgart", "Augsburg", 0.617, 0.23, 0.153, ko)
+
+    sent: list[str] = []
+
+    async def fake_send(s, chat_id, text):
+        sent.append(text)
+        return True
+
+    async def noop_operator(*a, **k):
+        return True
+
+    async def lineup_fn(_baseline):
+        return (None, 0.0, 0.0, None)  # NO lineup -> caveat + downgrade stack
+
+    await daily_jobs.send_prediction_alert(
+        settings, pred.fixture_id,
+        send_fn=fake_send,
+        prediction_fn=lambda fid: pred,
+        lineup_fn=lineup_fn,
+        rescore_fn=None,
+        entitlement_fn=_free_operator_entitlement,
+        users_fn=lambda: [_User(999)],
+        operator_send_fn=noop_operator,
+    )
+    assert len(sent) == 1
+    body = sent[0]
+    caveat_i = body.index("lineup not yet confirmed")
+    note_i = body.index(HIGH_CONF_DOWNGRADE_NOTE)
+    team_i = body.index("Stuttgart (H)")
+    assert caveat_i < note_i < team_i

@@ -41,6 +41,7 @@ from betbot.entitlement import entitlement_for
 from betbot.logging import get_logger
 from betbot.notify import notify_operator
 from betbot.scheduling import add_async_job
+from betbot.timefmt import to_eat
 from betbot.storage.repos import (
     has_revealed,
     high_conf_band_tally,
@@ -270,7 +271,6 @@ def render_matchday_notice(settings, fixtures, day) -> str | None:
     from betbot.main import high_conf_alert_passes
 
     gate_on = getattr(settings, "high_conf_alerts_only", False)
-    tz = ZoneInfo(REPORT_TZ)
     header = (
         f"*⚽ High-confidence calls — {day.isoformat()}*" if gate_on
         else f"*⚽ Today's fixtures — {day.isoformat()}*"
@@ -284,9 +284,9 @@ def render_matchday_notice(settings, fixtures, day) -> str | None:
         code = getattr(f, "competition_code", None)
         early_lead = settings.early_alert_lead_minutes(code)
         late_lead = settings.lineup_confirm_lead_minutes()
-        ko_local = ko.astimezone(tz)
-        early_local = (ko - timedelta(minutes=early_lead)).astimezone(tz)
-        late_local = (ko - timedelta(minutes=late_lead)).astimezone(tz)
+        ko_local = to_eat(ko)
+        early_local = to_eat(ko - timedelta(minutes=early_lead))
+        late_local = to_eat(ko - timedelta(minutes=late_lead))
         # Option (a): list ONLY fixtures that clear the high-conviction gate.
         # Flag OFF -> the predicate passes every fixture, so nothing is skipped
         # and this loop is byte-identical to the pre-gate notice. Flag ON -> a
@@ -502,6 +502,17 @@ async def report_lineup_gap(
     )
 
 
+#: Plain, non-alarming note appended to a pre-match alert whose call has
+#: rescored BELOW the high-confidence bar since it was first alerted (the
+#: "display drift" case). The result is still sent — see run_result_alerts,
+#: which honours the alert-time promise via fixture_was_ever_revealed.
+HIGH_CONF_DOWNGRADE_NOTE = (
+    "ℹ️ Update: since this call was first flagged, a fresh model run has eased "
+    "it below our high-confidence bar. We're still sending it, and the "
+    "full-time result will follow."
+)
+
+
 async def send_prediction_alert(
     settings,
     fixture_id: int,
@@ -634,6 +645,17 @@ async def send_prediction_alert(
                 note="stored row cleared the gate but the rescored row did not;"
                      " sending the standard body without the high-conf banner",
             )
+            # Tell the reader plainly that the call has slipped below the bar
+            # since the earlier alert, and that the result still follows. Plumbed
+            # through the existing ``adj_note`` (appended, so a lineup caveat is
+            # kept) — the standard body already carries the "NO BET — below our
+            # confidence bar" line when the filter is live, and this reads
+            # coherently above it.
+            adj_note = (
+                f"{adj_note}\n{HIGH_CONF_DOWNGRADE_NOTE}"
+                if adj_note
+                else HIGH_CONF_DOWNGRADE_NOTE
+            )
         else:
             try:
                 tally = high_conf_band_tally(settings.high_conf_alert_min_p)
@@ -721,20 +743,33 @@ async def run_result_alerts(
     batch for a fixture completes it is flagged ``result_notified`` so it never
     re-sends. Returns total messages delivered. Injected fns keep it testable.
 
-    HIGH-CONVICTION GATE (result path). To keep the RESULT path consistent with
-    the PRE-MATCH path by construction, each pending fixture is filtered through
-    the SAME predicate — :func:`betbot.main.high_conf_alert_passes` — reading the
-    STORED prediction triple resolved via ``prediction_fn``:
+    HIGH-CONVICTION GATE (result path). The old claim that this path agreed
+    with the PRE-MATCH path "by construction" was FALSE: the alert fires on the
+    row as it stood at alert time, but ``upsert_prediction`` overwrites
+    ``p_home/p_draw/p_away`` IN PLACE on every later rescore, so a fixture that
+    cleared the 0.65 bar when we alerted can read BELOW it by settlement (real
+    cases 2026-09-04: Stuttgart 0.654->0.617, Ipswich v Liverpool AWAY
+    0.691->0.639 — both alerted, both correct, both silently dropped their
+    result). The governing product rule is "high confidence AT ALERT TIME": if
+    we alerted it, we owe the outcome. So each pending fixture passes iff::
+
+        high_conf_alert_passes(live stored row)  OR  fixture_was_ever_revealed
+
+    exactly the ``passes OR already_revealed`` shape :func:`high_conf_visible`
+    already uses. NO second threshold, hysteresis band, or grace margin is
+    introduced — the ONE 0.65 gate, plus an honest memory of what we alerted.
 
       * ``settings.high_conf_alerts_only`` OFF: the predicate returns ``True``
         without touching the prediction, so EVERY settled fixture alerts and a
         missing prediction is harmless — byte-identical to the legacy behaviour.
-      * ON: a fixture alerts iff its stored top-pick probability clears
-        ``settings.high_conf_alert_min_p`` AND the top pick is NOT the draw
-        (exactly the pre-match band). A fixture with NO stored prediction could
-        not have cleared the pre-match gate, so it is SUPPRESSED (never
-        dereferenced). No second config knob is introduced — one concept, one
-        gate.
+      * ON: a fixture alerts iff its live stored top-pick probability clears
+        ``settings.high_conf_alert_min_p`` and is NOT the draw, OR the fixture
+        was ever revealed to any user (the drift case above). A fixture that
+        was never revealed AND whose stored row is below the bar (or has no
+        stored prediction — it could not have cleared the pre-match gate) is
+        SUPPRESSED (never dereferenced). Each honoured-on-drift fixture logs
+        ``result_alert_honoured_prior_reveal`` so the drift population stays
+        countable.
 
     NOTIFIED-FLAG DECISION: a SUPPRESSED fixture is STILL flagged
     ``result_notified`` (it is consumed, just not sent). Leaving it unflagged
@@ -743,7 +778,11 @@ async def run_result_alerts(
     Marking it also mirrors the pre-match path, where a suppressed fixture is
     simply absent from the plan and the coverage watchdog treats it as COVERED
     (not a missing alert). So here ``result_notified`` means "handled by the
-    result path" — whether by a send or a deliberate suppression. A consequence:
+    result path" — a DELIBERATE SUPPRESSION, or a broadcast in which AT LEAST
+    ONE recipient actually received the result. On a TOTAL send failure (every
+    recipient errored) the flag is left False so the 2-hourly pass retries the
+    fixture inside the 3-day pending window rather than recording a result
+    "sent" that nobody got. A consequence:
     a fixture suppressed while the flag was ON is not retroactively alerted if
     the flag is later turned OFF (its outcome is already consumed) — symmetric
     with the pre-match path, whose scheduled fire time is likewise long gone.
@@ -754,6 +793,7 @@ async def run_result_alerts(
     from betbot.main import high_conf_alert_passes
     from betbot.notify import send_telegram_to
     from betbot.storage.repos import (
+        fixture_was_ever_revealed,
         mark_result_notified,
         outcomes_pending_result_alert,
     )
@@ -777,19 +817,35 @@ async def run_result_alerts(
     for row in pending:
         pred = prediction_fn(row.fixture_id)
 
-        # Gate the RESULT path through the SAME predicate as the pre-match path
-        # so the two agree by construction. When high_conf_alerts_only is OFF
-        # the predicate returns True WITHOUT reading pred, so a missing
-        # prediction still alerts (legacy behaviour). When ON, a fixture with no
-        # stored prediction could not have cleared the pre-match gate, so it is
-        # suppressed rather than dereferenced (a None pred must not raise here).
+        # Gate the RESULT path on the LIVE stored row, but honour the alert-time
+        # promise: upsert_prediction overwrites p_* in place on rescore, so the
+        # live row can have drifted below the bar since we alerted. When
+        # high_conf_alerts_only is OFF the predicate returns True WITHOUT reading
+        # pred, so a missing prediction still alerts (legacy behaviour). When ON,
+        # a fixture with no stored prediction could not have cleared the
+        # pre-match gate (a None pred must not raise here). The OR-clause
+        # (fixture_was_ever_revealed) mirrors high_conf_visible and rescues a
+        # drifted-but-alerted fixture — see the HIGH-CONVICTION GATE docstring.
         if pred is None:
-            passes = not getattr(settings, "high_conf_alerts_only", False)
+            gate_passes = not getattr(settings, "high_conf_alerts_only", False)
         else:
-            passes = high_conf_alert_passes(settings, pred)[0]
-        if not passes:
-            # Consume the suppressed fixture (mark notified) so it is never
-            # re-queued — see the NOTIFIED-FLAG DECISION in the docstring.
+            gate_passes = high_conf_alert_passes(settings, pred)[0]
+        ever_revealed = fixture_was_ever_revealed(row.fixture_id)
+        if not gate_passes and ever_revealed:
+            # Below the bar now, but we alerted it — the promise is "high
+            # confidence AT ALERT TIME", so we still owe the result. Distinct
+            # event so the drift population is countable later. A revealed
+            # fixture with no stored prediction row lands here too (has_pred
+            # False): logged, never dereferenced, never raised.
+            log.info(
+                "result_alert_honoured_prior_reveal",
+                fixture_id=row.fixture_id,
+                has_pred=pred is not None,
+            )
+        if not gate_passes and not ever_revealed:
+            # Never alerted AND below the bar (or no stored prediction): consume
+            # it (mark notified) so it is never re-queued — see the
+            # NOTIFIED-FLAG DECISION in the docstring.
             mark_notified_fn(row.fixture_id)
             suppressed += 1
             log.info("result_alert_suppressed_low_conf", fixture_id=row.fixture_id)
@@ -809,20 +865,42 @@ async def run_result_alerts(
             if already_revealed_fn(u.telegram_user_id, row.fixture_id):
                 audience.append(u.telegram_user_id)
 
+        if not audience:
+            # No operator and nobody revealed it: the audience cannot grow after
+            # settlement, so retrying is pointless. Consume it (mark notified) so
+            # it never re-queues, rather than logging all_sends_failed every 2h
+            # for 3 days over a send that can never happen.
+            mark_notified_fn(row.fixture_id)
+            log.info("result_alert_no_audience", fixture_id=row.fixture_id)
+            continue
+
+        any_success = False
         for uid in audience:
             try:
                 if await send(settings, uid, body):
                     sent += 1
+                    any_success = True
             except Exception as e:  # noqa: BLE001 — one bad send mustn't drop the rest
                 log.warning(
                     "result_alert_send_failed",
                     telegram_user_id=uid, fixture_id=row.fixture_id, error=str(e),
                 )
-        # Flag AFTER attempting the whole audience so a fixture is broadcast once.
-        mark_notified_fn(row.fixture_id)
-        log.info(
-            "result_alert_sent", fixture_id=row.fixture_id, delivered=len(audience),
-        )
+        # Flag ONLY once at least one recipient actually received it, so
+        # ``result_notified`` never lies. On a TOTAL send failure the flag is
+        # left False and the fixture stays pending for the 2-hourly retry inside
+        # the 3-day window (outcomes_pending_result_alert) — better a retry than
+        # a result marked "sent" that nobody got.
+        if any_success:
+            mark_notified_fn(row.fixture_id)
+            log.info(
+                "result_alert_sent", fixture_id=row.fixture_id, delivered=len(audience),
+            )
+        else:
+            log.warning(
+                "result_alert_all_sends_failed",
+                fixture_id=row.fixture_id, audience=len(audience),
+                note="left un-notified for retry on the next 2-hourly pass",
+            )
     if suppressed:
         log.info("result_alerts_suppressed_total", count=suppressed)
     return sent

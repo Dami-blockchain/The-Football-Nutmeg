@@ -1435,6 +1435,25 @@ def has_revealed(telegram_user_id: int, fixture_id: int) -> bool:
         return row is not None
 
 
+def fixture_was_ever_revealed(fixture_id: int) -> bool:
+    """True if ANY user has a reveal-ledger row for this fixture.
+
+    Read-only, user-AGNOSTIC mirror of :func:`has_revealed` (which is scoped to
+    a single ``telegram_user_id``). The result path uses it to honour the
+    product promise "high confidence AT ALERT TIME": ``upsert_prediction``
+    overwrites the stored ``p_*`` triple in place on every rescore, so a fixture
+    that cleared the confidence bar when we alerted can read below it by
+    settlement. If it was ever revealed to anyone, its outcome is still owed.
+    """
+    with session_scope() as s:
+        row = s.execute(
+            select(PredictionReveal.id)
+            .where(PredictionReveal.fixture_id == fixture_id)
+            .limit(1)
+        ).scalar_one_or_none()
+        return row is not None
+
+
 def record_reveal(
     telegram_user_id: int, fixture_id: int, charged: bool
 ) -> bool:
