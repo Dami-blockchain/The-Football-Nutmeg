@@ -1,16 +1,40 @@
+# tfsm-daemon — the prediction/alert daemon (`tfsm run-daemon`).
+# Ordered AFTER tfsm-api and gated on the API's port so the migration has
+# already run once by the time this starts (see the migration-safety note in
+# tfsm-api.service). ExecStartPre fails open after 60s so a slow API can never
+# permanently wedge boot.
+
 [Unit]
-Description=The Football Nutmeg Agent - scoring + settlement daemon
-After=network-online.target
-Wants=network-online.target
+Description=tfsm prediction/alert daemon
+After=tfsm-api.service
+Requires=tfsm-api.service
+StartLimitIntervalSec=3600
+StartLimitBurst=3
 
 [Service]
 Type=simple
-User=tfsm
 WorkingDirectory=/home/tfsm/tfsm
-EnvironmentFile=/home/tfsm/tfsm/.env
+# Wait for the API to be listening (=> its startup migration has completed).
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 60); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && exit 0; sleep 1; done; exit 0'
 ExecStart=/home/tfsm/tfsm/.venv/bin/tfsm run-daemon
-Restart=on-failure
+Restart=always
 RestartSec=10
+# Rescoring can briefly peak above steady state. A hard MemoryMax at the steady-state size could
+# OOM-KILL this real-money daemon at that peak. MemoryHigh throttles (reclaim +
+# schedule pressure) BELOW the MemoryMax ceiling. Measured live 2026-09:
+# steady-state RSS ~226 MiB, so MemoryHigh=340M leaves real headroom (was 260M,
+# which left only ~34 MiB). OPERATOR: rescore PEAK RSS is still unverified —
+# measure it (systemctl --user show tfsm-daemon -p MemoryPeak, or watch a
+# rescore) and retune MemoryHigh/MemoryMax toward the real peak if desired.
+MemoryHigh=340M
+MemoryMax=400M
+SyslogIdentifier=tfsm-daemon
+# Damilare tfsm_alerts_scheduled and /logs read /tmp/daemon.log; append here
+# (matching start-services.sh `>/tmp/daemon.log 2>&1`) so switching to systemd
+# does NOT freeze that file and blind the checks. append: needs systemd >=240
+# (droplet runs 255). Do not change to journal without moving the checks too.
+StandardOutput=append:/tmp/daemon.log
+StandardError=append:/tmp/daemon.log
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

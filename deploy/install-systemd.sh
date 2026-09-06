@@ -1,4 +1,15 @@
 #!/usr/bin/env bash
+#
+# ============================ STALE / DO NOT USE ============================
+# The systemd section below installs the 3 tfsm services as OLD SYSTEM-LEVEL
+# units under /etc/systemd/system via sudo. That is NOT how tfsm is deployed
+# anymore. As of Aug 2026 the services run as USER units under
+# ~/.config/systemd/user (systemctl --user). Use deploy/install-user-systemd.sh
+# instead, and take the .service files from this same deploy/ dir (they are now
+# exact copies of the installed user units).
+#
+# Only the NGINX section near the bottom of this script is still current.
+# ===========================================================================
 # One-shot: install the 3 systemd services + nginx reverse proxy.
 # Run as root:  sudo bash /home/tfsm/tfsm/deploy/install-systemd.sh
 set -e
