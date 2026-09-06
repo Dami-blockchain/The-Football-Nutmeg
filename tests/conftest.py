@@ -2,9 +2,46 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from betbot.config import Settings
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _hermetic_settings_env():
+    """Make the whole suite ignore any real ``.env`` — regardless of cwd.
+
+    pydantic-settings resolves ``Settings.model_config["env_file"]`` (default
+    ``".env"``) against the *current working directory*. Run ``pytest`` from
+    ``~/tfsm`` and the live deployment ``.env`` bleeds into every test that
+    builds Settings via ``get_settings()`` — e.g. ``BETBOT_CONFIDENCE_FILTER``
+    injects the "NO BET - below our confidence bar" banner that several
+    ``test_tips`` / ``test_llm_agent`` cases assert is absent, so the suite is
+    green from a clean cwd and red from ``~/tfsm``.
+
+    Point ``env_file`` at a path that does not exist so no ``.env`` is ever
+    read. This also neutralises the *direct* read in
+    ``config._first_real_env_value`` (the HIGHLIGHTLY placeholder repair),
+    which returns "" on a missing file. Session-scoped so it is set up before
+    any function-scoped fixture (e.g. ``_no_ledger_epoch``) clears the
+    ``get_settings`` cache and rebuilds Settings.
+
+    The per-test ``settings`` fixture already passes ``_env_file=None`` and is
+    unaffected; this covers every OTHER construction path.
+    """
+    import betbot.config as config
+
+    original = config.Settings.model_config.get("env_file")
+    missing = str(Path(__file__).parent / "_hermetic_no_such_env_file.env")
+    config.Settings.model_config["env_file"] = missing
+    config.get_settings.cache_clear()
+    try:
+        yield
+    finally:
+        config.Settings.model_config["env_file"] = original
+        config.get_settings.cache_clear()
 
 
 @pytest.fixture()
