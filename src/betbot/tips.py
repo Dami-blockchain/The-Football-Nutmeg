@@ -186,9 +186,25 @@ def format_result(
     and can differ from what the user actually paid for. When ``None`` (legacy
     reveal rows, or the fixture was never revealed) only the model triple is
     shown, exactly as before.
+
+    CONSISTENCY: when a sold triple is present and its argmax differs from the
+    post-rescore ``predicted_pick`` (a pick-flip between sale and settlement),
+    the "Our call" line AND its correct/wrong verdict are derived from the SOLD
+    pick — scored against ``actual_outcome`` — so the message can never say
+    "Our call: X — correct" while telling the user they were sold Y.
     """
-    verdict = "✅ correct" if outcome_row.correct else "❌ wrong"
-    pick = _pick_label(outcome_row.predicted_pick, home_team, away_team)
+    picked = outcome_row.predicted_pick
+    was_correct = outcome_row.correct
+    if sold_triple is not None:
+        sh, sd, sa = sold_triple
+        sold_pick = max(
+            (("HOME", sh), ("DRAW", sd), ("AWAY", sa)), key=lambda kv: kv[1]
+        )[0]
+        if sold_pick != picked:
+            picked = sold_pick
+            was_correct = sold_pick == outcome_row.actual_outcome
+    verdict = "✅ correct" if was_correct else "❌ wrong"
+    pick = _pick_label(picked, home_team, away_team)
     lines = [
         f"*Full time: {home_team} {outcome_row.home_goals}-"
         f"{outcome_row.away_goals} {away_team}*",

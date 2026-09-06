@@ -653,7 +653,10 @@ def high_conf_band_tally_sold(min_p: float, *, days: int = 366) -> tuple[int, in
         if top_p < min_p or top_pick == "DRAW":
             continue
         n += 1
-        if row.correct:
+        # Score the SOLD pick against the actual result — never row.correct,
+        # which grades the POST-rescore predicted_pick and would credit a call
+        # that flipped between sale and settlement.
+        if top_pick == row.actual_outcome:
             hits += 1
     return hits, n
 

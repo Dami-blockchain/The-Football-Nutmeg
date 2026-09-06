@@ -206,6 +206,7 @@ def test_sold_tally_respects_scope_and_band_and_draw(db, monkeypatch):
 class _Outcome:
     fixture_id = 1
     predicted_pick = "HOME"
+    actual_outcome = "HOME"
     correct = True
     home_goals = 2
     away_goals = 0
@@ -231,3 +232,58 @@ def test_format_result_quotes_sold_triple_when_present():
     assert "As shown to you: H 72% / D 18% / A 10%" in body
     # The post-rescore model triple is still shown alongside it.
     assert "Model had H 50% / D 25% / A 25%" in body
+
+
+# ----------------------------------------------------------------------
+# Correctness must follow the SOLD pick, not the post-rescore verdict
+# ----------------------------------------------------------------------
+def test_sold_tally_scores_sold_pick_when_actual_matches_sold(db):
+    """Sold HOME 0.70, rescored to AWAY-top, actual HOME -> 1/1.
+
+    ``row.correct`` grades the post-rescore pick (AWAY) and would read False, so
+    scoring on it would give 0/1. Scoring the SOLD pick against actual_outcome
+    gives the right answer."""
+    _outcome(601, "PL", 0.15, 0.20, 0.65, outcome="HOME")  # rescored AWAY-top
+    record_reveal(1, 601, True, 0.70, 0.18, 0.12)          # sold HOME
+    assert high_conf_band_tally_sold(0.65) == (1, 1)
+
+
+def test_sold_tally_scores_sold_pick_when_actual_differs_from_sold(db):
+    """Sold HOME 0.70, rescored to AWAY-top, actual AWAY -> 0/1.
+
+    ``row.correct`` grades the post-rescore pick (AWAY == actual AWAY) and would
+    read True, so scoring on it would WRONGLY give 1/1 — crediting a pick the
+    user was never sold. Scoring the SOLD pick (HOME != AWAY) gives 0/1."""
+    _outcome(602, "PL", 0.15, 0.20, 0.65, outcome="AWAY")  # rescored AWAY-top
+    record_reveal(1, 602, True, 0.70, 0.18, 0.12)          # sold HOME
+    assert high_conf_band_tally_sold(0.65) == (0, 1)
+
+
+class _FlipOutcome:
+    """Post-rescore pick flipped to AWAY (wrong), but the user was sold HOME."""
+    fixture_id = 2
+    predicted_pick = "AWAY"
+    actual_outcome = "HOME"
+    correct = False  # AWAY != HOME, settlement's verdict on the rescored pick
+    home_goals = 1
+    away_goals = 0
+    predicted_home = 0.20
+    predicted_draw = 0.20
+    predicted_away = 0.60
+
+
+def test_format_result_verdict_follows_sold_pick_on_flip():
+    from betbot.tips import format_result
+
+    # No sold triple: the message reflects the post-rescore AWAY pick, wrong.
+    plain = format_result(_FlipOutcome(), "Arsenal", "Chelsea")
+    assert "Our call: Chelsea (A) — ❌ wrong" in plain
+
+    # With the sold triple (HOME): the call AND verdict follow what was sold —
+    # HOME, which actually won — so it can't claim the rescored pick's verdict.
+    sold = format_result(
+        _FlipOutcome(), "Arsenal", "Chelsea", sold_triple=(0.72, 0.18, 0.10)
+    )
+    assert "Our call: Arsenal (H) — ✅ correct" in sold
+    assert "Chelsea (A)" not in sold
+    assert "As shown to you: H 72% / D 18% / A 10%" in sold
