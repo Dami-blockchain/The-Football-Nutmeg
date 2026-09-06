@@ -147,3 +147,84 @@ async def test_broadcast_has_no_reveal_or_charge_side_effects(tmp_path, monkeypa
     # ... but commit_reveals fired ONLY for the user, never the broadcast chat.
     assert commits == [111]
     assert BROADCAST_ID not in commits
+
+
+# ----------------------------------------------------------------------
+# 3. SECURITY: group-0 command/message handlers are private-chat only
+# ----------------------------------------------------------------------
+def _tg_update(chat_type: str, chat_id: int, text: str = "/predictions"):
+    import datetime
+    from telegram import Chat, Message, Update
+    from telegram import User as TgUser
+
+    chat = Chat(id=chat_id, type=chat_type)
+    user = TgUser(id=999, is_bot=False, first_name="X")
+    msg = Message(
+        message_id=1,
+        date=datetime.datetime.now(datetime.timezone.utc),
+        chat=chat,
+        from_user=user,
+        text=text,
+    )
+    return Update(update_id=1, message=msg)
+
+
+def _built_app():
+    from betbot.config import Settings
+
+    s = Settings(TELEGRAM_BOT_TOKEN="123456:AAFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEF")
+    return tb.build_application(s)
+
+
+def test_no_group0_handler_accepts_a_group_update():
+    """Once the bot is in a group, NO command/message handler may fire — else a
+    member's /predictions posts operator reveals into the group and writes rows."""
+    app = _built_app()
+    grp = _tg_update("supergroup", -1001234567890, "/predictions")
+    accepting = [
+        getattr(h, "commands", None) or h.callback.__name__
+        for h in app.handlers[0]
+        if bool(h.filters.check_update(grp))
+    ]
+    assert accepting == [], f"group-0 handlers must reject group chats, got {accepting}"
+
+
+def test_predictions_command_private_only():
+    app = _built_app()
+    pred = next(
+        h for h in app.handlers[0]
+        if getattr(h, "commands", None) and "predictions" in h.commands
+    )
+    assert not pred.filters.check_update(_tg_update("supergroup", -100, "/predictions"))
+    assert pred.filters.check_update(_tg_update("private", 999, "/predictions"))
+
+
+def test_free_text_chat_handler_private_only():
+    app = _built_app()
+    chat_h = next(h for h in app.handlers[0] if getattr(h, "commands", None) is None)
+    assert not chat_h.filters.check_update(_tg_update("supergroup", -100, "hello"))
+    assert chat_h.filters.check_update(_tg_update("private", 999, "hello"))
+
+
+def test_capture_handler_still_sees_groups_not_private():
+    app = _built_app()
+    cap = next(h for h in app.handlers[1] if h.callback is tb.log_group_chat)
+    assert cap.filters.check_update(_tg_update("supergroup", -100, "hi"))
+    assert not cap.filters.check_update(_tg_update("private", 999, "hi"))
+
+
+def test_group_predictions_writes_no_reveal_rows(tmp_path):
+    """A group /predictions never dispatches, so the reveal ledger stays empty."""
+    from sqlalchemy import func, select
+
+    from betbot.storage.db import init_engine, session_scope
+    from betbot.storage.models import PredictionReveal
+
+    init_engine(tmp_path / "grp.sqlite")
+    app = _built_app()
+    grp = _tg_update("supergroup", -1001234567890, "/predictions")
+    # No group-0 handler accepts it -> predictions_cmd is never invoked.
+    assert not any(h.filters.check_update(grp) for h in app.handlers[0])
+    with session_scope() as s:
+        n = s.execute(select(func.count()).select_from(PredictionReveal)).scalar_one()
+    assert n == 0, "a group message must create no reveal rows"

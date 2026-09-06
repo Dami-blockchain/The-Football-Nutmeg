@@ -553,16 +553,26 @@ def build_application(settings) -> Application:
     app.add_handler(
         MessageHandler(~filters.ChatType.PRIVATE, log_group_chat), group=1
     )
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("help", guide_cmd))
-    app.add_handler(CommandHandler("guide", guide_cmd))
-    app.add_handler(CommandHandler("predictions", predictions_cmd))
-    app.add_handler(CommandHandler("balance", balance_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("record", record_cmd))
-    app.add_handler(CommandHandler("title", title_cmd))
+    # SECURITY: every command/message handler is PRIVATE-CHAT ONLY. Without
+    # this gate, once the bot is in a group ANY member's /predictions would post
+    # operator-entitlement reveals into the group AND write reveal rows — the
+    # paywall-in-groups leak (the paywall keys on telegram_user_id, and groups
+    # are not an approved paid surface). ``filters.ChatType.PRIVATE`` on each
+    # handler makes group messages fall through to the group=1 capture handler
+    # only. Broadcast to groups is one-way (send-only), never a paid surface.
+    _priv = filters.ChatType.PRIVATE
+    app.add_handler(CommandHandler("start", start_cmd, filters=_priv))
+    app.add_handler(CommandHandler("help", guide_cmd, filters=_priv))
+    app.add_handler(CommandHandler("guide", guide_cmd, filters=_priv))
+    app.add_handler(CommandHandler("predictions", predictions_cmd, filters=_priv))
+    app.add_handler(CommandHandler("balance", balance_cmd, filters=_priv))
+    app.add_handler(CommandHandler("status", status_cmd, filters=_priv))
+    app.add_handler(CommandHandler("record", record_cmd, filters=_priv))
+    app.add_handler(CommandHandler("title", title_cmd, filters=_priv))
     # Free-text → LLM assistant. Added LAST so commands keep priority.
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_handler))
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND & _priv, chat_handler)
+    )
     return app
 
 
