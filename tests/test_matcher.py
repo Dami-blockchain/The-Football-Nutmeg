@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from betbot.data.models import MatchOutcome
 from betbot.exchanges.matcher import (
     TeamAliasResolver,
@@ -100,7 +102,10 @@ def test_from_yaml_loads_aliases(tmp_path):
 # international name variants (must still match via the alias table)
 # ----------------------------------------------------------------------
 def test_international_name_variants_match_via_aliases():
-    r = TeamAliasResolver.from_yaml("config/team_aliases.yaml")
+    # Resolve relative to the repo root (parent of tests/), NOT the process
+    # cwd, so the test passes regardless of where pytest is invoked from.
+    aliases_path = Path(__file__).resolve().parent.parent / "config" / "team_aliases.yaml"
+    r = TeamAliasResolver.from_yaml(aliases_path)
     assert r.same_team("Korea Republic", "South Korea")
     assert r.same_team("Türkiye", "Turkey")
     assert r.same_team("Czechia", "Czech Republic")
