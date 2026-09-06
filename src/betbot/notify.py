@@ -144,7 +144,12 @@ def _band_for(min_p: float) -> tuple[float, tuple[float, float, float, float]]:
     return t, HIGH_CONF_BANDS[t]
 
 
-def format_band_line(min_p: float, live_tally: tuple[int, int] | None) -> str:
+def format_band_line(
+    min_p: float,
+    live_tally: tuple[int, int] | None,
+    *,
+    sold: bool = False,
+) -> str:
     """One-line band record + honest live-season tally.
 
     ``live_tally`` is ``(hits, n)`` from
@@ -153,6 +158,12 @@ def format_band_line(min_p: float, live_tally: tuple[int, int] | None) -> str:
     stats come from the fixed :data:`HIGH_CONF_BANDS` table; the live tally is
     captioned "too few to mean anything yet" until it reaches
     :data:`HIGH_CONF_MIN_MEANINGFUL_N`.
+
+    ``sold`` labels the live line honestly when the tally was computed over the
+    triple ACTUALLY SOLD (the reveal-ledger snapshot) rather than the
+    post-rescore triple — the two measure the same calls but the sold basis does
+    not silently drop a call whose stored triple drifted below the bar after it
+    was sold.
     """
     threshold, (_keep, hit, lo, hi) = _band_for(min_p)
     n_wf = band_fixture_count(threshold)
@@ -160,16 +171,17 @@ def format_band_line(min_p: float, live_tally: tuple[int, int] | None) -> str:
         f"Band record: p>={threshold:g} hits {hit:.1f}% "
         f"[{lo:.1f}–{hi:.1f}] on {n_wf:,} walk-forward fixtures (2022–26)."
     )
+    label = "This season live (as sold)" if sold else "This season live"
     if live_tally is None:
-        live = "This season live: not available."
+        live = f"{label}: not available."
     else:
         hits, n = live_tally
         if n == 0:
-            live = "This season live: none settled yet."
+            live = f"{label}: none settled yet."
         elif n < HIGH_CONF_MIN_MEANINGFUL_N:
-            live = f"This season live: {hits}/{n} — too few to mean anything yet."
+            live = f"{label}: {hits}/{n} — too few to mean anything yet."
         else:
-            live = f"This season live: {hits}/{n} ({hits / n:.0%})."
+            live = f"{label}: {hits}/{n} ({hits / n:.0%})."
     return f"{band} {live}"
 
 
@@ -202,6 +214,7 @@ def format_high_conf_alert(
     *,
     market: tuple[str, float, float] | None = None,
     live_tally: tuple[int, int] | None = None,
+    live_tally_sold: bool = False,
 ) -> str:
     """The high-conviction alert body for one fixture.
 
@@ -251,7 +264,7 @@ def format_high_conf_alert(
         header,
         _model_triple_line(pred, top_pick, market_str),
         call,
-        format_band_line(min_p, live_tally),
+        format_band_line(min_p, live_tally, sold=live_tally_sold),
     ])
 
 
