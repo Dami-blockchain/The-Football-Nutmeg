@@ -791,8 +791,16 @@ def run_daemon(
     trigger = CronTrigger.from_crontab(cron_expr, timezone=timezone.utc)
 
     # One long-lived alerter owns the stale-snapshot cadence (first alert, then
-    # a reminder at most once/day, then a single recovery note) across ticks.
-    clubelo_alerter = ClubEloAlerter()
+    # a reminder at most once/day, then a single recovery note). Its state is
+    # persisted to a JSON sidecar next to the snapshot so it survives the
+    # Restart=always daemon bouncing mid-outage (an in-memory-only alerter would
+    # re-fire the "first alert" after each restart and could silently drop the
+    # one-time recovery note).
+    clubelo_alerter = ClubEloAlerter(
+        state_path=Path(settings.clubelo_latest_path).with_name(
+            "clubelo_alert_state.json"
+        )
+    )
 
     async def _clubelo_refresh_and_alert(*, fetch: bool = True) -> None:
         # Refresh the cross-league Elo snapshot the CL engine reads (off the

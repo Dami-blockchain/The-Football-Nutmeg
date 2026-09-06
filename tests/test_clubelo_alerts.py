@@ -175,3 +175,70 @@ def test_recovered_message_has_key_fields():
     msg = format_recovered_message(_fresh(), wall_now=wall)
     assert "recovered" in msg.lower()
     assert "EAT" in msg
+
+
+# --------------------------------------------------------------------------
+# persistence across a Restart=always daemon bounce
+# --------------------------------------------------------------------------
+def _sidecar(tmp_path):
+    return tmp_path / "clubelo_alert_state.json"
+
+
+def test_state_persisted_and_reloaded(tmp_path):
+    sc = _sidecar(tmp_path)
+    a = ClubEloAlerter(state_path=sc)
+    assert a.decide(_stale(), now=0.0) is AlertAction.STALE
+    assert sc.exists()
+    # A fresh alerter (simulating a daemon restart) reloads the state.
+    b = ClubEloAlerter(state_path=sc)
+    assert b._stale_active is True
+    assert b._last_alert_ts == 0.0
+
+
+def test_reminder_cap_holds_across_restart(tmp_path):
+    sc = _sidecar(tmp_path)
+    a = ClubEloAlerter(state_path=sc)
+    assert a.decide(_stale(), now=0.0) is AlertAction.STALE
+    # Restart a few hours into the outage: must NOT re-fire a fresh alert.
+    b = ClubEloAlerter(state_path=sc)
+    assert b.decide(_stale(), now=6 * 3600.0) is AlertAction.NONE
+    # ...and the once-per-day reminder still lands 24h after the first alert,
+    # not 24h after the restart.
+    c = ClubEloAlerter(state_path=sc)
+    assert c.decide(_stale(), now=DAY) is AlertAction.STALE
+
+
+def test_recovery_note_fires_after_restart_then_recover(tmp_path):
+    # The critical bug: restart while stale, then the feed recovers -> the
+    # one-time recovery note must still be sent (in-memory-only state would
+    # have forgotten it was ever stale and stayed silent).
+    sc = _sidecar(tmp_path)
+    a = ClubEloAlerter(state_path=sc)
+    assert a.decide(_stale(), now=0.0) is AlertAction.STALE
+    b = ClubEloAlerter(state_path=sc)  # daemon restarts mid-outage
+    assert b.decide(_fresh(), now=5000.0) is AlertAction.RECOVERED
+    # Recovery is still one-time even across another restart.
+    c = ClubEloAlerter(state_path=sc)
+    assert c.decide(_fresh(), now=6000.0) is AlertAction.NONE
+
+
+def test_corrupt_sidecar_starts_clean(tmp_path):
+    sc = _sidecar(tmp_path)
+    sc.write_text("{not valid json")
+    a = ClubEloAlerter(state_path=sc)  # must not raise
+    assert a._stale_active is False
+    assert a._last_alert_ts is None
+    assert a.decide(_stale(), now=0.0) is AlertAction.STALE
+
+
+def test_missing_sidecar_starts_clean(tmp_path):
+    a = ClubEloAlerter(state_path=_sidecar(tmp_path))  # file does not exist yet
+    assert a._stale_active is False
+    assert a._last_alert_ts is None
+
+
+def test_no_state_path_stays_in_memory(tmp_path):
+    # Backwards-compatible: without a state_path, nothing is written to disk.
+    a = ClubEloAlerter()
+    assert a.decide(_stale(), now=0.0) is AlertAction.STALE
+    assert list(tmp_path.iterdir()) == []

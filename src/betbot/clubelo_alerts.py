@@ -7,18 +7,31 @@ control so a multi-day outage pages **once**, then reminds **at most once a day*
 while it stays stale, and sends a **single** recovery note when the feed comes
 back.
 
-The decision layer (:meth:`ClubEloAlerter.decide`) does no I/O and owns all
-cadence, so it is trivially unit-testable. The async :func:`run_clubelo_alert`
+The decision layer (:meth:`ClubEloAlerter.decide`) does no network I/O and owns
+all cadence, so it is trivially unit-testable. The async :func:`run_clubelo_alert`
 wires a decision to :func:`betbot.notify.notify_operator` (or any injected
 sender), formatting the message with EAT timestamps per the standing rule.
+
+**Persistence.** The daemon runs under ``Restart=always``, so alerter state
+cannot live in process memory alone: a restart mid-outage would reset the
+cadence (re-firing a fresh "first alert", degrading the 1/day cap) and — worse —
+drop the fact that we were stale, so the one-time recovery note would never be
+sent when the feed came back. State is therefore persisted to a small JSON
+sidecar next to ``clubelo_latest.csv`` and reloaded when the alerter is
+constructed, and the cadence clock is wall-clock (:func:`time.time`) so a
+persisted timestamp stays meaningful across processes (only differences are
+used).
 """
 
 from __future__ import annotations
 
+import json
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Awaitable, Callable
 
 from betbot.data.clubelo import STALE_AFTER_DAYS, SnapshotStatus
@@ -46,21 +59,78 @@ class ClubEloAlerter:
     """Cadence state machine for stale-snapshot operator alerts.
 
     Long-lived: one instance per daemon process. :meth:`decide` is pure with
-    respect to I/O — given a freshness status and the current clock it returns
-    the action to take and mutates only its own small state. It owns the daily
-    reminder cap and the one-time recovery, so the caller can pass
-    ``cooldown_seconds=0`` to ``notify_operator`` and not double-suppress.
+    respect to *network* I/O — given a freshness status and the current wall
+    clock it returns the action to take, mutates its own small state, and
+    persists that state to :attr:`state_path` (when set) so it survives the
+    ``Restart=always`` daemon bouncing mid-outage. It owns the daily reminder
+    cap and the one-time recovery, so the caller can pass ``cooldown_seconds=0``
+    to ``notify_operator`` and not double-suppress.
+
+    ``state_path`` is a JSON sidecar; a missing or corrupt one is treated as a
+    clean start (never raises), and a failed write logs but does not raise —
+    losing persistence degrades to the old in-memory behaviour, it never crashes
+    the tick.
     """
 
     reminder_interval_s: float = DEFAULT_REMINDER_INTERVAL_S
+    state_path: Path | None = None
     _stale_active: bool = False
     _last_alert_ts: float | None = None
 
-    def decide(self, status: SnapshotStatus, *, now: float) -> AlertAction:
-        """Return the action for this evaluation and advance internal state.
+    def __post_init__(self) -> None:
+        if self.state_path is not None:
+            self.state_path = Path(self.state_path)
+            self._load()
 
-        ``now`` is a monotonic-style clock (seconds); only differences matter.
+    # -- persistence --------------------------------------------------------
+    def _load(self) -> None:
+        try:
+            data = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError, TypeError) as e:  # corrupt/unreadable
+            log.warning("clubelo_alert_state_unreadable", error=str(e))
+            return
+        try:
+            self._stale_active = bool(data.get("stale_active", False))
+            ts = data.get("last_alert_wall_ts")
+            self._last_alert_ts = None if ts is None else float(ts)
+        except (AttributeError, TypeError, ValueError) as e:
+            log.warning("clubelo_alert_state_malformed", error=str(e))
+            self._stale_active = False
+            self._last_alert_ts = None
+
+    def _save(self) -> None:
+        if self.state_path is None:
+            return
+        try:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.state_path.with_name(f".{self.state_path.name}.tmp{os.getpid()}")
+            tmp.write_text(
+                json.dumps(
+                    {
+                        "stale_active": self._stale_active,
+                        "last_alert_wall_ts": self._last_alert_ts,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.replace(tmp, self.state_path)
+        except OSError as e:  # never crash the tick over a sidecar write
+            log.warning("clubelo_alert_state_save_failed", error=str(e))
+
+    # -- decision -----------------------------------------------------------
+    def decide(self, status: SnapshotStatus, *, now: float) -> AlertAction:
+        """Return the action for this evaluation, advance state, and persist it.
+
+        ``now`` is a wall-clock timestamp (:func:`time.time`); only differences
+        matter, which is what makes the persisted value valid across a restart.
         """
+        action = self._decide(status, now)
+        self._save()
+        return action
+
+    def _decide(self, status: SnapshotStatus, now: float) -> AlertAction:
         if status.stale:
             due = (
                 self._last_alert_ts is None
@@ -131,10 +201,10 @@ async def run_clubelo_alert(
 
     Returns the :class:`AlertAction` taken. Never raises: a broken notifier must
     not crash the daemon tick that called it. ``notify`` defaults to
-    :func:`betbot.notify.notify_operator`; ``now`` is the cadence clock and
-    ``wall_now`` the display timestamp (both injectable for tests).
+    :func:`betbot.notify.notify_operator`; ``now`` is the wall-clock cadence
+    clock and ``wall_now`` the display timestamp (both injectable for tests).
     """
-    action = alerter.decide(status, now=time.monotonic() if now is None else now)
+    action = alerter.decide(status, now=time.time() if now is None else now)
     if action is AlertAction.NONE:
         return action
 
