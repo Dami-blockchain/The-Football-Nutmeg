@@ -585,6 +585,83 @@ def high_conf_band_tally(min_p: float, *, days: int = 366) -> tuple[int, int]:
     return hits, n
 
 
+def _sold_triples_by_fixture() -> dict[int, tuple[float, float, float]]:
+    """``{fixture_id: sold triple}`` — earliest non-NULL reveal triple per fixture.
+
+    A fixture sold to several users can carry several reveal rows (and a rescore
+    could have moved the triple between their reveals); the EARLIEST reveal with
+    a stored triple is taken as the fixture's canonical sold call — the first
+    time it was sold to anyone — matching the "first reveal wins" rule. Legacy
+    rows (NULL triple) are ignored, so a fixture only ever revealed before the
+    column existed does not appear.
+    """
+    with session_scope() as s:
+        rows = list(
+            s.execute(
+                select(
+                    PredictionReveal.fixture_id,
+                    PredictionReveal.p_home,
+                    PredictionReveal.p_draw,
+                    PredictionReveal.p_away,
+                    PredictionReveal.revealed_at,
+                    PredictionReveal.id,
+                )
+                .where(PredictionReveal.p_home.is_not(None))
+                .where(PredictionReveal.p_draw.is_not(None))
+                .where(PredictionReveal.p_away.is_not(None))
+            ).all()
+        )
+    best: dict[int, tuple] = {}
+    out: dict[int, tuple[float, float, float]] = {}
+    for fid, ph, pd, pa, revealed_at, rid in rows:
+        key = (revealed_at, rid)
+        cur = best.get(fid)
+        if cur is None or key < cur:
+            best[fid] = key
+            out[fid] = (float(ph), float(pd), float(pa))
+    return out
+
+
+def high_conf_band_tally_sold(min_p: float, *, days: int = 366) -> tuple[int, int]:
+    """``(hits, n)`` for high-conf calls measured over what was ACTUALLY SOLD.
+
+    Sibling of :func:`high_conf_band_tally`, but the band membership test uses
+    the SOLD triple stored on the reveal ledger instead of the POST-rescore
+    triple on ``prediction_outcomes``. ``upsert_prediction`` overwrites the
+    stored ``p_*`` in place on every rescore, so a call that cleared the bar
+    when it was sold can read below it by settlement and vanish from BOTH the
+    numerator and denominator of :func:`high_conf_band_tally` (verified on the
+    live ledger for the correct 2026-09-04 calls, fixtures 565791 and 560566).
+    Anchoring the band test to the sold triple keeps those calls counted.
+
+    Scope is identical and enforced by reusing :func:`prediction_outcomes_since`
+    (ledger epoch, non-degenerate, CLUB competition, current season) — a sold
+    fixture with no in-scope settled outcome is excluded. A row counts when its
+    SOLD top-pick probability is >= ``min_p`` and the top pick is NOT the draw,
+    mirroring :func:`betbot.main.high_conf_alert_passes`. Fixtures whose only
+    reveal rows are legacy (NULL triple) never appear. HIT-RATE only, never
+    edge/ROI — the caller presents it honestly and flags a small sample.
+    """
+    outcomes = {r.fixture_id: r for r in prediction_outcomes_since(days)}
+    sold = _sold_triples_by_fixture()
+    hits = n = 0
+    for fid, (ph, pd, pa) in sold.items():
+        row = outcomes.get(fid)
+        if row is None:
+            continue  # sold but no in-scope settled outcome
+        triple = [("HOME", ph), ("DRAW", pd), ("AWAY", pa)]
+        top_pick, top_p = max(triple, key=lambda kv: kv[1])
+        if top_p < min_p or top_pick == "DRAW":
+            continue
+        n += 1
+        # Score the SOLD pick against the actual result — never row.correct,
+        # which grades the POST-rescore predicted_pick and would credit a call
+        # that flipped between sale and settlement.
+        if top_pick == row.actual_outcome:
+            hits += 1
+    return hits, n
+
+
 def outcome_result_notified(fixture_id: int) -> bool:
     """True once the RESULT ALERT has been broadcast for this fixture."""
     with session_scope() as s:
@@ -1456,7 +1533,12 @@ def fixture_was_ever_revealed(fixture_id: int) -> bool:
 
 
 def record_reveal(
-    telegram_user_id: int, fixture_id: int, charged: bool
+    telegram_user_id: int,
+    fixture_id: int,
+    charged: bool,
+    p_home: float | None = None,
+    p_draw: float | None = None,
+    p_away: float | None = None,
 ) -> bool:
     """Record that this fixture was revealed to this user. Idempotent.
 
@@ -1464,6 +1546,12 @@ def record_reveal(
     existed (the unique constraint fired). Callers increment the paid-credit
     counter only when this returns True AND ``charged`` is set, so committing a
     reveal twice (e.g. a retried Telegram send) can never double-charge.
+
+    ``p_home``/``p_draw``/``p_away`` snapshot the triple ACTUALLY RENDERED to
+    the user (the sold triple). They are stored ONLY on a brand-new row — the
+    idempotency semantics are unchanged, so an existing row is never updated:
+    FIRST REVEAL WINS, and that is the sold triple. They default to ``None`` so
+    legacy call sites keep working and old rows stay NULL.
     """
     try:
         with session_scope() as s:
@@ -1472,12 +1560,43 @@ def record_reveal(
                     telegram_user_id=telegram_user_id,
                     fixture_id=fixture_id,
                     charged=charged,
+                    p_home=p_home,
+                    p_draw=p_draw,
+                    p_away=p_away,
                 )
             )
         return True
     except IntegrityError:
-        # Row already exists (uq_reveal_user_fixture) — safe no-op.
+        # Row already exists (uq_reveal_user_fixture) — safe no-op. The stored
+        # triple is NOT overwritten: the first reveal's triple is the sold one.
         return False
+
+
+def sold_triple(fixture_id: int) -> tuple[float, float, float] | None:
+    """The sold H/D/A triple for a fixture, or ``None`` if none is stored.
+
+    Returns the triple from the EARLIEST reveal row for the fixture that carries
+    a non-NULL triple — the first time the call was sold to anyone. A fixture
+    only revealed on legacy (pre-column) rows, or never revealed, returns
+    ``None``. Used by the result alert to quote what was actually sold.
+    """
+    with session_scope() as s:
+        row = s.execute(
+            select(
+                PredictionReveal.p_home,
+                PredictionReveal.p_draw,
+                PredictionReveal.p_away,
+            )
+            .where(PredictionReveal.fixture_id == fixture_id)
+            .where(PredictionReveal.p_home.is_not(None))
+            .where(PredictionReveal.p_draw.is_not(None))
+            .where(PredictionReveal.p_away.is_not(None))
+            .order_by(PredictionReveal.revealed_at.asc(), PredictionReveal.id.asc())
+            .limit(1)
+        ).first()
+    if row is None:
+        return None
+    return (float(row[0]), float(row[1]), float(row[2]))
 
 
 # ----------------------------------------------------------------------

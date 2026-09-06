@@ -45,6 +45,11 @@ _ADDITIVE_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("predictions", "away_xg", "REAL"),
     # When the match was played, so the record can be scoped to a season.
     ("prediction_outcomes", "kickoff", "DATETIME"),
+    # Snapshot of the sold H/D/A triple on the reveal ledger. Additive &
+    # nullable: legacy reveal rows keep NULLs. See PredictionReveal.p_*.
+    ("prediction_reveals", "p_home", "FLOAT"),
+    ("prediction_reveals", "p_draw", "FLOAT"),
+    ("prediction_reveals", "p_away", "FLOAT"),
 )
 
 # Indexes for columns added by _ADDITIVE_COLUMNS. ``create_all`` only indexes

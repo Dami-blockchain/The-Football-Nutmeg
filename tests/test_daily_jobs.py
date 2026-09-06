@@ -110,7 +110,7 @@ def test_operator_reveals_all():
         already_revealed_fn=_never_revealed,
     )
     # Recorded (so they stay free after any trial) but NEVER charged.
-    assert reveals == [(1, False), (2, False)]
+    assert reveals == [(1, False, (0.39, 0.31, 0.30)), (2, False, (0.39, 0.31, 0.30))]
     assert "operator" in text
     assert "🔒" not in text
 
@@ -122,7 +122,7 @@ def test_trial_reveals_all():
         entitlement_fn=lambda u, s, now=None: _ent("trial", trial=3),
         already_revealed_fn=_never_revealed,
     )
-    assert reveals == [(1, False), (2, False)]  # free, but recorded
+    assert reveals == [(1, False, (0.39, 0.31, 0.30)), (2, False, (0.39, 0.31, 0.30))]  # free, but recorded
     assert "3 days left" in text
     assert "🔒" not in text
 
@@ -135,7 +135,7 @@ def test_credits_reveal_then_lock():
         already_revealed_fn=_never_revealed,
     )
     # Only the 2 funded fixtures are revealed + charged; the third is locked.
-    assert reveals == [(0, True), (1, True)]
+    assert reveals == [(0, True, (0.39, 0.31, 0.30)), (1, True, (0.39, 0.31, 0.30))]
     assert text.count("🔒") == 1
 
 
@@ -215,7 +215,7 @@ def test_gate_filters_low_conf_from_reveal_and_charge():
         entitlement_fn=lambda u, s, now=None: _ent("credit", credits=5),
         already_revealed_fn=_never_revealed,
     )
-    assert reveals == [(1, True), (3, True)]  # only the two high-conf, charged
+    assert reveals == [(1, True, (0.72, 0.18, 0.10)), (3, True, (0.72, 0.18, 0.10))]  # only the two high-conf, charged
     assert "Beta" not in text                 # low-conf fixture vanished
     assert "Alpha" in text and "Gamma" in text
 
@@ -288,7 +288,7 @@ def test_gate_off_is_unchanged():
         entitlement_fn=lambda u, s, now=None: _ent("trial", trial=3),
         already_revealed_fn=_never_revealed,
     )
-    assert reveals == [(1, False), (2, False)]  # nothing filtered
+    assert reveals == [(1, False, (0.39, 0.31, 0.30)), (2, False, (0.39, 0.31, 0.30))]  # nothing filtered
     assert "No high-confidence calls today" not in text
 
 
@@ -302,7 +302,7 @@ def test_gate_credits_charged_exactly_for_qualifying(db, tmp_path):
         entitlement_fn=lambda usr, se, now=None: _ent("credit", credits=5),
         already_revealed_fn=has_revealed,
     )
-    assert reveals == [(1, True), (3, True)]
+    assert reveals == [(1, True, (0.72, 0.18, 0.10)), (3, True, (0.72, 0.18, 0.10))]
     commit_reveals(u, reveals)
     assert get_user(u.telegram_user_id).predictions_consumed == 2  # exactly 2
 
@@ -965,7 +965,7 @@ def test_repeat_render_charges_a_fixture_at_most_once(db, tmp_path):
     text1, reveals1 = render_user_predictions(
         u, preds, s, entitlement_fn=ent, already_revealed_fn=has_revealed
     )
-    assert reveals1 == [(1, True), (2, True)]
+    assert reveals1 == [(1, True, (0.39, 0.31, 0.30)), (2, True, (0.39, 0.31, 0.30))]
     assert text1.count("🔒") == 0
 
     # Commit after a (simulated) confirmed send: 2 charged rows, consumed == 2.
@@ -1109,7 +1109,7 @@ def test_operator_trial_reveals_recorded_but_never_charged(db, tmp_path):
         entitlement_fn=lambda usr, se, now=None: _ent("trial", trial=4),
         already_revealed_fn=has_revealed,
     )
-    assert reveals == [(7, False)]
+    assert reveals == [(7, False, (0.39, 0.31, 0.30))]
     commit_reveals(u, reveals)
     assert has_revealed(u.telegram_user_id, 7) is True
     assert get_user(u.telegram_user_id).predictions_consumed == 0

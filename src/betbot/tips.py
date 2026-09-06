@@ -166,23 +166,58 @@ def _pick_label(pick: str, home: str, away: str) -> str:
     return "the draw"
 
 
-def format_result(outcome_row, home_team: str, away_team: str) -> str:
+def format_result(
+    outcome_row,
+    home_team: str,
+    away_team: str,
+    *,
+    sold_triple: tuple[float, float, float] | None = None,
+) -> str:
     """End-of-match RESULT ALERT body for one settled fixture.
 
-    Shows the final score, whether OUR pick was right, and the model's original
-    triple — no new probabilities are gated (the user already saw/paid for the
+    Shows the final score, whether OUR pick was right, and the model's triple —
+    no new probabilities are gated (the user already saw/paid for the
     prediction). ``outcome_row`` is a
     :class:`~betbot.storage.models.PredictionOutcome`.
+
+    ``sold_triple`` is the ``(p_home, p_draw, p_away)`` ACTUALLY SOLD to the
+    user (from the reveal ledger). When present it is quoted verbatim as "what
+    you were shown", because ``outcome_row``'s triple is the POST-rescore one
+    and can differ from what the user actually paid for. When ``None`` (legacy
+    reveal rows, or the fixture was never revealed) only the model triple is
+    shown, exactly as before.
+
+    CONSISTENCY: when a sold triple is present and its argmax differs from the
+    post-rescore ``predicted_pick`` (a pick-flip between sale and settlement),
+    the "Our call" line AND its correct/wrong verdict are derived from the SOLD
+    pick — scored against ``actual_outcome`` — so the message can never say
+    "Our call: X — correct" while telling the user they were sold Y.
     """
-    verdict = "✅ correct" if outcome_row.correct else "❌ wrong"
-    pick = _pick_label(outcome_row.predicted_pick, home_team, away_team)
-    return "\n".join([
+    picked = outcome_row.predicted_pick
+    was_correct = outcome_row.correct
+    if sold_triple is not None:
+        sh, sd, sa = sold_triple
+        sold_pick = max(
+            (("HOME", sh), ("DRAW", sd), ("AWAY", sa)), key=lambda kv: kv[1]
+        )[0]
+        if sold_pick != picked:
+            picked = sold_pick
+            was_correct = sold_pick == outcome_row.actual_outcome
+    verdict = "✅ correct" if was_correct else "❌ wrong"
+    pick = _pick_label(picked, home_team, away_team)
+    lines = [
         f"*Full time: {home_team} {outcome_row.home_goals}-"
         f"{outcome_row.away_goals} {away_team}*",
         f"Our call: {pick} — {verdict}",
         f"Model had H {outcome_row.predicted_home:.0%} / "
         f"D {outcome_row.predicted_draw:.0%} / A {outcome_row.predicted_away:.0%}",
-    ])
+    ]
+    if sold_triple is not None:
+        sh, sd, sa = sold_triple
+        lines.append(
+            f"As shown to you: H {sh:.0%} / D {sd:.0%} / A {sa:.0%}"
+        )
+    return "\n".join(lines)
 
 
 def format_locked(pred) -> str:

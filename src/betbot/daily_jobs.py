@@ -45,6 +45,7 @@ from betbot.timefmt import to_eat
 from betbot.storage.repos import (
     has_revealed,
     high_conf_band_tally,
+    high_conf_band_tally_sold,
     increment_predictions_consumed,
     list_users,
     predictions_for_kickoff_range,
@@ -151,6 +152,22 @@ def high_conf_visible(
     ]
 
 
+# A single newly-revealed fixture: ``(fixture_id, charged, sold_triple)`` where
+# ``sold_triple`` is the ``(p_home, p_draw, p_away)`` ACTUALLY RENDERED to the
+# user, or ``None`` when no triple was on screen. ``commit_reveals`` persists
+# the triple with the ledger row so the sold call is recoverable after a later
+# rescore overwrites the stored prediction.
+Reveal = tuple[int, bool, "tuple[float, float, float] | None"]
+
+
+def _rendered_triple(pred) -> tuple[float, float, float] | None:
+    """The H/D/A triple as shown to the user, or ``None`` if unavailable."""
+    try:
+        return (float(pred.p_home), float(pred.p_draw), float(pred.p_away))
+    except (AttributeError, TypeError):
+        return None
+
+
 def render_user_predictions(
     user,
     predictions,
@@ -160,11 +177,12 @@ def render_user_predictions(
     entitlement_fn=entitlement_for,
     already_revealed_fn=has_revealed,
     edge_threshold: float | None = None,
-) -> tuple[str, list[tuple[int, bool]]]:
+) -> tuple[str, list[Reveal]]:
     """Build one user's gated message body. **Pure — no DB writes.**
 
     Returns ``(text, reveals)`` where ``reveals`` is a list of
-    ``(fixture_id, charged)`` for each fixture NEWLY revealed in THIS render
+    ``(fixture_id, charged, sold_triple)`` for each fixture NEWLY revealed in
+    THIS render
     (i.e. not already in the reveal ledger). The caller commits those reveals —
     and only charges credits — AFTER a confirmed Telegram send, via
     :func:`commit_reveals`. Nothing here mutates the DB, so a render whose send
@@ -188,7 +206,7 @@ def render_user_predictions(
 
     ent = entitlement_fn(user, settings, now=now)
     parts = [_entitlement_header(ent)]
-    reveals: list[tuple[int, bool]] = []
+    reveals: list[Reveal] = []
 
     if not predictions:
         parts.append("\nNo fixtures today.")
@@ -222,10 +240,10 @@ def render_user_predictions(
 
         if free_reason:
             parts.append("\n" + format_prediction(p, edge_threshold=edge_threshold))
-            reveals.append((p.fixture_id, False))
+            reveals.append((p.fixture_id, False, _rendered_triple(p)))
         elif paid_revealed < credits:
             parts.append("\n" + format_prediction(p, edge_threshold=edge_threshold))
-            reveals.append((p.fixture_id, True))
+            reveals.append((p.fixture_id, True, _rendered_triple(p)))
             paid_revealed += 1
         else:
             parts.append("\n" + format_locked(p))
@@ -233,7 +251,7 @@ def render_user_predictions(
     return "\n".join(parts), reveals
 
 
-def commit_reveals(user, reveals: list[tuple[int, bool]]) -> None:
+def commit_reveals(user, reveals: list[Reveal]) -> None:
     """Persist reveals AFTER a confirmed send; charge one credit per NEW paid one.
 
     ``record_reveal`` returns False if the ledger row already existed (a retried
@@ -241,9 +259,21 @@ def commit_reveals(user, reveals: list[tuple[int, bool]]) -> None:
     double :func:`increment_predictions_consumed`. A credit is charged ONLY when
     a brand-new ``charged=True`` row is inserted, which only happens after a send
     the caller has already confirmed returned True.
+
+    Each reveal is ``(fixture_id, charged, sold_triple)``; a 2-tuple
+    ``(fixture_id, charged)`` is still accepted (legacy callers) and stores no
+    triple. The sold triple lands on the ledger row only when the row is
+    brand-new — first reveal wins.
     """
-    for fid, charged in reveals:
-        if record_reveal(user.telegram_user_id, fid, charged) and charged:
+    for rev in reveals:
+        fid, charged = rev[0], rev[1]
+        triple = rev[2] if len(rev) > 2 else None
+        p_home, p_draw, p_away = triple if triple else (None, None, None)
+        inserted = record_reveal(
+            user.telegram_user_id, fid, charged,
+            p_home=p_home, p_draw=p_draw, p_away=p_away,
+        )
+        if inserted and charged:
             increment_predictions_consumed(user.telegram_user_id)
 
 
@@ -393,7 +423,7 @@ def render_user_lineup_prediction(
     already_revealed_fn=has_revealed,
     edge_threshold: float | None = None,
     high_conf_body: str | None = None,
-) -> tuple[str, list[tuple[int, bool]]]:
+) -> tuple[str, list[Reveal]]:
     """One user's gated body for a SINGLE fixture's lineup-adjusted prediction.
 
     Same entitlement + reveal-ledger semantics as
@@ -422,13 +452,14 @@ def render_user_lineup_prediction(
             adj_note=adj_note, absences=absences,
         )
 
+    triple = _rendered_triple(pred)
     # Already paid for on a prior path/repeat — always free, never re-charged.
     if already_revealed_fn(user.telegram_user_id, fid):
         return header + "\n\n" + _revealed_body(), []
     if ent.reason in ("operator", "trial"):
-        return header + "\n\n" + _revealed_body(), [(fid, False)]
+        return header + "\n\n" + _revealed_body(), [(fid, False, triple)]
     if ent.reason == "credit" and ent.credits_remaining >= 1:
-        return header + "\n\n" + _revealed_body(), [(fid, True)]
+        return header + "\n\n" + _revealed_body(), [(fid, True, triple)]
     # Locked: teaser only, nothing revealed or charged.
     return header + "\n\n" + format_locked(pred), []
 
@@ -682,13 +713,28 @@ async def send_prediction_alert(
                 else HIGH_CONF_DOWNGRADE_NOTE
             )
         else:
+            # Prefer the SOLD-basis tally (band membership judged on the triple
+            # actually sold, not the post-rescore triple) — it does not silently
+            # drop a call whose stored triple drifted below the bar after sale.
+            # It falls back to the standard tally when the sold ledger has no
+            # rows yet (legacy reveals carry NULL triples), and the alert is
+            # labelled honestly for whichever basis is used. Same club-only /
+            # current-season scope either way (enforced inside the repo helpers).
+            tally = None
+            tally_sold = False
             try:
-                tally = high_conf_band_tally(settings.high_conf_alert_min_p)
+                min_p = settings.high_conf_alert_min_p
+                sold_hits, sold_n = high_conf_band_tally_sold(min_p)
+                if sold_n > 0:
+                    tally, tally_sold = (sold_hits, sold_n), True
+                else:
+                    tally = high_conf_band_tally(min_p)
             except Exception as e:  # noqa: BLE001 — never block the alert on a read
                 log.warning("high_conf_tally_failed", fixture_id=fixture_id, error=str(e))
                 tally = None
             high_conf_body = format_high_conf_alert(
-                pred, settings, market=None, live_tally=tally,
+                pred, settings, market=None,
+                live_tally=tally, live_tally_sold=tally_sold,
             )
 
     sent = 0
@@ -821,6 +867,7 @@ async def run_result_alerts(
         fixture_was_ever_revealed,
         mark_result_notified,
         outcomes_pending_result_alert,
+        sold_triple,
     )
     from betbot.tips import format_result
 
@@ -899,7 +946,12 @@ async def run_result_alerts(
 
         home = pred.home_team if pred is not None else "Home"
         away = pred.away_team if pred is not None else "Away"
-        body = "*⚽ Result*\n\n" + format_result(row, home, away)
+        # Quote the triple ACTUALLY SOLD when we have it (None for legacy/never-
+        # revealed fixtures), so the result echoes what the user paid for rather
+        # than the post-rescore triple on the outcome row.
+        body = "*⚽ Result*\n\n" + format_result(
+            row, home, away, sold_triple=sold_triple(row.fixture_id)
+        )
 
         # Audience: the operator (always) + every user who saw this prediction.
         audience: list[int] = []

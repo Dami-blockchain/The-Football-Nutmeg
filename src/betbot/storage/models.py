@@ -332,6 +332,19 @@ class PredictionReveal(Base):
     revealed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )
+    # Snapshot of the H/D/A triple ACTUALLY RENDERED to the user at reveal time
+    # ("the sold triple"). Nullable and additive: rows written before this
+    # column existed carry NULLs, and every consumer must treat a missing triple
+    # explicitly. Because ``upsert_prediction`` overwrites the stored ``p_*``
+    # triple in place on every rescore, ``prediction_outcomes`` holds only the
+    # POST-rescore triple; this captures what was on screen when the fixture was
+    # first revealed, so a call that cleared the confidence bar when sold stays
+    # attributable to that bar even after a later rescore drifts it below.
+    # First reveal wins (idempotency in :func:`record_reveal`), so this is never
+    # overwritten once set.
+    p_home: Mapped[float | None] = mapped_column(Float, nullable=True)
+    p_draw: Mapped[float | None] = mapped_column(Float, nullable=True)
+    p_away: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 class ModelPrediction(Base):
