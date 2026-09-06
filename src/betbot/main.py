@@ -22,6 +22,7 @@ from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from betbot.config import get_settings
+from betbot.clubelo_alerts import ClubEloAlerter, run_clubelo_alert
 from betbot.data.football_data import FootballDataClient, FootballDataError
 from betbot.data.form import FormService, _parse_kickoff, _parse_team
 from betbot.data.odds import shared_odds_service
@@ -789,23 +790,65 @@ def run_daemon(
     cron_expr = cron or settings.daemon_cron
     trigger = CronTrigger.from_crontab(cron_expr, timezone=timezone.utc)
 
-    async def _tick() -> None:
-        # Refresh the cross-league Elo snapshot the CL engine reads, so a
-        # fixture is priced off today's ratings. Non-fatal + off the event
-        # loop; on failure the engine keeps the last snapshot.
+    # One long-lived alerter owns the stale-snapshot cadence (first alert, then
+    # a reminder at most once/day, then a single recovery note) across ticks.
+    clubelo_alerter = ClubEloAlerter()
+
+    async def _clubelo_refresh_and_alert(*, fetch: bool = True) -> None:
+        # Refresh the cross-league Elo snapshot the CL engine reads (off the
+        # event loop; non-fatal), then check its freshness and page the operator
+        # if it has gone stale, or send one recovery note when it comes back.
         _s = get_settings()
-        if _s.cl_elo_enabled:
+        if not _s.cl_elo_enabled:
+            return
+        from betbot.data.clubelo import refresh_latest, snapshot_status
+
+        path = Path(_s.clubelo_latest_path)
+        if fetch:
             try:
-                from betbot.data.clubelo import refresh_latest
-                await asyncio.to_thread(
-                    refresh_latest, Path(_s.clubelo_latest_path)
-                )
+                await asyncio.to_thread(refresh_latest, path)
             except Exception as e:  # noqa: BLE001 — never crash the tick
                 get_logger(__name__).warning("clubelo_refresh_tick_failed", error=str(e))
+        try:
+            status = await asyncio.to_thread(snapshot_status, path)
+            await run_clubelo_alert(_s, status, clubelo_alerter)
+        except Exception as e:  # noqa: BLE001 — alerting must never crash the tick
+            get_logger(__name__).warning("clubelo_alert_failed", error=str(e))
+
+    async def _tick() -> None:
+        # Refresh + freshness-alert the ClubElo snapshot so a CL fixture is
+        # priced off today's ratings and the operator hears about a stale feed.
+        await _clubelo_refresh_and_alert(fetch=True)
         # Score recos for the next 48h, then settle finished recos (accuracy
         # tracking). No orders are placed on either step.
         await _settle_once()
         await _score_once()
+
+    async def _clubelo_retry_tick() -> None:
+        # Intra-day fallback: the 08:00 refresh can fail against a multi-hour
+        # (or multi-day) upstream outage, and 3 attempts ~seconds apart do
+        # nothing against that. A few hours later, re-check the snapshot and, if
+        # it is still stale, try the refresh again. Only fetches when actually
+        # stale, so a healthy feed is never hit a second time. The alerter still
+        # owns cadence, so this cannot spam.
+        _s = get_settings()
+        if not _s.cl_elo_enabled:
+            return
+        from betbot.data.clubelo import snapshot_status
+
+        path = Path(_s.clubelo_latest_path)
+        try:
+            status = await asyncio.to_thread(snapshot_status, path)
+        except Exception as e:  # noqa: BLE001 — never crash the daemon
+            get_logger(__name__).warning("clubelo_retry_check_failed", error=str(e))
+            return
+        if status.stale:
+            get_logger(__name__).info(
+                "clubelo_intraday_retry",
+                age_days=None if status.age_days is None else round(status.age_days, 2),
+                reason=status.reason,
+            )
+            await _clubelo_refresh_and_alert(fetch=True)
 
     async def _club_refresh_tick() -> None:
         # Weekly: refresh results + re-seed club Glicko + refit club DC so
@@ -1184,6 +1227,14 @@ def run_daemon(
         init_engine(s.db_path)  # cron jobs may fire before the first scoring tick
         scheduler = AsyncIOScheduler(timezone=timezone.utc)
         add_async_job(scheduler, _tick, trigger=trigger, id="score_and_settle")
+        # Intra-day ClubElo fallback: re-check and (only if stale) re-fetch at
+        # 12:00 and 16:00 UTC when the 08:00 refresh left the snapshot stale.
+        add_async_job(
+            scheduler,
+            _clubelo_retry_tick,
+            trigger=CronTrigger.from_crontab("0 12,16 * * *", timezone=timezone.utc),
+            id="clubelo_intraday_retry",
+        )
         add_async_job(
             scheduler,
             _club_refresh_tick,
