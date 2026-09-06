@@ -21,6 +21,7 @@ from betbot.storage.models import (
     PredictionOutcome,
     PredictionReveal,
     PredictionRow,
+    RescoreDriftLog,
     TreasuryBridge,
     User,
 )
@@ -1627,3 +1628,136 @@ def update_prediction_kickoff(fixture_id: int, kickoff: datetime) -> int:
             row.kickoff = kickoff
             changed += 1
         return changed
+
+
+# ----------------------------------------------------------------------
+# Rescore-drift instrumentation (MEASUREMENT ONLY — see RescoreDriftLog)
+# ----------------------------------------------------------------------
+#: Below this magnitude a top-pick probability change counts as "flat" rather
+#: than up/down — floats never compare exactly equal, so a bare ``== 0`` would
+#: bin every observation as drifted.
+_DRIFT_FLAT_EPS = 1e-9
+
+#: Order stages are compared in the report. The alert-time baseline is the
+#: EARLIEST observation for a fixture regardless of label; these are the later
+#: stages a delta is reported for.
+_DRIFT_LATER_STAGES = ("kickoff_60", "result")
+
+
+def record_rescore_drift(
+    fixture_id: int,
+    stage: str,
+    p_home: float,
+    p_draw: float,
+    p_away: float,
+) -> None:
+    """Append one drift-log observation. Best-effort, never raises.
+
+    Called from the alert paths purely to MEASURE how a fixture's triple drifts
+    between stages; it must never affect delivery, so every failure is swallowed
+    (the caller also guards, belt-and-braces). One row per call — the report
+    dedups to the earliest per (fixture, stage).
+    """
+    try:
+        with session_scope() as s:
+            s.add(
+                RescoreDriftLog(
+                    fixture_id=fixture_id,
+                    stage=stage,
+                    p_home=float(p_home),
+                    p_draw=float(p_draw),
+                    p_away=float(p_away),
+                )
+            )
+    except Exception as e:  # noqa: BLE001 — instrumentation must never break a send
+        log.warning(
+            "rescore_drift_record_failed",
+            fixture_id=fixture_id,
+            stage=stage,
+            error=str(e),
+        )
+
+
+def _top_pick(triple: tuple[float, float, float]) -> tuple[str, float]:
+    """Argmax of a (home, draw, away) triple as ``(pick, prob)``."""
+    return max(
+        (("HOME", triple[0]), ("DRAW", triple[1]), ("AWAY", triple[2])),
+        key=lambda kv: kv[1],
+    )
+
+
+def _triple_for_pick(pick: str, triple: tuple[float, float, float]) -> float:
+    """The probability the triple assigns to a fixed ``pick`` outcome."""
+    return {"HOME": triple[0], "DRAW": triple[1], "AWAY": triple[2]}[pick]
+
+
+def rescore_drift_stats() -> dict:
+    """Read-only drift statistics over :class:`RescoreDriftLog`.
+
+    For each fixture the EARLIEST observation is the alert-time baseline and
+    defines the "sold" pick (its argmax). For every later stage present, the
+    delta is that same pick's probability at the later stage minus at baseline —
+    i.e. how far the call we alerted has drifted, positive = firmed up, negative
+    = eased. Aggregated per stage into direction counts (up/down/flat) and a mean
+    delta. ``n_fixtures`` is the number of fixtures with a baseline; each stage's
+    ``n`` is how many of those also have that stage. n is stated EXPLICITLY so a
+    small sample is never read as a track record. Pure read — never mutates.
+    """
+    with session_scope() as s:
+        rows = list(
+            s.execute(
+                select(RescoreDriftLog).order_by(
+                    RescoreDriftLog.fixture_id.asc(),
+                    RescoreDriftLog.observed_at.asc(),
+                    RescoreDriftLog.id.asc(),
+                )
+            ).scalars()
+        )
+        s.expunge_all()
+
+    # Earliest observation per (fixture, stage): the first snapshot wins.
+    by_fixture: dict[int, dict[str, RescoreDriftLog]] = {}
+    for r in rows:
+        stages = by_fixture.setdefault(r.fixture_id, {})
+        if r.stage not in stages:
+            stages[r.stage] = r
+
+    stage_stats: dict[str, dict] = {}
+    n_fixtures = 0
+    for _fid, stages in by_fixture.items():
+        # Baseline = earliest observation overall for the fixture.
+        baseline = min(
+            stages.values(), key=lambda r: (r.observed_at, r.id)
+        )
+        n_fixtures += 1
+        base_triple = (baseline.p_home, baseline.p_draw, baseline.p_away)
+        pick, _base_p = _top_pick(base_triple)
+        base_pick_p = _triple_for_pick(pick, base_triple)
+        for stage, r in stages.items():
+            if r is baseline:
+                continue  # the baseline itself carries no delta
+            later_p = _triple_for_pick(pick, (r.p_home, r.p_draw, r.p_away))
+            delta = later_p - base_pick_p
+            st = stage_stats.setdefault(
+                stage, {"n": 0, "up": 0, "down": 0, "flat": 0, "_sum": 0.0}
+            )
+            st["n"] += 1
+            st["_sum"] += delta
+            if delta > _DRIFT_FLAT_EPS:
+                st["up"] += 1
+            elif delta < -_DRIFT_FLAT_EPS:
+                st["down"] += 1
+            else:
+                st["flat"] += 1
+
+    stages_out: dict[str, dict] = {}
+    for stage, st in stage_stats.items():
+        n = st["n"]
+        stages_out[stage] = {
+            "n": n,
+            "up": st["up"],
+            "down": st["down"],
+            "flat": st["flat"],
+            "mean_delta": (st["_sum"] / n) if n else 0.0,
+        }
+    return {"n_fixtures": n_fixtures, "stages": stages_out}

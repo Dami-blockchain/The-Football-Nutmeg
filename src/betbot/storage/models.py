@@ -469,3 +469,38 @@ class ArbExecution(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
     )
+
+
+class RescoreDriftLog(Base):
+    """Per-stage snapshot of a pre-match alert fixture's probability triple.
+
+    ``send_prediction_alert`` re-scores every fixture at fire time and
+    ``upsert_prediction`` overwrites ``p_home/p_draw/p_away`` IN PLACE, so once a
+    fixture settles the stored triple is only the LAST rescore — the earlier
+    (early-fire, near-kickoff) triples are gone and early-vs-late drift cannot be
+    split. This table snapshots the triple actually in force at each stage of the
+    alert lifecycle so drift per stage is measurable once the sample is large
+    enough (the operator reads it at n>=30). Stages seen in practice:
+
+      * ``early_fire``  — the first pre-match alert (KO - early_alert_lead),
+      * ``kickoff_60``  — the near-kickoff confirmed-XI alert
+                          (KO - lineup_confirm_lead), and
+      * ``result``      — the triple settlement actually scored.
+
+    MEASUREMENT ONLY: nothing here feeds alerting, gating, or thresholds. One row
+    per observation (a stage may be re-observed on a retried fire); the report
+    takes the earliest row per (fixture, stage), and the earliest row overall as
+    the alert-time baseline every later stage is compared against.
+    """
+
+    __tablename__ = "rescore_drift_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    fixture_id: Mapped[int] = mapped_column(Integer, index=True)
+    stage: Mapped[str] = mapped_column(String(32), index=True)
+    p_home: Mapped[float] = mapped_column(Float)
+    p_draw: Mapped[float] = mapped_column(Float)
+    p_away: Mapped[float] = mapped_column(Float)
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
