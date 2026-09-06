@@ -49,6 +49,7 @@ from betbot.storage.repos import (
     list_users,
     predictions_for_kickoff_range,
     prediction_for_fixture,
+    record_rescore_drift,
     record_reveal,
     upsert_prediction,
 )
@@ -64,6 +65,10 @@ REPORT_TZ = "Africa/Nairobi"
 
 # (settings, chat_id, text) -> delivered?  Matches notify.send_telegram_to.
 SendFn = Callable[[object, int, str], Awaitable[bool]]
+
+# Rescore-drift instrumentation stage labels, keyed by the alert tag the
+# scheduler fires (see betbot.main). MEASUREMENT ONLY — see RescoreDriftLog.
+_DRIFT_STAGE_BY_TAG = {"early": "early_fire", "late": "kickoff_60"}
 
 
 def nairobi_day_bounds(
@@ -613,6 +618,26 @@ async def send_prediction_alert(
     if not lineup:
         adj_note = "⚠️ lineup not yet confirmed — model prediction"
 
+    # Snapshot the post-rescore triple ACTUALLY in force at this fire, tagged
+    # by stage, so early-vs-late drift is measurable later. Best-effort and
+    # match-level (once per fire, outside the per-user loop); never blocks the
+    # alert. MEASUREMENT ONLY — nothing here touches gating or thresholds.
+    try:
+        _drift_stage = _DRIFT_STAGE_BY_TAG.get(alert_tag, alert_tag)
+        record_rescore_drift(
+            fixture_id, _drift_stage, pred.p_home, pred.p_draw, pred.p_away
+        )
+        log.info(
+            "rescore_drift_observed",
+            fixture_id=fixture_id,
+            stage=_drift_stage,
+            p_home=round(pred.p_home, 4),
+            p_draw=round(pred.p_draw, 4),
+            p_away=round(pred.p_away, 4),
+        )
+    except Exception as e:  # noqa: BLE001 — instrumentation never blocks a send
+        log.warning("rescore_drift_log_failed", fixture_id=fixture_id, error=str(e))
+
     # High-conviction alert format (BETBOT_HIGH_CONF_ALERTS_ONLY). Built ONCE
     # per fixture (match-level, same for every user) and only when the flag is
     # ON. The live-season tally is read fresh here at send time from the settled
@@ -850,6 +875,27 @@ async def run_result_alerts(
             suppressed += 1
             log.info("result_alert_suppressed_low_conf", fixture_id=row.fixture_id)
             continue
+
+        # Snapshot the RESULT-stage triple (what settlement scored) for the
+        # alerted population, so drift from the alert-time triple is
+        # measurable. Best-effort; never affects the result broadcast.
+        try:
+            record_rescore_drift(
+                row.fixture_id, "result",
+                row.predicted_home, row.predicted_draw, row.predicted_away,
+            )
+            log.info(
+                "rescore_drift_observed",
+                fixture_id=row.fixture_id,
+                stage="result",
+                p_home=round(row.predicted_home, 4),
+                p_draw=round(row.predicted_draw, 4),
+                p_away=round(row.predicted_away, 4),
+            )
+        except Exception as e:  # noqa: BLE001 — instrumentation never blocks
+            log.warning(
+                "rescore_drift_log_failed", fixture_id=row.fixture_id, error=str(e)
+            )
 
         home = pred.home_team if pred is not None else "Home"
         away = pred.away_team if pred is not None else "Away"
