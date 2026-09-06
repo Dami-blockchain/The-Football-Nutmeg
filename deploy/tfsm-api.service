@@ -1,16 +1,35 @@
+# tfsm-api — FastAPI backend (uvicorn on 127.0.0.1:8000).
+# Reproduces ~/tfsm/deploy/start-services.sh exactly: same binary, args, cwd.
+# tfsm loads its own .env via dotenv from WorkingDirectory, so NO
+# EnvironmentFile here (a malformed line in a complex .env would wedge the
+# unit; the app already reads it safely).
+#
+# MIGRATION-SAFETY NOTE: _apply_additive_migrations in
+# ~/tfsm/src/betbot/storage/db.py:63-72 is NOT concurrency-safe — an unguarded
+# inspector-check-then-ALTER TABLE with no duplicate-column catch (unlike
+# create_all). Three simultaneous cold boots can leave a service dead. Until
+# the parallel fix ships, the API boots FIRST and runs the migration alone;
+# tfsm-daemon and tfsm-bot are ordered After= this unit and wait for its port.
+# Once the migration is concurrency-safe this ordering is simply harmless.
+
 [Unit]
-Description=The Football Nutmeg Agent - API (FastAPI/uvicorn)
+Description=tfsm FastAPI backend (uvicorn)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=3600
+StartLimitBurst=3
 
 [Service]
 Type=simple
-User=tfsm
 WorkingDirectory=/home/tfsm/tfsm
-EnvironmentFile=/home/tfsm/tfsm/.env
 ExecStart=/home/tfsm/tfsm/.venv/bin/uvicorn backend.tfsm_api.app:app --host 127.0.0.1 --port 8000
-Restart=on-failure
-RestartSec=5
+Restart=always
+RestartSec=10
+MemoryMax=200M
+SyslogIdentifier=tfsm-api
+# /logs api reads /tmp/uvicorn.log — append here so systemd matches nohup.
+StandardOutput=append:/tmp/uvicorn.log
+StandardError=append:/tmp/uvicorn.log
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

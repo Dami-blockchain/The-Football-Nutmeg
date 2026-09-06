@@ -1,16 +1,29 @@
+# tfsm-bot — the Telegram bot (`python -m betbot.telegram_bot`).
+# Ordered AFTER tfsm-daemon so the three tfsm services start strictly
+# serially (api -> daemon -> bot), never as three simultaneous cold boots that
+# could all hit the non-concurrency-safe migration at once (see the note in
+# tfsm-api.service). Once the migration fix ships this ordering is harmless.
+
 [Unit]
-Description=The Football Nutmeg Agent - Telegram bot
-After=network-online.target
-Wants=network-online.target
+Description=tfsm Telegram bot
+After=tfsm-daemon.service
+Requires=tfsm-api.service
+StartLimitIntervalSec=3600
+StartLimitBurst=3
 
 [Service]
 Type=simple
-User=tfsm
 WorkingDirectory=/home/tfsm/tfsm
-EnvironmentFile=/home/tfsm/tfsm/.env
+# Belt-and-suspenders: also wait for the API port before starting.
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 60); do (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null && exit 0; sleep 1; done; exit 0'
 ExecStart=/home/tfsm/tfsm/.venv/bin/python -m betbot.telegram_bot
-Restart=on-failure
+Restart=always
 RestartSec=10
+MemoryMax=200M
+SyslogIdentifier=tfsm-bot
+# /logs bot reads /tmp/bot.log — append here so systemd matches nohup.
+StandardOutput=append:/tmp/bot.log
+StandardError=append:/tmp/bot.log
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
