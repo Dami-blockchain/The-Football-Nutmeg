@@ -507,6 +507,31 @@ async def _heartbeat(context: ContextTypes.DEFAULT_TYPE) -> None:
         log.error("telegram_heartbeat_notify_failed", error_type=type(e).__name__)
 
 
+async def log_group_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log the chat id/type/title of any message from a NON-private chat.
+
+    The operator adds the bot to a group, sends one message, and reads the
+    (negative) chat id from /tmp/bot.log to set BETBOT_BROADCAST_CHAT_ID.
+    A manual ``getUpdates`` cannot be used for this while the bot runs:
+    Telegram allows a SINGLE getUpdates consumer, so the bot's own long-poll
+    loop makes a second getUpdates return 409 Conflict.
+
+    Read-only and NON-INVASIVE: registered in its OWN handler group (see
+    build_application) so it runs ALONGSIDE, never instead of, the command and
+    chat handlers -- it logs and returns, consuming nothing. Token-safe: it
+    logs only the chat's own id/type/title, never the bot token.
+    """
+    chat = update.effective_chat
+    if chat is None or chat.type == "private":
+        return
+    log.info(
+        "telegram_group_chat_seen",
+        chat_id=chat.id,
+        chat_type=chat.type,
+        chat_title=getattr(chat, "title", None),
+    )
+
+
 def build_application(settings) -> Application:
     app = Application.builder().token(settings.telegram_bot_token).build()
     # Registered BEFORE the handlers so a failure during startup is still
@@ -522,6 +547,12 @@ def build_application(settings) -> Application:
             "telegram_heartbeat_unavailable",
             note="no JobQueue; 'alive but deaf' will not be detectable",
         )
+    # Non-private chat-id capture. Registered in its OWN group (group=1) so it
+    # runs in ADDITION to the group-0 command/chat handlers without blocking
+    # them -- existing (private-chat) behaviour is byte-identical.
+    app.add_handler(
+        MessageHandler(~filters.ChatType.PRIVATE, log_group_chat), group=1
+    )
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", guide_cmd))
     app.add_handler(CommandHandler("guide", guide_cmd))

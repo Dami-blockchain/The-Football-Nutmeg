@@ -689,6 +689,35 @@ async def send_prediction_alert(
                 telegram_user_id=user.telegram_user_id,
                 fixture_id=fixture_id, error=str(e),
             )
+    # --- Optional BROADCAST copy of the high-confidence call --------------
+    # When BETBOT_BROADCAST_CHAT_ID is set AND this fixture produced a
+    # high-confidence alert body, send the SAME rendered alert ONCE to that
+    # chat (a group/channel), IN ADDITION to the per-user DMs above, which
+    # remain the primary target and are untouched. BROADCAST-ONLY: groups are
+    # not an approved paid surface (the paywall keys on telegram_user_id), so
+    # this path deliberately does NOT build a per-user body, and creates NO
+    # reveal row, charge, or free-limit draw -- it never calls commit_reveals.
+    # It is also kept OUT of ``sent`` so the returned delivered-count is
+    # unchanged. Default unset -> this block is skipped entirely and behaviour
+    # is byte-identical to before.
+    broadcast_chat_id = getattr(settings, "broadcast_chat_id", None)
+    if high_conf_body is not None and broadcast_chat_id:
+        label = "confirmed lineup" if lineup else "model prediction"
+        broadcast_body = f"*\u23f0 Pre-match \u2014 {label}*\n\n{high_conf_body}"
+        try:
+            if await send(settings, int(broadcast_chat_id), broadcast_body):
+                log.info(
+                    "high_conf_broadcast_sent",
+                    fixture_id=fixture_id,
+                    chat_id=int(broadcast_chat_id),
+                )
+        except Exception as e:  # noqa: BLE001 -- broadcast must never break DMs
+            log.warning(
+                "high_conf_broadcast_failed",
+                fixture_id=fixture_id,
+                error=str(e),
+            )
+
     log.info("prematch_alert_sent", fixture_id=fixture_id, delivered=sent)
     return sent
 

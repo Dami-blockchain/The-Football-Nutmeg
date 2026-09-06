@@ -231,6 +231,16 @@ class Settings(BaseSettings):
     telegram_open_registration: bool = Field(
         default=True, alias="TELEGRAM_OPEN_REGISTRATION"
     )
+    # Optional group/channel broadcast target for high-confidence CALL alerts.
+    # BROADCAST-ONLY: when set, the SAME rendered high-conf alert is ALSO sent
+    # to this chat id (supergroups look like -100...), IN ADDITION to the
+    # operator/user DMs, which remain the primary target. Groups are NOT an
+    # approved paid surface -- the paywall keys on telegram_user_id -- so the
+    # broadcast copy never creates a reveal row, charge, or free-limit draw.
+    # Default unset (None) -> no broadcast; behaviour is byte-identical.
+    broadcast_chat_id: int | None = Field(
+        default=None, alias="BETBOT_BROADCAST_CHAT_ID"
+    )
 
     # ---- Interactive chat assistant (free-text Telegram, via Groq) ----
     # The chat runs on the FREE Groq API (OpenAI-compatible). No SDK by design —
