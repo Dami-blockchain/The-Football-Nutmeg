@@ -241,6 +241,16 @@ class Settings(BaseSettings):
     broadcast_chat_id: int | None = Field(
         default=None, alias="BETBOT_BROADCAST_CHAT_ID"
     )
+    # Read-only group commands: chat ids where a SMALL public subset of bot
+    # commands (/record, /title) may run IN a group. Comma-separated. Everything
+    # money/entitlement/reveal/free-text-LLM stays DM-only regardless of this.
+    # Default EMPTY -> only the broadcast group (BETBOT_BROADCAST_CHAT_ID) is
+    # enabled, if one is set; an arbitrary group the bot is added to gets NOTHING.
+    # Set an explicit list to override (a list that omits the broadcast id turns
+    # in-group commands off there too).
+    telegram_group_command_chat_ids: str = Field(
+        default="", alias="BETBOT_GROUP_COMMAND_CHAT_IDS"
+    )
 
     # ---- Interactive chat assistant (free-text Telegram, via Groq) ----
     # The chat runs on the FREE Groq API (OpenAI-compatible). No SDK by design —
@@ -295,6 +305,27 @@ class Settings(BaseSettings):
                 except ValueError:
                     pass
         return ids
+
+    @property
+    def group_command_chat_ids(self) -> set[int]:
+        """Chat ids where the read-only group command subset is allowed.
+
+        An explicit BETBOT_GROUP_COMMAND_CHAT_IDS wins; otherwise the ONLY
+        enabled group is the broadcast chat (if set), so adding the bot to an
+        arbitrary group grants it no commands.
+        """
+        raw = (self.telegram_group_command_chat_ids or "").strip()
+        if raw:
+            out: set[int] = set()
+            for part in raw.split(","):
+                part = part.strip()
+                if part:
+                    try:
+                        out.add(int(part))
+                    except ValueError:
+                        pass
+            return out
+        return {self.broadcast_chat_id} if self.broadcast_chat_id else set()
 
     @property
     def mode(self) -> str:

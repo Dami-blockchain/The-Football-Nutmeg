@@ -14,6 +14,7 @@ set:  python -m betbot.telegram_bot
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 
 from telegram import Update
@@ -77,6 +78,39 @@ def _authed(handler):
         return await handler(update, ctx)
 
     return wrapper
+
+
+#: Per-chat debounce for the read-only group command subset. A group can hold
+#: arbitrary people, so one accepted reply per chat per window bounds spam.
+_GROUP_CMD_COOLDOWN_S: float = 5.0
+_group_cmd_last: dict[int, float] = {}
+
+
+def _group_throttled(chat_id: int) -> bool:
+    """True if a group command fired in this chat within the cooldown."""
+    now = time.monotonic()
+    last = _group_cmd_last.get(chat_id)
+    if last is not None and now - last < _GROUP_CMD_COOLDOWN_S:
+        return True
+    _group_cmd_last[chat_id] = now
+    return False
+
+
+def _reject_group(update: Update) -> bool:
+    """Gate a read-only group command. Returns True to SKIP (reply nothing).
+
+    Defense in depth on top of the per-chat handler filter: re-checks that the
+    chat is a non-private, explicitly approved group, then debounces per chat.
+    Never registers a user, reveals a call, charges, consumes a free draw, or
+    reads any per-user state -- so an arbitrary group member cannot use it to
+    reach a paid/private surface.
+    """
+    chat = getattr(update, "effective_chat", None)
+    if chat is None or chat.type == "private":
+        return True
+    if chat.id not in get_settings().group_command_chat_ids:
+        return True
+    return _group_throttled(chat.id)
 
 
 def build_onboarding_guide(user, settings) -> str:
@@ -245,9 +279,12 @@ async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-@_authed
-async def record_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Rolling prediction accuracy (free). Accuracy — NOT a profit/edge claim."""
+def _render_record_body() -> str:
+    """Rolling prediction accuracy (free). Accuracy — NOT a profit/edge claim.
+
+    Pure and read-only: aggregate track record only, no per-user state, no
+    reveal, no charge. Shared by the private and approved-group /record.
+    """
     from betbot.storage.repos import track_record
 
     tr = track_record(30)
@@ -288,7 +325,24 @@ async def record_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             + "\n_This is prediction accuracy, not proof of profit or betting edge._"
             + small
         )
-    await update.message.reply_text(body, parse_mode=ParseMode.MARKDOWN)
+    return body
+
+
+@_authed
+async def record_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        _render_record_body(), parse_mode=ParseMode.MARKDOWN
+    )
+
+
+async def record_group_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/record in an approved group: the SAME public aggregate as the DM, with
+    no auth, no register, no reveal, no charge. Debounced per chat."""
+    if _reject_group(update):
+        return
+    await update.message.reply_text(
+        _render_record_body(), parse_mode=ParseMode.MARKDOWN
+    )
 
 
 def _format_title_race(result: dict, code: str) -> str:
@@ -374,12 +428,13 @@ def _format_cl_winner(result: dict) -> str:
     return "\n".join(lines) + "\n\n_" + " ".join(note_bits) + "_"
 
 
-@_authed
-async def title_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Season-title race for a league (default La Liga), or /title CL. FREE, cached."""
+async def _title_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Render the cached season-title / CL-winner projection (default La Liga,
+    or /title CL). Read-only: reads only the public season caches -- no
+    per-user state, no register, no reveal, no charge. Shared by the private
+    and approved-group /title handlers."""
     from betbot.season_service import LEAGUE_NAMES, load_cache
 
-    _register(update)
     s = get_settings()
     arg = (ctx.args[0].upper() if ctx.args else "PD")
 
@@ -409,6 +464,22 @@ async def title_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         _format_title_race(result, code), parse_mode=ParseMode.MARKDOWN,
     )
+
+
+@_authed
+async def title_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/title in a private chat: auth first (via @_authed), then register the
+    caller (as today) and reply."""
+    _register(update)
+    await _title_reply(update, ctx)
+
+
+async def title_group_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/title in an approved group: the SAME public projection, but NO register
+    (no wallet created for a group member), no reveal, no charge. Debounced."""
+    if _reject_group(update):
+        return
+    await _title_reply(update, ctx)
 
 
 # Lazily constructed so importing this module never needs settings; tests
@@ -553,13 +624,25 @@ def build_application(settings) -> Application:
     app.add_handler(
         MessageHandler(~filters.ChatType.PRIVATE, log_group_chat), group=1
     )
-    # SECURITY: every command/message handler is PRIVATE-CHAT ONLY. Without
-    # this gate, once the bot is in a group ANY member's /predictions would post
-    # operator-entitlement reveals into the group AND write reveal rows — the
-    # paywall-in-groups leak (the paywall keys on telegram_user_id, and groups
-    # are not an approved paid surface). ``filters.ChatType.PRIVATE`` on each
-    # handler makes group messages fall through to the group=1 capture handler
-    # only. Broadcast to groups is one-way (send-only), never a paid surface.
+    # SECURITY: almost every command/message handler is PRIVATE-CHAT ONLY.
+    # Without that gate, once the bot is in a group ANY member's /predictions
+    # would post operator-entitlement reveals into the group AND write reveal
+    # rows — the paywall-in-groups leak (the paywall keys on telegram_user_id,
+    # and a group is not an approved paid surface). So /start, /help, /guide,
+    # /predictions, /balance, /status and the free-text LLM chat stay
+    # ``filters.ChatType.PRIVATE``: a group message falls through to the
+    # group=1 capture handler only, never a reply.
+    #
+    # The ONLY exception is a small READ-ONLY subset — /record and /title —
+    # which report already-public aggregate state (rolling accuracy; cached
+    # title/CL-winner projections). In an approved group (see
+    # settings.group_command_chat_ids, default: only BETBOT_BROADCAST_CHAT_ID)
+    # they run via SEPARATE handlers (record_group_cmd/title_group_cmd) that
+    # take the strictly-public branch: no _register (no wallet for a group
+    # member), no entitlement/per-user read, no PredictionReveal, no charge, no
+    # free-limit draw — and are debounced per chat. An unapproved group matches
+    # no handler and gets nothing. Broadcast to groups stays one-way
+    # (send-only), never a paid surface.
     _priv = filters.ChatType.PRIVATE
     app.add_handler(CommandHandler("start", start_cmd, filters=_priv))
     app.add_handler(CommandHandler("help", guide_cmd, filters=_priv))
@@ -569,7 +652,20 @@ def build_application(settings) -> Application:
     app.add_handler(CommandHandler("status", status_cmd, filters=_priv))
     app.add_handler(CommandHandler("record", record_cmd, filters=_priv))
     app.add_handler(CommandHandler("title", title_cmd, filters=_priv))
-    # Free-text → LLM assistant. Added LAST so commands keep priority.
+    # Read-only PUBLIC subset in approved groups only. Registered AFTER the
+    # private handlers; the allowlist filter keys on the exact approved chat
+    # ids, so a private chat (served above) and any unapproved group never
+    # match these.
+    group_ids = settings.group_command_chat_ids
+    if group_ids:
+        group_filter = (
+            filters.Chat(chat_id=list(group_ids)) & filters.ChatType.GROUPS
+        )
+        app.add_handler(CommandHandler("record", record_group_cmd, filters=group_filter))
+        app.add_handler(CommandHandler("title", title_group_cmd, filters=group_filter))
+    # Free-text → LLM assistant. Added LAST so commands keep priority. DM-only:
+    # the Groq free tier is a per-user daily cap with no coherent per-user
+    # accounting in a group.
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND & _priv, chat_handler)
     )
