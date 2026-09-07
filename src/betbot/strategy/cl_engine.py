@@ -30,12 +30,19 @@ Two safety guards (mirroring ClubStrategyEngine):
   bridging via ``normalize`` + ``TeamAliasResolver``) has no cross-league
   rating, so we defer to the form-based naive engine, exactly like the club
   engine's unknown-team guard.
-* **Stale/missing snapshot** — if ``clubelo_latest.csv`` is absent or older
-  than 14 days (by its own ``From`` column, not ``To`` and not file mtime),
-  the Elo edge is untrustworthy; we log once at ERROR and expose
-  ``snapshot_stale``/``snapshot_age_days``. An absent or unparseable file
-  leaves the club list empty, so every team is unresolved and every fixture
-  takes the naive path — degraded, but never wrong.
+* **Stale/missing snapshot** — the two cases differ and it matters:
+  - a snapshot that is *present but old* (older than 14 days by its own ``From``
+    column, not ``To`` and not file mtime) is STILL used: ``predict`` prices
+    every resolvable club off those aged ratings. Staleness here is a
+    read-only signal (``snapshot_stale``/``snapshot_age_days``, logged once at
+    ERROR) with no hard cutoff — there is intentionally no code that drops an
+    old-but-present file to naive, because a month-old cross-league snapshot is
+    a smaller error than pricing off nothing (or off a mis-scaled substitute).
+    The honest description of the degradation is "CL priced off N-day-old
+    ratings", and it worsens with age.
+  - a snapshot that is *absent or unparseable* leaves the club list empty, so
+    every team is unresolved and every fixture takes the naive path via the
+    unresolved-team guard below — degraded, but never wrong.
 
 Scope: Champions League only; the caller routes domestic leagues to the club
 engine and the World Cup to the international engine.
@@ -191,10 +198,12 @@ class EuropeanStrategyEngine:
     def _check_freshness(self, path: Path) -> None:
         """Record and announce whether the snapshot behind us is usable.
 
-        Logged at ERROR, not WARNING: a stale or missing ClubElo snapshot
-        silently drops every Champions League price back to the naive form
-        engine (~50.7% vs the CL engine's ~58.7% held-out accuracy), and that
-        is exactly the kind of degradation that must not pass unnoticed.
+        Logged at ERROR, not WARNING. Be precise about the two failure modes:
+        a *missing/empty* snapshot leaves every team unresolved and drops CL to
+        the naive form engine (~50.7% vs the CL engine's ~58.7% held-out
+        accuracy); a *present-but-stale* snapshot is still used and CL is priced
+        off those N-day-old ratings (a smaller, age-dependent error — there is
+        no hard cutoff). Either way the degradation must not pass unnoticed.
         ``snapshot_stale``/``snapshot_age_days`` are the read-only seam an
         operator notifier can poll; this module does not page anyone itself.
         """
@@ -215,12 +224,19 @@ class EuropeanStrategyEngine:
         self.snapshot_reason = reason
 
         if stale and not self._warned:
+            # Distinguish the two: an empty snapshot really does fall back to
+            # naive; a present-but-old one is still priced, just off aged ratings.
+            impact = (
+                "cl_predictions_fall_back_to_naive"
+                if not self._snapshot
+                else f"cl_priced_off_{age}d_old_ratings"
+            )
             log.error(
                 "clubelo_snapshot_stale",
                 path=str(path), reason=reason, age_days=age,
                 clubs=len(self._snapshot),
                 snapshot_date=None if self._snapshot_date is None else str(self._snapshot_date),
-                impact="cl_predictions_fall_back_to_naive",
+                impact=impact,
             )
             self._warned = True
 
