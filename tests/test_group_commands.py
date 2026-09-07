@@ -225,3 +225,52 @@ def test_group_command_debounced_per_chat(tmp_path, monkeypatch):
     asyncio.run(tb.record_group_cmd(upd2, _ctx()))
     assert upd1.message.sent, "first call in a chat replies"
     assert upd2.message.sent == [], "a rapid second call in the same chat is debounced"
+
+
+# -------------------------------------------------- auth ordering (open reg OFF)
+def _settings_open_reg_off(tmp_path):
+    return Settings(
+        TELEGRAM_BOT_TOKEN=FAKE_TOKEN,
+        BETBOT_BROADCAST_CHAT_ID=BROADCAST_ID,
+        TELEGRAM_OPEN_REGISTRATION=False,
+        BETBOT_WALLET_KEYFILE=str(tmp_path / "secrets" / "agent_wallet.key"),
+    )
+
+
+def _count_users() -> int:
+    from betbot.storage.models import User
+    with session_scope() as sess:
+        return sess.scalar(select(func.count()).select_from(User)) or 0
+
+
+def test_group_title_never_reads_per_user_state_even_with_open_reg_off(tmp_path, monkeypatch):
+    """The security bug (FIX 2): with @_authed on the shared body, an
+    approved-group /title from an unregistered member ran _allowed -> get_user
+    and could post 'Not authorized' INTO the group, disclosing that member's
+    registration status. The group path must NEVER touch per-user state; it
+    serves the public projection to anyone in an approved group."""
+    init_engine(tmp_path / "gc.sqlite")
+    tb._group_cmd_last.clear()
+    s = _settings_open_reg_off(tmp_path)
+    monkeypatch.setattr(tb, "get_settings", lambda: s)
+    calls: list = []
+    monkeypatch.setattr(tb, "get_user", lambda *a, **k: calls.append(1))
+    upd = _fake_update(BROADCAST_ID)
+    asyncio.run(tb.title_group_cmd(upd, _ctx()))
+    assert calls == [], "the group path must never call get_user (the disclosure vector)"
+    assert upd.message.sent, "an approved group still gets the public projection"
+    assert "Not authorized" not in upd.message.sent[0]
+    assert _count_users() == 0
+
+
+def test_private_title_auth_precedes_register_with_open_reg_off(tmp_path, monkeypatch):
+    """Regression (FIX 2): title_cmd must auth FIRST. With open registration off,
+    an unauthorized DM /title must be refused WITHOUT creating a User row or a
+    wallet keyfile first."""
+    init_engine(tmp_path / "priv.sqlite")
+    s = _settings_open_reg_off(tmp_path)
+    monkeypatch.setattr(tb, "get_settings", lambda: s)
+    upd = _fake_update(999, chat_type="private")
+    asyncio.run(tb.title_cmd(upd, _ctx()))
+    assert _count_users() == 0, "auth must precede register: no user row for an unauthorized DM"
+    assert upd.message.sent and "Not authorized" in upd.message.sent[0]

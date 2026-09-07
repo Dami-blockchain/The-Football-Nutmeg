@@ -428,7 +428,6 @@ def _format_cl_winner(result: dict) -> str:
     return "\n".join(lines) + "\n\n_" + " ".join(note_bits) + "_"
 
 
-@_authed
 async def _title_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Render the cached season-title / CL-winner projection (default La Liga,
     or /title CL). Read-only: reads only the public season caches -- no
@@ -467,8 +466,10 @@ async def _title_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+@_authed
 async def title_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """/title in a private chat: register the caller (as today), then reply."""
+    """/title in a private chat: auth first (via @_authed), then register the
+    caller (as today) and reply."""
     _register(update)
     await _title_reply(update, ctx)
 
