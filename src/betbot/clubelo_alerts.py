@@ -158,19 +158,41 @@ def _snap_str(status: SnapshotStatus) -> str:
 
 
 def format_stale_message(status: SnapshotStatus, *, wall_now: datetime) -> str:
-    """Operator message for a stale snapshot (first alert or daily reminder)."""
+    """Operator message for a stale snapshot (first alert or daily reminder).
+
+    States what actually happens, which depends on the snapshot:
+
+    * present but old — CL is still priced, just off N-day-old ratings (no hard
+      cutoff; a month-old API-scale file is a smaller error than a fresh
+      mis-scaled one, so we do not drop it);
+    * missing/unparseable — the club list is empty, so every CL fixture falls
+      back to the naive form engine.
+    """
+    present = status.exists and status.clubs > 0 and status.snapshot_date is not None
+    if present:
+        impact = (
+            f"CL is still priced, but off {_age_str(status)}-old ratings — "
+            "the older it gets, the worse the prices. (No hard cutoff: an aged "
+            "API-scale snapshot beats a fresh mis-scaled one.)"
+        )
+    else:
+        impact = (
+            "the snapshot is missing/unparseable, so every CL fixture is falling "
+            "back to the naive form engine until it recovers."
+        )
     return (
         "*⚠️ ClubElo snapshot is stale*\n\n"
         "The cross-league Elo feed the Champions League engine reads has not "
-        "refreshed, so every CL prediction is degrading to the naive form "
-        "engine until it recovers.\n\n"
+        f"refreshed, so {impact}\n\n"
         f"- File: `{status.path.name}`\n"
         f"- Snapshot date: {_snap_str(status)}\n"
         f"- Age: {_age_str(status)} (threshold {STALE_AFTER_DAYS} d)\n"
         f"- Reason: `{status.reason}`\n\n"
         "The daily http://api.clubelo.com refresh is failing upstream (their "
-        "backend). No action needed unless it persists — I retry through "
-        "the day, remind once daily while stale, and tell you when it recovers.\n"
+        "backend deactivated the CSV). No action needed unless it persists — I "
+        "retry through the day, refresh a site-scale coverage snapshot for "
+        "monitoring, remind once daily while stale, and tell you when it "
+        "recovers.\n"
         f"_Checked {eat_datetime(wall_now)}._"
     )
 

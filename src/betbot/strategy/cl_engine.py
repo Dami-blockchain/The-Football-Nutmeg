@@ -30,12 +30,19 @@ Two safety guards (mirroring ClubStrategyEngine):
   bridging via ``normalize`` + ``TeamAliasResolver``) has no cross-league
   rating, so we defer to the form-based naive engine, exactly like the club
   engine's unknown-team guard.
-* **Stale/missing snapshot** — if ``clubelo_latest.csv`` is absent or older
-  than 14 days (by its own ``From`` column, not ``To`` and not file mtime),
-  the Elo edge is untrustworthy; we log once at ERROR and expose
-  ``snapshot_stale``/``snapshot_age_days``. An absent or unparseable file
-  leaves the club list empty, so every team is unresolved and every fixture
-  takes the naive path — degraded, but never wrong.
+* **Stale/missing snapshot** — the two cases differ and it matters:
+  - a snapshot that is *present but old* (older than 14 days by its own ``From``
+    column, not ``To`` and not file mtime) is STILL used: ``predict`` prices
+    every resolvable club off those aged ratings. Staleness here is a
+    read-only signal (``snapshot_stale``/``snapshot_age_days``, logged once at
+    ERROR) with no hard cutoff — there is intentionally no code that drops an
+    old-but-present file to naive, because a month-old cross-league snapshot is
+    a smaller error than pricing off nothing (or off a mis-scaled substitute).
+    The honest description of the degradation is "CL priced off N-day-old
+    ratings", and it worsens with age.
+  - a snapshot that is *absent or unparseable* leaves the club list empty, so
+    every team is unresolved and every fixture takes the naive path via the
+    unresolved-team guard below — degraded, but never wrong.
 
 Scope: Champions League only; the caller routes domestic leagues to the club
 engine and the World Cup to the international engine.
@@ -45,6 +52,7 @@ from __future__ import annotations
 
 import csv
 import json
+from collections import Counter
 from datetime import date
 from pathlib import Path
 
@@ -60,6 +68,16 @@ from betbot.strategy.glicko import DRAW_CAP, DRAW_FLOOR
 log = get_logger(__name__)
 
 STALE_AFTER_DAYS = 14
+
+#: Degenerate-country guard thresholds (see _drop_degenerate_countries).
+#: ClubElo emits one identical placeholder Elo for every club of a league it
+#: has stopped rating; we drop a whole country only when a single Elo value is
+#: shared by at least DEGENERATE_MIN_CLUSTER of its clubs AND those clubs are a
+#: majority (>= DEGENERATE_MIN_FRACTION) of the country -- the stopped-league
+#: signature, distinct from the 3-way bottom-table promotion floor a healthy
+#: country shows.
+DEGENERATE_MIN_CLUSTER = 3
+DEGENERATE_MIN_FRACTION = 0.5
 
 
 def _elo_probs(elo_home: float, elo_away: float, home_adv: float, draw_rho: float):
@@ -86,8 +104,18 @@ def _load_snapshot(path: Path) -> tuple[dict[str, float], date | None]:
     Elo values outside the sanity band are dropped. A truncated final row such
     as ``2,Bayern,GER,1,20`` otherwise loads Bayern at Elo 20.0 and prices them
     as the worst team in Europe — silently wrong, which is the worst kind.
+
+    Degenerate-country guard: ClubElo emits one identical placeholder Elo for
+    every club of a league it has stopped rating -- the whole Ukrainian top
+    flight sat at a single 1241.82 in the 2026-08-31 snapshot, Shakhtar and
+    Dynamo Kyiv included, though their real API-scale ratings were 1587/1441.
+    Such a value is inside the sanity band and its clubs resolve by name, so
+    neither existing guard catches it and a CL side is priced off a bogus
+    rating. ``_drop_degenerate_countries`` drops every club of such a country
+    so its fixtures fall to the naive form path.
     """
     snap: dict[str, float] = {}
+    by_country: dict[str, list[tuple[str, float]]] = {}
     newest: date | None = None
     dropped = 0
     try:
@@ -103,6 +131,9 @@ def _load_snapshot(path: Path) -> tuple[dict[str, float], date | None]:
                     continue
                 if club:
                     snap[club] = elo
+                    by_country.setdefault(
+                        (row.get("Country") or "").strip(), []
+                    ).append((club, elo))
                 try:
                     dt = date.fromisoformat((row.get("From") or "").strip())
                 except ValueError:
@@ -111,6 +142,8 @@ def _load_snapshot(path: Path) -> tuple[dict[str, float], date | None]:
                     newest = dt
     except OSError:
         return {}, None
+    # Run the degenerate-country guard FIRST so kept= below is the final count.
+    _drop_degenerate_countries(snap, by_country)
     if dropped:
         log.error(
             "clubelo_snapshot_rows_dropped",
@@ -119,6 +152,48 @@ def _load_snapshot(path: Path) -> tuple[dict[str, float], date | None]:
         )
     return snap, newest
 
+
+def _drop_degenerate_countries(
+    snap: dict[str, float],
+    by_country: dict[str, list[tuple[str, float]]],
+) -> None:
+    """Drop every club of a country whose ratings collapsed to one value.
+
+    Mutates ``snap`` in place. A country is dropped only when a single Elo
+    value is shared by ``>= DEGENERATE_MIN_CLUSTER`` of its clubs AND those
+    clubs are ``>= DEGENERATE_MIN_FRACTION`` of the country (the stopped-league
+    placeholder signature). The majority gate is deliberate: a literal
+    any-three-identical rule would also drop the real, distinct top ratings of
+    Belgium, the Netherlands and Romania -- whose three bottom clubs share a
+    promotion-floor value -- silently pushing live CL sides such as PSV and
+    Club Brugge to the naive path. Fires at ERROR (a whole country lost its
+    cross-league signal); a sub-majority identical cluster is logged at WARNING
+    and kept, so a later degenerate league stays answerable from the logs.
+    """
+    for country, entries in by_country.items():
+        if len(entries) < DEGENERATE_MIN_CLUSTER:
+            continue
+        value, n = Counter(elo for _club, elo in entries).most_common(1)[0]
+        if n < DEGENERATE_MIN_CLUSTER:
+            continue
+        if n >= DEGENERATE_MIN_FRACTION * len(entries):
+            clubs = sorted(club for club, _elo in entries)
+            for club in clubs:
+                snap.pop(club, None)
+            log.error(
+                "clubelo_degenerate_country_dropped",
+                country=country, shared_elo=value,
+                cluster=n, country_clubs=len(entries), clubs=clubs,
+                reason="identical_elo_majority_placeholder",
+                impact="all_country_fixtures_fall_back_to_naive",
+            )
+        else:
+            log.warning(
+                "clubelo_identical_elo_cluster",
+                country=country, shared_elo=value,
+                cluster=n, country_clubs=len(entries),
+                reason="benign_bottom_table_floor_not_dropped",
+            )
 
 def _load_dc_params(path: Path) -> dc.DCParams | None:
     try:
@@ -191,10 +266,12 @@ class EuropeanStrategyEngine:
     def _check_freshness(self, path: Path) -> None:
         """Record and announce whether the snapshot behind us is usable.
 
-        Logged at ERROR, not WARNING: a stale or missing ClubElo snapshot
-        silently drops every Champions League price back to the naive form
-        engine (~50.7% vs the CL engine's ~58.7% held-out accuracy), and that
-        is exactly the kind of degradation that must not pass unnoticed.
+        Logged at ERROR, not WARNING. Be precise about the two failure modes:
+        a *missing/empty* snapshot leaves every team unresolved and drops CL to
+        the naive form engine (~50.7% vs the CL engine's ~58.7% held-out
+        accuracy); a *present-but-stale* snapshot is still used and CL is priced
+        off those N-day-old ratings (a smaller, age-dependent error — there is
+        no hard cutoff). Either way the degradation must not pass unnoticed.
         ``snapshot_stale``/``snapshot_age_days`` are the read-only seam an
         operator notifier can poll; this module does not page anyone itself.
         """
@@ -215,12 +292,19 @@ class EuropeanStrategyEngine:
         self.snapshot_reason = reason
 
         if stale and not self._warned:
+            # Distinguish the two: an empty snapshot really does fall back to
+            # naive; a present-but-old one is still priced, just off aged ratings.
+            impact = (
+                "cl_predictions_fall_back_to_naive"
+                if not self._snapshot
+                else f"cl_priced_off_{age}d_old_ratings"
+            )
             log.error(
                 "clubelo_snapshot_stale",
                 path=str(path), reason=reason, age_days=age,
                 clubs=len(self._snapshot),
                 snapshot_date=None if self._snapshot_date is None else str(self._snapshot_date),
-                impact="cl_predictions_fall_back_to_naive",
+                impact=impact,
             )
             self._warned = True
 
