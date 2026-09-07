@@ -142,13 +142,14 @@ def _load_snapshot(path: Path) -> tuple[dict[str, float], date | None]:
                     newest = dt
     except OSError:
         return {}, None
+    # Run the degenerate-country guard FIRST so kept= below is the final count.
+    _drop_degenerate_countries(snap, by_country)
     if dropped:
         log.error(
             "clubelo_snapshot_rows_dropped",
             path=str(path), dropped=dropped, kept=len(snap),
             reason="elo_out_of_sanity_band",
         )
-    _drop_degenerate_countries(snap, by_country)
     return snap, newest
 
 
