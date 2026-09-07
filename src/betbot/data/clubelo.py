@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import os
 import random
+import re
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -228,6 +229,289 @@ def _write_atomic(dest: Path, text: str) -> None:
         tmp.unlink(missing_ok=True)
 
 
+# ============================================================================
+# HTML scrape fallback (clubelo.com website)
+# ----------------------------------------------------------------------------
+# The machine-readable CSV API (api.clubelo.com) was deactivated upstream
+# (``/Fixtures`` -> "Fixtures API deactivated"; dated endpoints -> 502). The
+# public website https://clubelo.com/ still serves the SAME ratings, fresh, as
+# HTML. This is the fallback path: fetch that page once per refresh, parse the
+# ranking table, and rebuild a CSV byte-compatible with the API's so nothing
+# downstream changes. The API stays PRIMARY (refresh_latest tries it first);
+# this only runs when the API path fails, and logs source="scrape" when it
+# serves so the operator can see which path fed the engine.
+#
+# Two scrape-specific realities the API did not have:
+#  * The website ranking is now WORLDWIDE, while the API CSV was Europe-only.
+#    We filter to the country set of the previous (last-known-good) snapshot so
+#    the scope, and the Ecuador-"Barcelona" / Uruguay-"Liverpool" name
+#    collisions that come with non-European clubs, are excluded.
+#  * Website display names differ from the API's short names ("Internazionale"
+#    vs "Inter", "Bayern München" vs "Bayern"). Rather than invent a second
+#    matcher, we CANONICALISE every scraped club back to the previous snapshot's
+#    name via the SAME TeamAliasResolver the CL engine resolves fixtures with,
+#    so the emitted Club column is identical to what the API produced. Clubs in
+#    the previous snapshot we cannot refresh, and new top-flight clubs we cannot
+#    canonicalise, are surfaced in the returned report — never silently dropped.
+
+SCRAPE_URL = "https://clubelo.com/"
+#: A stale free site behind Cloudflare-style filters 403s a default urllib UA;
+#: the codebase already needs a realistic browser UA for Highlightly.
+BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+_RE_TR = re.compile(r"(?=<tr)")
+_RE_FLAG = re.compile(r'<img alt="([A-Z]{3})"')
+_RE_LEVEL = re.compile(r"Level (\d+) \(\d+ teams\)")
+_RE_RANK = re.compile(r"<small>\s*(\d+)\s*</small>")
+_RE_SLUG = re.compile(r'<a href="/([^"]+)"><span class="(?:NonAst|Ast)">')
+_RE_NAME = re.compile(r'<span class="Ast">([^<]+)</span>')
+_RE_RATING = re.compile(r'<td class="r">(-?\d+)</td>')
+_RE_SNAPDATE = re.compile(r'<h1><a href="/(\d{4}-\d{2}-\d{2})/">')
+
+
+@dataclass(frozen=True)
+class ScrapedClub:
+    rank: int | None
+    name: str
+    country: str | None
+    level: int | None
+    elo: int
+
+
+def _parse_clubelo_html(html: str) -> tuple[list[ScrapedClub], date | None]:
+    """Parse the clubelo.com ranking page into rows + the snapshot date.
+
+    The ranking is a sequence of per-country ``<table class="ast">`` blocks,
+    each row carrying the country (flag ``<img alt="XXX">``, carried forward
+    within a block), a global rank, an optional club link (top clubs are linked,
+    deep lower-division clubs are plain ``<span class="Ast">`` text) and an
+    integer Elo in ``<td class="r">``. The eloData JS widget at the top has no
+    ``<span class="Ast">`` cell, so requiring that span cleanly excludes it.
+
+    The snapshot date is the ``/YYYY-MM-DD/`` in the page ``<h1>`` — the date
+    the ratings are effective, which is what the staleness check needs.
+    """
+    md = _RE_SNAPDATE.search(html)
+    snap_date: date | None = None
+    if md:
+        try:
+            snap_date = date.fromisoformat(md.group(1))
+        except ValueError:
+            snap_date = None
+
+    rows: list[ScrapedClub] = []
+    country: str | None = None
+    level: int | None = None
+    for tr in _RE_TR.split(html):
+        ml = _RE_LEVEL.search(tr)
+        if ml:
+            level = int(ml.group(1))
+        fl = _RE_FLAG.search(tr)
+        if fl:
+            country = fl.group(1)
+        nm = _RE_NAME.search(tr)
+        rt = _RE_RATING.search(tr)
+        if not (nm and rt):
+            continue
+        rk = _RE_RANK.search(tr)
+        name = nm.group(1).strip().replace(",", " ")
+        try:
+            elo = int(rt.group(1))
+        except ValueError:
+            continue
+        rows.append(
+            ScrapedClub(
+                rank=int(rk.group(1)) if rk else None,
+                name=name,
+                country=country,
+                level=level,
+                elo=elo,
+            )
+        )
+    return rows, snap_date
+
+
+def _read_previous_clubs(path: Path) -> list[dict[str, str]]:
+    """Rows of the last-known-good CSV as dicts, or [] if unreadable/absent."""
+    try:
+        import csv as _csv
+
+        with path.open(encoding="utf-8") as fh:
+            return [dict(r) for r in _csv.DictReader(fh)]
+    except (OSError, ValueError):
+        return []
+
+
+def _build_csv_from_scrape(
+    scraped: list[ScrapedClub],
+    previous: list[dict[str, str]],
+    *,
+    snap_date: date,
+    resolver=None,
+) -> tuple[str, dict[str, object]]:
+    """Render a CSV byte-compatible with the API snapshot from scraped rows.
+
+    Canonicalises scraped clubs to the previous snapshot's names so the Club
+    column is identical to the API's. Returns ``(csv_text, report)`` where the
+    report surfaces coverage gaps:
+
+    * ``unrefreshed`` — previous clubs with no scraped match (kept OUT of the
+      output so they take the CL engine's naive-fallback path, never a silently
+      stale rating);
+    * ``new_top_flight`` — scraped Level-1 clubs not in the previous snapshot,
+      emitted under their display name so a promoted side is still priced.
+    """
+    from betbot.exchanges.matcher import TeamAliasResolver
+
+    if resolver is None:
+        try:
+            resolver = TeamAliasResolver.from_yaml("config/team_aliases.yaml")
+        except (OSError, ValueError):
+            resolver = TeamAliasResolver()
+
+    euro = {r["Country"] for r in previous if r.get("Country")}
+    # Restrict to the API's (European) scope; if we have no previous snapshot to
+    # learn the scope from, keep every scraped row (cold-start, display names).
+    pool = [c for c in scraped if (not euro) or (c.country in euro)]
+    by_name = {c.name: c for c in pool}
+    names = list(by_name)
+
+    header = "Rank,Club,Country,Level,Elo,From,To"
+    frm = snap_date.isoformat()
+    lines: list[str] = [header]
+    claimed: set[str] = set()
+    unrefreshed: list[str] = []
+
+    if previous and names:
+        for prow in previous:
+            club = (prow.get("Club") or "").strip()
+            if not club:
+                continue
+            hit = resolver.match(club, names)
+            if hit is None or hit in claimed:
+                unrefreshed.append(club)
+                continue
+            claimed.add(hit)
+            sc = by_name[hit]
+            rank = sc.rank if sc.rank is not None else (prow.get("Rank") or "0")
+            country = (prow.get("Country") or sc.country or "").strip()
+            level = (prow.get("Level") or (str(sc.level) if sc.level else "1")).strip()
+            lines.append(f"{rank},{club},{country},{level},{sc.elo},{frm},{frm}")
+    else:
+        # Cold start: emit scraped rows directly under display names.
+        for sc in pool:
+            claimed.add(sc.name)
+            lines.append(
+                f"{sc.rank or 0},{sc.name},{sc.country or ''},"
+                f"{sc.level or 1},{sc.elo},{frm},{frm}"
+            )
+
+    # New top-flight clubs the previous snapshot did not have.
+    new_top: list[str] = []
+    if previous:
+        for sc in pool:
+            if sc.name in claimed or sc.level != 1:
+                continue
+            new_top.append(sc.name)
+            country = (sc.country or "").strip()
+            lines.append(
+                f"{sc.rank or 0},{sc.name},{country},{sc.level or 1},{sc.elo},{frm},{frm}"
+            )
+
+    report: dict[str, object] = {
+        "scraped_total": len(scraped),
+        "in_scope": len(pool),
+        "emitted": len(lines) - 1,
+        "unrefreshed_count": len(unrefreshed),
+        "unrefreshed": unrefreshed[:40],
+        "new_top_flight_count": len(new_top),
+        "new_top_flight": new_top[:40],
+    }
+    return "\n".join(lines) + "\n", report
+
+
+def scrape_latest(
+    dest: Path,
+    *,
+    timeout: int = DEFAULT_TIMEOUT,
+    retries: int = DEFAULT_RETRIES,
+    sleep=time.sleep,
+    resolver=None,
+    html: str | None = None,
+) -> bool:
+    """Fallback refresh: rebuild ``dest`` from the clubelo.com website HTML.
+
+    Fetches the ranking page once (polite: realistic UA, short timeout, bounded
+    jittered-backoff retry, never hammered), parses it, canonicalises names
+    against the existing ``dest`` snapshot, validates the rebuilt CSV with the
+    same ``_validate`` gate the API path uses, and writes it atomically. Returns
+    True only when a valid snapshot was written. ``html`` is injectable so tests
+    parse a captured fixture instead of hitting the network.
+    """
+    dest = Path(dest)
+    previous = _read_previous_clubs(dest)
+
+    if html is None:
+        attempts = max(1, retries)
+        last_error = "unknown"
+        for attempt in range(attempts):
+            try:
+                req = urllib.request.Request(SCRAPE_URL, headers={"User-Agent": BROWSER_UA})
+                with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+                    html = resp.read().decode("utf-8", errors="replace")
+                break
+            except Exception as e:  # noqa: BLE001 — fallback must never crash the caller
+                last_error = f"{e.__class__.__name__}: {e}"
+                if attempt + 1 < attempts:
+                    delay = min(BACKOFF_CAP, BACKOFF_BASE * (2**attempt)) * (
+                        1.0 + random.random() * 0.25
+                    )
+                    log.warning(
+                        "clubelo_scrape_attempt_failed",
+                        attempt=attempt + 1, attempts=attempts,
+                        error=last_error, retry_in_s=round(delay, 1),
+                    )
+                    sleep(delay)
+                    continue
+        if html is None:
+            log.error("clubelo_scrape_fetch_failed", error=last_error, url=SCRAPE_URL)
+            return False
+
+    scraped, snap_date = _parse_clubelo_html(html)
+    if not scraped or snap_date is None:
+        log.error(
+            "clubelo_scrape_unparseable",
+            rows=len(scraped), have_date=snap_date is not None,
+        )
+        return False
+
+    csv_text, report = _build_csv_from_scrape(
+        scraped, previous, snap_date=snap_date, resolver=resolver
+    )
+    reason = _validate(csv_text)
+    if reason is not None:
+        log.error("clubelo_scrape_bad_payload", reason=reason, **report)
+        return False
+
+    _write_atomic(dest, csv_text)
+    log.info(
+        "clubelo_refreshed",
+        source="scrape", dest=str(dest), snapshot=snap_date.isoformat(),
+        clubs=report["emitted"], **report,
+    )
+    if report["unrefreshed_count"]:
+        log.warning(
+            "clubelo_scrape_coverage_gap",
+            unrefreshed_count=report["unrefreshed_count"],
+            unrefreshed=report["unrefreshed"],
+        )
+    return True
+
+
+
 def refresh_latest(
     dest: Path,
     *,
@@ -236,6 +520,7 @@ def refresh_latest(
     sleep=time.sleep,
     stale_after_days: int = STALE_AFTER_DAYS,
     snapshot_date: date | None = None,
+    scrape_fallback: bool = True,
 ) -> bool:
     """Fetch a ClubElo snapshot to ``dest`` (today's unless overridden).
 
@@ -280,6 +565,11 @@ def refresh_latest(
             # retrying will not change it, and we must not overwrite a good
             # snapshot with it.
             log.error("clubelo_refresh_bad_payload", reason=reason, head=text[:60], snapshot=d)
+            if not historical and scrape_fallback and scrape_latest(
+                dest, timeout=timeout, retries=retries, sleep=sleep
+            ):
+                log.info("clubelo_served_via_scrape_fallback", dest=str(dest))
+                return True
             if not historical:
                 check_snapshot_freshness(dest, stale_after_days=stale_after_days)
             return False
@@ -296,6 +586,11 @@ def refresh_latest(
         "clubelo_refresh_failed",
         error=last_error, attempts=attempts, timeout_s=timeout, url=url,
     )
+    if not historical and scrape_fallback and scrape_latest(
+        dest, timeout=timeout, retries=retries, sleep=sleep
+    ):
+        log.info("clubelo_served_via_scrape_fallback", dest=str(dest))
+        return True
     if not historical:
         check_snapshot_freshness(dest, stale_after_days=stale_after_days)
     return False

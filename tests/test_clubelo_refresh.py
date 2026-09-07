@@ -114,7 +114,9 @@ def test_retries_are_bounded_and_do_not_hammer(tmp_path, monkeypatch):
     monkeypatch.setattr(clubelo.urllib.request, "urlopen", _always_timeout)
     dest = tmp_path / "clubelo_latest.csv"
 
-    assert clubelo.refresh_latest(dest, retries=3, sleep=slept.append) is False
+    assert clubelo.refresh_latest(
+        dest, retries=3, sleep=slept.append, scrape_fallback=False
+    ) is False
     assert calls["n"] == 3
     assert len(slept) == 2  # no sleep after the final failure
     assert not dest.exists()
@@ -147,7 +149,9 @@ def test_bad_payload_is_not_retried_and_does_not_clobber(tmp_path, monkeypatch):
         return _Resp(b"Rank,Club,Country,Level,Elo,From,To\n1,X,ENG,1,99999,2026-01-01,2026-01-07\n")
 
     monkeypatch.setattr(clubelo.urllib.request, "urlopen", _garbage)
-    assert clubelo.refresh_latest(dest, retries=3, sleep=lambda _s: None) is False
+    assert clubelo.refresh_latest(
+        dest, retries=3, sleep=lambda _s: None, scrape_fallback=False
+    ) is False
     assert calls["n"] == 1
     assert dest.read_text() == good
 
