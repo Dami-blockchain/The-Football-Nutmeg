@@ -206,3 +206,56 @@ def test_unparseable_snapshot_degrades_to_naive(tmp_path, monkeypatch):
     naive = StrategyEngine(get_settings()).predict(ff)
     got = eng.predict(ff)
     assert (got.p_home, got.p_draw, got.p_away) == (naive.p_home, naive.p_draw, naive.p_away)
+
+
+def _degenerate_csv(frm: date) -> str:
+    """ENG healthy (distinct ratings) + UKR fully collapsed to one placeholder."""
+    to = frm + timedelta(days=10)
+    rows = [_HEADER]
+    for i in range(4):
+        rows.append(f"{i + 1},Eng {i},ENG,1,{1800 - i * 40}.0,{frm.isoformat()},{to.isoformat()}")
+    for i in range(4):
+        rows.append(f"None,Ukr {i},UKR,1,1241.81884766,{frm.isoformat()},{to.isoformat()}")
+    return "\n".join(rows) + "\n"
+
+
+def test_degenerate_country_is_dropped_from_snapshot(tmp_path):
+    """All UKR clubs share one placeholder Elo -> the whole country is dropped
+    (the live Shakhtar-at-1241.82 defect); the healthy ENG country is untouched."""
+    p = tmp_path / "c.csv"
+    p.write_text(_degenerate_csv(date.today()))
+    snap, _ = _load_snapshot(p)
+    assert not any(k.startswith("Ukr ") for k in snap)   # every collapsed club gone
+    assert snap["Eng 0"] == 1800.0                        # healthy country survives
+    assert len(snap) == 4
+
+
+def test_benign_bottom_table_floor_is_kept(tmp_path):
+    """A minority (3 of 8) identical bottom-floor cluster is NOT a stopped league:
+    dropping it would nuke the country's real top ratings (the PSV/Brugge case)."""
+    frm = date.today()
+    to = frm + timedelta(days=10)
+    rows = [_HEADER]
+    for i in range(5):
+        rows.append(f"{i + 1},Bel {i},BEL,1,{1700 - i * 50}.0,{frm.isoformat()},{to.isoformat()}")
+    for i in range(3):
+        rows.append(f"None,Bel low {i},BEL,1,1350.29199219,{frm.isoformat()},{to.isoformat()}")
+    p = tmp_path / "c.csv"
+    p.write_text("\n".join(rows) + "\n")
+    snap, _ = _load_snapshot(p)
+    assert snap["Bel 0"] == 1700.0        # real top rating survives
+    assert "Bel low 0" in snap            # minority floor cluster kept, not dropped
+    assert len(snap) == 8
+
+
+def test_degenerate_country_fixture_falls_back_to_naive(tmp_path, monkeypatch):
+    """A tie between two collapsed-country clubs takes the naive form path, not a
+    price off the bogus shared Elo."""
+    p = tmp_path / "c.csv"
+    p.write_text(_degenerate_csv(date.today()))
+    eng = _engine_on_file(p, monkeypatch, tmp_path)
+    ff = _ff("Ukr 0", "Ukr 1", hp=2.5, ap=0.4)
+    got = eng.predict(ff)
+    from betbot.strategy.engine import StrategyEngine
+    naive = StrategyEngine(get_settings()).predict(ff)
+    assert (got.p_home, got.p_draw, got.p_away) == (naive.p_home, naive.p_draw, naive.p_away)

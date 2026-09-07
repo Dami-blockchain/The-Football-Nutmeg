@@ -239,12 +239,15 @@ def _write_atomic(dest: Path, text: str) -> None:
 # ----------------------------------------------------------------------------
 # The machine-readable CSV API (api.clubelo.com) was deactivated upstream
 # (``/Fixtures`` -> "Fixtures API deactivated"; dated endpoints -> 502). The
-# public website https://clubelo.com/ still serves the SAME ratings, fresh, as
-# HTML. This is the fallback path: fetch that page once per refresh, parse the
-# ranking table, and rebuild a CSV byte-compatible with the API's so nothing
-# downstream changes. The API stays PRIMARY (refresh_latest tries it first);
-# this only runs when the API path fails, and logs source="scrape" when it
-# serves so the operator can see which path fed the engine.
+# public website https://clubelo.com/ still serves ratings, fresh, as HTML, but
+# on a DIFFERENT numeric scale from the API CSV the CL engine was
+# tuned on (see SCRAPE_MONITOR_NAME). So this is NOT an engine fallback: it does
+# not feed clubelo_latest.csv and never lets the engine price off site numbers.
+# It fetches the page once per refresh, parses the ranking table, and writes a
+# labelled, non-authoritative MONITORING snapshot (SCRAPE_MONITOR_NAME) for
+# coverage tracking and a future re-tune corpus. The engine keeps pricing off
+# the last real API snapshot, and the staleness alarm on clubelo_latest.csv is
+# deliberately left to fire — a fresh-but-mis-scaled file must never silence it.
 #
 # Two scrape-specific realities the API did not have:
 #  * The website ranking is now WORLDWIDE, while the API CSV was Europe-only.
@@ -268,19 +271,33 @@ BROWSER_UA = (
 )
 
 #: Sibling filename the scrape writes to. The scrape is NOT the engine's tuned
-#: input — the clubelo.com website publishes an "Elo +/- Golo" composite on a
-#: DIFFERENT scale from the ``api.clubelo.com`` CSV the CL engine was tuned on
-#: (measured: ``site ≈ 0.77 × api + 447``, with a level-dependent gap of +7 at
-#: the top to +175 at the bottom). Feeding raw site ratings to the API-tuned
-#: engine silently mis-prices every tie, and fitting an inverse bridge only
-#: launders noise: held-out, the bridge's per-club residual is ~34-46 API
-#: points even among CL-calibre clubs — larger than the ~18-20-point drift of a
-#: month-old API snapshot and comparable to the ~60-point rating *differences*
-#: that decide matches. So the scrape does NOT overwrite ``clubelo_latest.csv``;
-#: it lands here as a labelled, non-authoritative monitoring/coverage snapshot
-#: (site scale) while the engine keeps pricing off the last real API snapshot,
-#: and the staleness alarm on ``clubelo_latest.csv`` is deliberately left to
-#: fire — a fresh-but-mis-scaled file must never silence it.
+#: input — the clubelo.com website's table Elo is on a DIFFERENT scale from the
+#: ``api.clubelo.com`` CSV the CL engine was tuned on. CAUSE UNKNOWN, and it is
+#: NOT an "Elo +/- Golo" composite (an earlier guess since disproved: the table
+#: cell equals the site's own "Elo" field to within rounding; the "+/-" column
+#: is the since-yesterday delta, and Golo is a separate, uncorrelated metric).
+#: The residuals cluster by COUNTRY (e.g. ENG +49..+74, RUS -97, TUR -79),
+#: consistent with a re-calibrated site model rather than a fixed rescale.
+#: Feeding raw site ratings to the API-tuned engine would silently mis-price
+#: every tie, and the best bridge measured (a global slope + per-country offset)
+#: still leaves ~20.9 API pts/club residual and ~29.5 pts on the match
+#: difference d — comparable to the ~60-pt rating *differences* that decide
+#: matches. So the scrape does NOT overwrite ``clubelo_latest.csv``; it lands
+#: here as a labelled, non-authoritative monitoring/coverage snapshot (site
+#: scale) while the engine keeps pricing off the last real API snapshot, and the
+#: staleness alarm is deliberately left to fire — a fresh-but-mis-scaled file
+#: must never silence it.
+#:
+#: This is NOT an argument for permanent inaction: a pinned API-scale file only
+#: beats the best bridge while it is young. Measured drift of the pinned file:
+#: 15.4 pts/club @30d, 22.7 @60d, 27.0 @90d, 29.0 @120d (21.8/32.0/38.3/40.7 on
+#: d). It crosses the best bridge (~20.9/club, 29.5 on d) at ~90-100 days
+#: in-season — roughly EARLY DECEMBER 2026 for a 2026-08-31 pin; past that the
+#: bridged site feed is the smaller error and the re-tune should ship. For
+#: whoever builds it: the bridge is global slope + per-country offset (Golo does
+#: NOT help), and Approach B (Glicko) is out on coverage —
+#: scripts/fetch_club_results.py seeds only PL/PD/BL1/SA/FL1, so Glicko has NO
+#: rating at all for Sporting, PSV, Galatasaray, Bodø/Glimt or Shakhtar.
 SCRAPE_MONITOR_NAME = "clubelo_scrape_latest.csv"
 
 #: clubelo.com's website and the api.clubelo.com CSV disagree on the country
@@ -419,8 +436,9 @@ def _build_csv_from_scrape(
     reference snapshot's names.
 
     This is NOT the engine's tuned input (see ``SCRAPE_MONITOR_NAME``): the
-    website's "Elo +/- Golo" numbers are on a different scale from the API CSV,
-    so this file exists only for coverage monitoring and to accumulate a
+    website's table Elo is on a different scale from the API CSV (cause unknown,
+    country-dependent — not a Golo composite), so this file exists only for
+    coverage monitoring and to accumulate a
     site-scale history for a possible future re-tune. It still canonicalises to
     the reference names so the two are directly comparable.
 
@@ -587,8 +605,9 @@ def scrape_latest(
     """Scrape clubelo.com into ``dest`` as a SITE-SCALE monitoring snapshot.
 
     ``dest`` is the monitoring file (:data:`SCRAPE_MONITOR_NAME`), NOT the CL
-    engine's tuned ``clubelo_latest.csv``: the website's "Elo +/- Golo" numbers
-    are on a different scale, and writing them into the engine's input would
+    engine's tuned ``clubelo_latest.csv``: the website's table Elo is on a
+    different scale (cause unknown, country-dependent — not a Golo composite),
+    and writing it into the engine's input would
     silently mis-price every tie AND — because a scrape stamps today's ``From``
     date — quietly silence the staleness alarm on a mis-scaled file. So the
     engine keeps reading the last real API snapshot; this file is only for
@@ -709,8 +728,9 @@ def refresh_latest(
     existing snapshot is left UNTOUCHED, its age is checked (a stale one logs at
     ERROR so the degradation is visible), and this returns ``False``.
 
-    The clubelo.com website is NOT used to refresh ``dest``. Its "Elo +/- Golo"
-    numbers are on a different scale from this API CSV, so substituting them
+    The clubelo.com website is NOT used to refresh ``dest``. Its table Elo is on
+    a different scale from this API CSV (cause unknown, country-dependent — not a
+    Golo composite), so substituting it
     would silently mis-price the API-tuned CL engine and — by stamping today's
     date — hide the fact that the real feed is down. Instead, on an API failure
     a separate site-scale *monitoring* file is refreshed beside ``dest`` (see

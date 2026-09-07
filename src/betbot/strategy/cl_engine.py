@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import csv
 import json
+from collections import Counter
 from datetime import date
 from pathlib import Path
 
@@ -67,6 +68,16 @@ from betbot.strategy.glicko import DRAW_CAP, DRAW_FLOOR
 log = get_logger(__name__)
 
 STALE_AFTER_DAYS = 14
+
+#: Degenerate-country guard thresholds (see _drop_degenerate_countries).
+#: ClubElo emits one identical placeholder Elo for every club of a league it
+#: has stopped rating; we drop a whole country only when a single Elo value is
+#: shared by at least DEGENERATE_MIN_CLUSTER of its clubs AND those clubs are a
+#: majority (>= DEGENERATE_MIN_FRACTION) of the country -- the stopped-league
+#: signature, distinct from the 3-way bottom-table promotion floor a healthy
+#: country shows.
+DEGENERATE_MIN_CLUSTER = 3
+DEGENERATE_MIN_FRACTION = 0.5
 
 
 def _elo_probs(elo_home: float, elo_away: float, home_adv: float, draw_rho: float):
@@ -93,8 +104,18 @@ def _load_snapshot(path: Path) -> tuple[dict[str, float], date | None]:
     Elo values outside the sanity band are dropped. A truncated final row such
     as ``2,Bayern,GER,1,20`` otherwise loads Bayern at Elo 20.0 and prices them
     as the worst team in Europe — silently wrong, which is the worst kind.
+
+    Degenerate-country guard: ClubElo emits one identical placeholder Elo for
+    every club of a league it has stopped rating -- the whole Ukrainian top
+    flight sat at a single 1241.82 in the 2026-08-31 snapshot, Shakhtar and
+    Dynamo Kyiv included, though their real API-scale ratings were 1587/1441.
+    Such a value is inside the sanity band and its clubs resolve by name, so
+    neither existing guard catches it and a CL side is priced off a bogus
+    rating. ``_drop_degenerate_countries`` drops every club of such a country
+    so its fixtures fall to the naive form path.
     """
     snap: dict[str, float] = {}
+    by_country: dict[str, list[tuple[str, float]]] = {}
     newest: date | None = None
     dropped = 0
     try:
@@ -110,6 +131,9 @@ def _load_snapshot(path: Path) -> tuple[dict[str, float], date | None]:
                     continue
                 if club:
                     snap[club] = elo
+                    by_country.setdefault(
+                        (row.get("Country") or "").strip(), []
+                    ).append((club, elo))
                 try:
                     dt = date.fromisoformat((row.get("From") or "").strip())
                 except ValueError:
@@ -124,8 +148,51 @@ def _load_snapshot(path: Path) -> tuple[dict[str, float], date | None]:
             path=str(path), dropped=dropped, kept=len(snap),
             reason="elo_out_of_sanity_band",
         )
+    _drop_degenerate_countries(snap, by_country)
     return snap, newest
 
+
+def _drop_degenerate_countries(
+    snap: dict[str, float],
+    by_country: dict[str, list[tuple[str, float]]],
+) -> None:
+    """Drop every club of a country whose ratings collapsed to one value.
+
+    Mutates ``snap`` in place. A country is dropped only when a single Elo
+    value is shared by ``>= DEGENERATE_MIN_CLUSTER`` of its clubs AND those
+    clubs are ``>= DEGENERATE_MIN_FRACTION`` of the country (the stopped-league
+    placeholder signature). The majority gate is deliberate: a literal
+    any-three-identical rule would also drop the real, distinct top ratings of
+    Belgium, the Netherlands and Romania -- whose three bottom clubs share a
+    promotion-floor value -- silently pushing live CL sides such as PSV and
+    Club Brugge to the naive path. Fires at ERROR (a whole country lost its
+    cross-league signal); a sub-majority identical cluster is logged at WARNING
+    and kept, so a later degenerate league stays answerable from the logs.
+    """
+    for country, entries in by_country.items():
+        if len(entries) < DEGENERATE_MIN_CLUSTER:
+            continue
+        value, n = Counter(elo for _club, elo in entries).most_common(1)[0]
+        if n < DEGENERATE_MIN_CLUSTER:
+            continue
+        if n >= DEGENERATE_MIN_FRACTION * len(entries):
+            clubs = sorted(club for club, _elo in entries)
+            for club in clubs:
+                snap.pop(club, None)
+            log.error(
+                "clubelo_degenerate_country_dropped",
+                country=country, shared_elo=value,
+                cluster=n, country_clubs=len(entries), clubs=clubs,
+                reason="identical_elo_majority_placeholder",
+                impact="all_country_fixtures_fall_back_to_naive",
+            )
+        else:
+            log.warning(
+                "clubelo_identical_elo_cluster",
+                country=country, shared_elo=value,
+                cluster=n, country_clubs=len(entries),
+                reason="benign_bottom_table_floor_not_dropped",
+            )
 
 def _load_dc_params(path: Path) -> dc.DCParams | None:
     try:
