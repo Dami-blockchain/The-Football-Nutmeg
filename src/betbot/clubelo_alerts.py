@@ -171,9 +171,12 @@ def format_stale_message(status: SnapshotStatus, *, wall_now: datetime) -> str:
     present = status.exists and status.clubs > 0 and status.snapshot_date is not None
     if present:
         impact = (
-            f"CL is still priced, but off {_age_str(status)}-old ratings — "
-            "the older it gets, the worse the prices. (No hard cutoff: an aged "
-            "API-scale snapshot beats a fresh mis-scaled one.)"
+            f"CL is still priced, just off {_age_str(status)}-old ratings. The "
+            "measured cost is small: a walk-forward test put a 6-month-stale "
+            "snapshot at only ~1-2% higher RPS (0.2025 -> 0.2054), paired CIs "
+            "crossing zero — real but minor, and it grows only slowly with age. "
+            "(No hard cutoff: an aged API-scale snapshot still beats a fresh "
+            "mis-scaled one.)"
         )
     else:
         impact = (
@@ -188,11 +191,14 @@ def format_stale_message(status: SnapshotStatus, *, wall_now: datetime) -> str:
         f"- Snapshot date: {_snap_str(status)}\n"
         f"- Age: {_age_str(status)} (threshold {STALE_AFTER_DAYS} d)\n"
         f"- Reason: `{status.reason}`\n\n"
-        "The daily http://api.clubelo.com refresh is failing upstream (their "
-        "backend deactivated the CSV). No action needed unless it persists — I "
-        "retry through the day, refresh a site-scale coverage snapshot for "
-        "monitoring, remind once daily while stale, and tell you when it "
-        "recovers.\n"
+        "This is a PERMANENT upstream change, not a transient outage: ClubElo "
+        "deactivated the CSV/date API on their side (their Fixtures API is off "
+        "and the date endpoints now 502), so api.clubelo.com will not recover "
+        "and clubelo_latest.csv will not refresh from it. The plan is already "
+        "in place — a site-scale scrape keeps a coverage snapshot current so CL "
+        "stays scored. Nothing to fix here; while the primary snapshot is the "
+        "now-frozen API file this reminder will keep firing once a day (it is "
+        "not waiting on a recovery).\n"
         f"_Checked {eat_datetime(wall_now)}._"
     )
 

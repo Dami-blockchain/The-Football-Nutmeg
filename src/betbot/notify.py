@@ -229,9 +229,13 @@ def format_high_conf_alert(
     carries a bet/no-bet call defaulting to NO BET. The remaining honesty
     guard is the Market line (it says "unavailable" when there is no live
     quote, and never fabricates a price) plus the band-record stats. ``market`` is ``(side, implied_prob, decimal_price)`` when a quote is
-    available; the Polymarket matching path has been dead for weeks, so it is
-    normally ``None`` and the Market field says so HONESTLY rather than
-    fabricating a price. ``live_tally`` is passed straight to
+    available; the current high-conf caller passes ``None`` (no live
+    quote is wired into this path), so the Market field says so HONESTLY
+    rather than fabricating a price. NB Polymarket per-match 1X2 anchoring is
+    NOT dead in general — it works for EPL/La Liga/Bundesliga/Ligue 1 (it
+    fired as recently as 2026-09-07); it is unavailable only for the Champions
+    League and Serie A, where Polymarket lists tournament outrights rather than
+    per-match markets. ``live_tally`` is passed straight to
     :func:`format_band_line`.
 
     Gates/probabilities are read off the stored triple carried on ``pred``; this
