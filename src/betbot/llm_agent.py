@@ -39,6 +39,7 @@ from betbot.storage.repos import (
     has_revealed,
     predictions_for_kickoff_range,
 )
+from betbot.leagues import league_label
 from betbot.tips import format_prediction
 
 log = get_logger(__name__)
@@ -207,9 +208,11 @@ def build_prediction_context(user, settings, *, now: datetime | None = None) -> 
             lines.append("")
             lines.append(format_prediction(p, edge_threshold=settings.edge_threshold))
         else:
+            _league = league_label(getattr(p, "competition_code", None))
+            _tag = f" · {_league}" if _league else ""
             lines.append(
-                f"{p.home_team} v {p.away_team} — LOCKED (user must pay 1 USDC "
-                "to unlock; do NOT reveal the pick)"
+                f"{p.home_team} v {p.away_team}{_tag} — LOCKED (user must pay "
+                "1 USDC to unlock; do NOT reveal the pick)"
             )
     return "\n".join(lines)
 

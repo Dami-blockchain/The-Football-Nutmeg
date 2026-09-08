@@ -324,7 +324,9 @@ def test_high_conf_message_home_favourite_no_market(settings):
     body = notify.format_high_conf_alert(pred, _hc(settings), live_tally=(3, 4))
     assert "HIGH-CONFIDENCE ALERT" in body
     assert "Arsenal (HOME) v Everton (AWAY)" in body
-    assert ", PL," in body
+    # League shown as its human name, not the internal "PL" code.
+    assert ", Premier League," in body
+    assert ", PL," not in body
     assert "KO 17:00 EAT" in body  # 14:00 UTC -> 17:00 EAT (UTC+3)
     assert "Model: HOME 71% / draw 18% / away 11%" in body
     # Matching is dead: the Market field must say so, not fabricate a price.
@@ -332,6 +334,15 @@ def test_high_conf_message_home_favourite_no_market(settings):
     # Honest: with no quote the reason must NOT claim an edge-vs-price check.
     assert "*NO BET* (default; no live price to assess edge)" in body
     assert "Band record: p>=0.65 hits 72.8%" in body
+
+
+def test_high_conf_message_unknown_code_degrades_to_raw_code(settings):
+    # An unfamiliar competition (e.g. a historical World Cup style code) must
+    # fall back to the raw code, never crash and never render "None".
+    pred = _pred(1, 0.71, 0.18, 0.11, code="ZZ9")
+    body = notify.format_high_conf_alert(pred, _hc(settings), live_tally=None)
+    assert ", ZZ9," in body
+    assert "None" not in body
 
 
 def test_high_conf_message_labels_away_favourite():

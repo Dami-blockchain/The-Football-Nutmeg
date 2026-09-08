@@ -301,7 +301,7 @@ def test_context_payer_reveals_only_A_B_stays_locked(
     assert "Arsenal" in ctx and "Chelsea" in ctx
     assert "55%" in ctx  # A's p_home
     # B appears only as a LOCKED line — NO pick, NO probability leaked.
-    assert "Liverpool v Everton — LOCKED" in ctx
+    assert "Liverpool v Everton · Premier League — LOCKED" in ctx
     assert "60%" not in ctx  # B's p_home absent
     assert "18%" not in ctx  # B's p_away absent
     assert "*Bet:" not in ctx.split("LOCKED")[1]  # nothing after B leaks a pick
@@ -316,8 +316,8 @@ def test_context_locked_user_all_locked_no_probabilities(
 
     ctx = build_prediction_context(u, s, now=_KO)
 
-    assert "Arsenal v Chelsea — LOCKED" in ctx
-    assert "Liverpool v Everton — LOCKED" in ctx
+    assert "Arsenal v Chelsea · Premier League — LOCKED" in ctx
+    assert "Liverpool v Everton · Premier League — LOCKED" in ctx
     # No probabilities anywhere.
     for pct in ("55%", "60%", "25%", "22%", "20%", "18%"):
         assert pct not in ctx

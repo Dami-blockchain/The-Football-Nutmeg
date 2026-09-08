@@ -366,6 +366,9 @@ def test_matchday_notice_states_both_alert_times_and_hides_probs():
     )  # SA: early KO-55, late KO-10
     assert "Man City (H) v Arsenal (A)" in text
     assert "Inter (H) v Milan (A)" in text
+    # Each fixture carries its human league label (not the PL/SA code).
+    assert "Premier League" in text
+    assert "Serie A" in text
     # NO probability / edge / xG leakage.
     assert "%" not in text
     assert "xG" not in text

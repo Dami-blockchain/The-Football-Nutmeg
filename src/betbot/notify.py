@@ -20,6 +20,8 @@ pre-match alerts dead and said nothing.
 
 from __future__ import annotations
 
+from betbot.leagues import league_label
+
 import re
 import asyncio
 import time
@@ -232,13 +234,14 @@ def format_high_conf_alert(
     """
     home, away = pred.home_team, pred.away_team
     code = getattr(pred, "competition_code", "") or ""
+    league = league_label(code)
     triples = [("HOME", pred.p_home), ("DRAW", pred.p_draw), ("AWAY", pred.p_away)]
     top_pick, _top_p = max(triples, key=lambda kv: kv[1])
 
     ko = _kickoff_eat(pred)
     header = f"\U0001f3af *HIGH-CONFIDENCE ALERT* — {home} (HOME) v {away} (AWAY)"
-    if code:
-        header += f", {code}"
+    if league:
+        header += f", {league}"
     if ko:
         header += f", KO {ko} EAT"
 

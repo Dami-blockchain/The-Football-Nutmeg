@@ -30,6 +30,7 @@ class _Pred:
     home_xg: float | None = 1.44
     away_xg: float | None = 1.17
     kickoff: datetime = datetime(2026, 8, 1, 19, 30, tzinfo=timezone.utc)
+    competition_code: str = "PD"  # La Liga, to prove the human league label
     paper_bets: list = field(default_factory=list)
 
 
@@ -37,6 +38,10 @@ def test_format_prediction_has_home_away_tags_probs_and_no_bet_line():
     text = format_prediction(_Pred(), edge_threshold=0.05)
     assert "Man City (H)" in text
     assert "Arsenal (A)" in text
+    # League shown by its human name (not the "PD" code), never "None".
+    assert "La Liga" in text
+    assert "PD" not in text
+    assert "None" not in text
     # Model probabilities and kickoff are present.
     assert "H 39% / D 31% / A 30%" in text
     assert "22:30 EAT" in text  # 19:30 UTC rendered in EAT (UTC+3)
@@ -95,6 +100,7 @@ def test_format_locked_hides_probabilities():
     text = format_locked(_Pred())
     assert "Man City (H)" in text
     assert "Arsenal (A)" in text
+    assert "La Liga" in text  # league label on the paywall teaser too
     assert "22:30 EAT" in text  # 19:30 UTC rendered in EAT (UTC+3)
     assert "🔒" in text
     assert "1 USDC" in text
@@ -113,14 +119,29 @@ class _Outcome:
     correct: bool
     home_goals: int
     away_goals: int
+    competition_code: str = "PL"
 
 
 def test_format_result_correct_pick():
     o = _Outcome(0.60, 0.25, 0.15, "HOME", True, 2, 0)
-    text = format_result(o, "Arsenal", "Chelsea")
+    text = format_result(o, "Arsenal", "Chelsea", competition_code="PL")
     assert "Full time: Arsenal 2-0 Chelsea" in text
+    assert "Premier League" in text  # human league label on the result alert
     assert "Our call: Arsenal (H) — ✅ correct" in text
     assert "H 60% / D 25% / A 15%" in text
+
+
+def test_format_result_unknown_code_degrades_and_omits_when_missing():
+    o = _Outcome(0.60, 0.25, 0.15, "HOME", True, 2, 0)
+    # Unknown code -> raw code, never a crash, never "None".
+    raw = format_result(o, "A", "B", competition_code="WC")
+    assert "World Cup" in raw  # WC is mapped
+    other = format_result(o, "A", "B", competition_code="ZZ9")
+    assert "ZZ9" in other and "None" not in other
+    # No code at all (legacy caller) -> no league label, no "None".
+    none = format_result(o, "A", "B")
+    assert "None" not in none
+    assert " · " not in none
 
 
 def test_format_result_wrong_pick_away_label():

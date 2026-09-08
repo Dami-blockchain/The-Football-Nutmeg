@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from betbot.data.football_data import FootballDataClient
+from betbot.leagues import LEAGUE_DISPLAY_NAMES as _LEAGUE_DISPLAY_NAMES
 from betbot.logging import get_logger
 from betbot.strategy.club_engine import ClubStrategyEngine
 from betbot.strategy.glicko import Glicko2Rating, match_probabilities
@@ -35,12 +36,12 @@ from betbot.strategy.season_sim import Fixture, PlayedResult, Triple, simulate_s
 log = get_logger(__name__)
 
 # football-data.org competition code -> display name, for the /title header.
+# Title-race leagues (the 5 domestic top divisions /title projects over); names
+# come from the ONE canonical map in betbot.leagues (imported at top) so a
+# league is never spelled two ways. CL is excluded here (no single table).
 LEAGUE_NAMES: dict[str, str] = {
-    "PD": "La Liga",
-    "PL": "Premier League",
-    "BL1": "Bundesliga",
-    "SA": "Serie A",
-    "FL1": "Ligue 1",
+    code: _LEAGUE_DISPLAY_NAMES[code]
+    for code in ("PD", "PL", "BL1", "SA", "FL1")
 }
 
 _FINISHED = {"FINISHED", "AWARDED"}

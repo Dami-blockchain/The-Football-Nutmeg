@@ -28,6 +28,7 @@ Messages use Telegram Markdown (``parse_mode="Markdown"``), matching
 
 from __future__ import annotations
 
+from betbot.leagues import league_label
 from betbot.timefmt import eat_time
 
 
@@ -77,6 +78,9 @@ def format_prediction(
     home, away = pred.home_team, pred.away_team
     ko = _kickoff_str(pred)
     header = f"*{home} (H) v {away} (A)*"
+    league = league_label(getattr(pred, "competition_code", None))
+    if league:
+        header += f" · {league}"
     if ko:
         header += f" — {ko}"
 
@@ -171,6 +175,7 @@ def format_result(
     home_team: str,
     away_team: str,
     *,
+    competition_code: str | None = None,
     sold_triple: tuple[float, float, float] | None = None,
 ) -> str:
     """End-of-match RESULT ALERT body for one settled fixture.
@@ -205,9 +210,15 @@ def format_result(
             was_correct = sold_pick == outcome_row.actual_outcome
     verdict = "✅ correct" if was_correct else "❌ wrong"
     pick = _pick_label(picked, home_team, away_team)
-    lines = [
+    league = league_label(competition_code)
+    ft = (
         f"*Full time: {home_team} {outcome_row.home_goals}-"
-        f"{outcome_row.away_goals} {away_team}*",
+        f"{outcome_row.away_goals} {away_team}*"
+    )
+    if league:
+        ft += f" · {league}"
+    lines = [
+        ft,
         f"Our call: {pick} — {verdict}",
         f"Model had H {outcome_row.predicted_home:.0%} / "
         f"D {outcome_row.predicted_draw:.0%} / A {outcome_row.predicted_away:.0%}",
@@ -225,6 +236,9 @@ def format_locked(pred) -> str:
     home, away = pred.home_team, pred.away_team
     ko = _kickoff_str(pred)
     header = f"*{home} (H) v {away} (A)*"
+    league = league_label(getattr(pred, "competition_code", None))
+    if league:
+        header += f" · {league}"
     if ko:
         header += f" — {ko}"
     return f"{header}\n🔒 send 1 USDC (Polygon) to unlock this prediction"

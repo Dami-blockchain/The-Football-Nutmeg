@@ -54,6 +54,7 @@ from betbot.storage.repos import (
     record_reveal,
     upsert_prediction,
 )
+from betbot.leagues import league_label
 from betbot.tips import (
     format_locked,
     format_prediction,
@@ -329,8 +330,10 @@ def render_matchday_notice(settings, fixtures, day) -> str | None:
         if not high_conf_alert_passes(settings, f)[0]:
             continue
         qualifying += 1
+        league = league_label(getattr(f, "competition_code", None))
+        league_tag = f" · {league}" if league else ""
         lines.append(
-            f"*{f.home_team} (H) v {f.away_team} (A)* — "
+            f"*{f.home_team} (H) v {f.away_team} (A)*{league_tag} — "
             f"KO {ko_local:%H:%M} · 🔮 prediction at {early_local:%H:%M}, "
             f"confirmed-lineup update ~{late_local:%H:%M}"
         )
@@ -979,7 +982,9 @@ async def run_result_alerts(
         # revealed fixtures), so the result echoes what the user paid for rather
         # than the post-rescore triple on the outcome row.
         body = "*⚽ Result*\n\n" + format_result(
-            row, home, away, sold_triple=sold_triple(row.fixture_id)
+            row, home, away,
+            competition_code=getattr(row, "competition_code", None),
+            sold_triple=sold_triple(row.fixture_id),
         )
 
         # Audience: the operator (always) + every user who saw this prediction.
