@@ -143,10 +143,15 @@ class OddsProvider(Protocol):
 
     name: str
 
-    def fetch(self, leagues: Sequence[str]) -> list[MatchOdds]:
+    def fetch(self, leagues: Sequence[str]) -> list[MatchOdds] | None:
         """Blocking fetch of upcoming fixtures' prices for ``leagues``.
 
-        MUST NOT raise: a provider that cannot be reached returns ``[]``.
+        MUST NOT raise. Returns ``None`` when the source could not be REACHED
+        (HTTP error, timeout, DNS) — distinct from ``[]`` which means the
+        source WAS reached and legitimately lists no in-scope fixtures. The
+        shared service keeps its last-good cache on ``None`` and only replaces
+        it on a genuine (possibly empty) refresh; conflating the two is what
+        let a feed outage silently wipe a whole matchday's anchors (Defect A).
         """
         ...
 
@@ -226,10 +231,13 @@ class FootballDataCoUkProvider:
         self.skipped_fixtures = 0
 
     # -- public ---------------------------------------------------------
-    def fetch(self, leagues: Sequence[str]) -> list[MatchOdds]:
+    def fetch(self, leagues: Sequence[str]) -> list[MatchOdds] | None:
         raw = self._fetcher(self._fixtures_url, self._timeout)
-        if not raw:
-            return []
+        if raw is None:
+            # HTTP failure (``_http_get`` returns None on any exception).
+            # NOT the same as a 200 carrying no in-scope fixtures: a genuine
+            # empty file parses to ``[]`` below. See the Protocol contract.
+            return None
         return self.parse(raw, leagues, kind="prematch")
 
     def fetch_season(self, season: str, league: str, *, kind: str = "prematch") -> list[MatchOdds]:
@@ -370,12 +378,20 @@ class OddsService:
                 return sum(len(v) for v in self._index.values())
             self._last_request_at = self._clock()
             rows: list[MatchOdds] = []
+            any_success = False  # >=1 provider WAS reached (rows or empty list)
             for provider in self._providers:
                 try:
                     got = await asyncio.to_thread(provider.fetch, list(leagues))
                 except Exception as e:  # noqa: BLE001 — never break the alert path
                     log.warning("odds_provider_error", provider=provider.name, error=str(e))
                     continue
+                if got is None:
+                    # Provider could not be REACHED. Distinct from an empty
+                    # list (reached, no fixtures). Do not let it count as a
+                    # successful refresh — that is Defect A.
+                    log.warning("odds_provider_fetch_failed", provider=provider.name)
+                    continue
+                any_success = True
                 log.info("odds_provider_fetched", provider=provider.name, fixtures=len(got))
                 rows.extend(got)
                 unresolved = getattr(provider, "unresolved", None)
@@ -385,6 +401,27 @@ class OddsService:
                         provider=provider.name,
                         names=sorted(unresolved),
                     )
+            if not any_success:
+                # Every provider failed to be reached. KEEP the last-good index
+                # rather than wiping it, and do NOT advance ``_loaded_at`` so
+                # the cache stays stale and a recovered feed is re-primed at the
+                # next opportunity. ``_last_request_at`` (bumped above) enforces
+                # the 60s min-interval so a persistent outage is not hammered.
+                #
+                # DELIBERATELY no hard staleness cap on the retained index: a
+                # bounded ttl here would guard against a failure that cannot
+                # occur. ``quote`` matches on ``match_date`` (see below), so as
+                # the calendar rolls past the cached fixtures they simply stop
+                # matching and the anchor degrades to the safe ``no_quote``
+                # (unanchored) path — a stale index goes useless, never wrong.
+                # Do not add a cap without first defeating that date guard.
+                retained = sum(len(v) for v in self._index.values())
+                log.warning(
+                    "odds_refresh_failed_cache_retained",
+                    providers=len(self._providers),
+                    retained_rows=retained,
+                )
+                return retained
             self._reindex(rows)
             self._loaded_at = self._clock()
             return len(rows)

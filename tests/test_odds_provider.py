@@ -118,12 +118,23 @@ def test_nonsense_prices_are_rejected():
     assert p.fetch(["PD"]) == []
 
 
-def test_dead_feed_returns_no_rows_rather_than_raising():
-    assert _provider(payload=None).fetch(["PL"]) == []
+def test_dead_feed_returns_none_not_empty_list():
+    """A None from ``_http_get`` (503/timeout/DNS) must surface from ``fetch``
+    as None, distinct from a reached-but-empty ``[]``. OddsService relies on
+    that distinction to keep its last-good cache instead of wiping it on an
+    outage (Defect A)."""
+    assert _provider(payload=None).fetch(["PL"]) is None
 
 
 def test_garbage_payload_returns_no_rows():
     assert _provider(payload="not,a,fixtures,file\n1,2,3,4\n").fetch(["PL"]) == []
+
+
+def test_reached_but_empty_fixtures_file_is_empty_list_not_none():
+    """A 200 carrying only a header row = the feed was reached and lists no
+    fixtures. That is ``[]`` (a legitimate refresh), NOT ``None`` (a failure)."""
+    header_only = "Div,Date,Time,HomeTeam,AwayTeam,B365H,B365D,B365A\n"
+    assert _provider(payload=header_only).fetch(["PL"]) == []
 
 
 # ---------------------------------------------------------------------------
@@ -230,3 +241,109 @@ def test_quote_for_unresolvable_team_is_none():
 def test_quote_for_league_we_do_not_cover_is_none():
     svc = _primed_service()
     assert svc.quote("CL", date(2026, 8, 22), "Arsenal", "Man City") is None
+
+
+# ---------------------------------------------------------------------------
+# Defect A — a failed refresh must NOT wipe the last-good cache
+# ---------------------------------------------------------------------------
+_EMPTY_FIXTURES = "Div,Date,Time,HomeTeam,AwayTeam,B365H,B365D,B365A\\n"
+
+
+def _switchable_provider(state: dict, counter: list | None = None):
+    """Provider whose HTTP payload can change between calls. ``state['payload']``
+    is a CSV string (reached), ``''``/header-only (reached, empty), or None
+    (unreachable — what ``_http_get`` returns on any exception)."""
+
+    def fake_get(url, timeout):
+        if counter is not None:
+            counter.append(url)
+        return state["payload"]
+
+    return FootballDataCoUkProvider(_resolver(), fetcher=fake_get)
+
+
+class _FastRetry(_Settings):
+    odds_cache_ttl_seconds = 10.0
+    odds_min_request_interval_seconds = 5.0
+
+
+def _vallecano(svc: OddsService):
+    return svc.quote("PD", date(2026, 8, 20), "Rayo Vallecano", "Alaves")
+
+
+def test_503_mid_session_keeps_prior_index_and_does_not_advance_ttl():
+    calls: list[str] = []
+    now = [1000.0]
+    state = {"payload": FIXTURES_CSV}
+    svc = OddsService(_FastRetry(), providers=[_switchable_provider(state, calls)],
+                      clock=lambda: now[0])
+    primed = asyncio.run(svc.prime(["PD"]))
+    assert primed >= 1 and _vallecano(svc) is not None
+
+    # TTL expires AND the min-interval elapses, then the feed 503s.
+    now[0] += 20.0
+    state["payload"] = None
+    retained = asyncio.run(svc.prime(["PD"]))
+
+    assert retained == primed, "a 503 must NOT wipe the last-good index"
+    assert _vallecano(svc) is not None, "the primed quote must still be served"
+    assert len(calls) == 2, "it DID attempt the refresh"
+    # TTL not advanced: the service still considers itself stale, so a recovered
+    # feed is re-primed at the next opportunity rather than 6h from the outage.
+    assert svc._is_stale() is True
+
+
+def test_genuinely_empty_upstream_empties_cache_and_advances_ttl():
+    now = [1000.0]
+    state = {"payload": FIXTURES_CSV}
+    svc = OddsService(_FastRetry(), providers=[_switchable_provider(state)],
+                      clock=lambda: now[0])
+    assert asyncio.run(svc.prime(["PD"])) >= 1
+
+    # A reached-but-empty file is a SUCCESSFUL refresh that legitimately lists
+    # no fixtures — it replaces the cache and advances the TTL, unlike a 503.
+    now[0] += 20.0
+    state["payload"] = _EMPTY_FIXTURES
+    assert asyncio.run(svc.prime(["PD"])) == 0
+    assert _vallecano(svc) is None, "an empty refresh clears the cache"
+    assert svc._is_stale() is False, "an empty refresh still advances the TTL"
+
+
+def test_retry_backoff_respects_min_interval_after_a_failure():
+    calls: list[str] = []
+    now = [1000.0]
+    state = {"payload": None}  # feed down from the first call
+
+    class S(_Settings):
+        odds_cache_ttl_seconds = 10.0
+        odds_min_request_interval_seconds = 100.0
+
+    svc = OddsService(S(), providers=[_switchable_provider(state, calls)],
+                      clock=lambda: now[0])
+    assert asyncio.run(svc.prime(["PD"])) == 0
+    assert len(calls) == 1
+
+    # Still stale (nothing ever loaded), but the min-interval must suppress the
+    # retry so a persistent outage does not hammer the host.
+    now[0] += 20.0
+    assert asyncio.run(svc.prime(["PD"])) == 0
+    assert len(calls) == 1, "min-interval must hold back the early retry"
+
+    now[0] += 100.0  # interval elapsed -> retry allowed
+    asyncio.run(svc.prime(["PD"]))
+    assert len(calls) == 2
+
+
+def test_recovered_feed_reindexes_normally():
+    now = [1000.0]
+    state = {"payload": None}
+    svc = OddsService(_FastRetry(), providers=[_switchable_provider(state)],
+                      clock=lambda: now[0])
+    assert asyncio.run(svc.prime(["PD"])) == 0
+    assert _vallecano(svc) is None
+
+    now[0] += 20.0
+    state["payload"] = FIXTURES_CSV  # feed recovers
+    assert asyncio.run(svc.prime(["PD"])) >= 1
+    assert _vallecano(svc) is not None
+    assert svc._is_stale() is False
