@@ -170,3 +170,55 @@ def test_normalized_team_pair_is_orientation_agnostic():
     assert normalized_team_pair("Mexico", "South Africa") != normalized_team_pair(
         "Mexico", "Czech Republic"
     )
+
+
+# ----------------------------------------------------------------------
+# token-collision hardening (Braga bug + the swallow class)
+# ----------------------------------------------------------------------
+_CONFIG_ALIASES = (
+    Path(__file__).resolve().parents[1] / "config" / "team_aliases.yaml"
+)
+
+
+def test_exact_normalised_match_beats_fuzzy_partial():
+    # "Inter" must resolve to the exact "Inter", never the token-superset
+    # "Inter Turku" that a fuzzy partial would also score highly.
+    r = TeamAliasResolver()
+    assert r.match("Inter", ["Inter Turku", "Inter"]) == "Inter"
+    # Independent of candidate order.
+    assert r.match("Inter", ["Inter", "Inter Turku"]) == "Inter"
+
+
+def test_ambiguous_token_tie_returns_none_not_a_coin_flip():
+    # Without an alias, "Sporting Clube de Braga" scores 100 against BOTH
+    # "Braga" and "Sporting" (Sporting CP) via token-subset. The resolver must
+    # refuse rather than return a pool-order-dependent guess.
+    r = TeamAliasResolver()
+    assert r.match("Sporting Clube de Braga", ["Sporting", "Braga"]) is None
+    assert r.match("Sporting Clube de Braga", ["Braga", "Sporting"]) is None
+
+
+def test_braga_resolves_to_braga_not_sporting():
+    # With the shipped alias table the tie becomes an exact hit — and it is
+    # stable regardless of which club the pool lists first (ClubElo orders by
+    # rating, so Sporting CP 1758 precedes Braga 1677 in production).
+    r = TeamAliasResolver.from_yaml(_CONFIG_ALIASES)
+    assert r.match("Sporting Clube de Braga", ["Sporting", "Braga"]) == "Braga"
+    assert r.match("Sporting Clube de Braga", ["Braga", "Sporting"]) == "Braga"
+
+
+def test_sporting_cp_still_resolves_to_sporting():
+    # The sibling club must not regress: Sporting CP still lands on "Sporting".
+    r = TeamAliasResolver.from_yaml(_CONFIG_ALIASES)
+    assert r.match("Sporting Clube de Portugal", ["Sporting", "Braga"]) == "Sporting"
+
+
+def test_common_cl_short_names_still_resolve_uniquely():
+    # A spot-check that ordinary short-name subsets (not ambiguous) still
+    # resolve — the tie-guard must not break the normal case.
+    r = TeamAliasResolver.from_yaml(_CONFIG_ALIASES)
+    pool = ["Atalanta", "Leverkusen", "Frankfurt", "Sociedad", "Braga", "Sporting"]
+    assert r.match("Atalanta BC", pool) == "Atalanta"
+    assert r.match("Bayer 04 Leverkusen", pool) == "Leverkusen"
+    assert r.match("Eintracht Frankfurt", pool) == "Frankfurt"
+    assert r.match("Real Sociedad de Fútbol", pool) == "Sociedad"

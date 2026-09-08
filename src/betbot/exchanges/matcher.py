@@ -128,15 +128,32 @@ class TeamAliasResolver:
         if target in norm_to_original:
             return norm_to_original[target]
 
-        # 2) Fuzzy match over the normalised candidate forms.
-        best = process.extractOne(
+        # 2) Fuzzy match over the normalised candidate forms. token_set_ratio
+        # awards a perfect 100 to any token-*subset* match, so a multi-word
+        # query ("Sporting Clube de Braga") ties two DISTINCT candidates that
+        # each share one token ("Braga" AND "Sporting" — Sporting CP).
+        # ``process.extractOne`` would then return whichever the candidate pool
+        # happened to list first (ClubElo orders by rating, so the higher-rated
+        # WRONG club won), silently mis-pricing the fixture. So we take every
+        # top-scorer and refuse to guess when two distinct candidates tie at
+        # the top: genuinely ambiguous names are disambiguated up-front by the
+        # alias table (the exact-match pass above), never by a coin-flip here.
+        scored = process.extract(
             target,
             list(norm_to_original.keys()),
             scorer=fuzz.token_set_ratio,
+            limit=None,
         )
-        if best is not None and best[1] >= threshold:
-            return norm_to_original[best[0]]
-        return None
+        if not scored:
+            return None
+        top_score = scored[0][1]
+        if top_score < threshold:
+            return None
+        top_keys = [key for key, score, _ in scored if score == top_score]
+        if len(top_keys) > 1:
+            # Ambiguous tie between distinct clubs — do not mis-route.
+            return None
+        return norm_to_original[top_keys[0]]
 
     def same_team(
         self, a: str, b: str, *, threshold: float = DEFAULT_THRESHOLD

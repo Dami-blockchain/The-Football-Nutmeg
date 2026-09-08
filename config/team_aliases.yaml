@@ -43,6 +43,18 @@ aliases:
   "Stade Brestois 29": ["Brest", "Stade Brestois"]
   "Stade Rennais FC 1901": ["Rennes", "Stade Rennais", "Rennais"]
 
+  # ---- Portuguese clubs sharing the "sporting" token ----------------------
+  # ClubElo lists Sporting CP and Braga as the short names "Sporting" and
+  # "Braga", but CL results / football-data.org use "Sporting Clube de
+  # Portugal" and "Sporting Clube de Braga". Both normalise to a token set
+  # containing "sporting", so the fuzzy matcher ties them 100/100 — and the
+  # tie-guard would then return None, dropping the fixture to the naive
+  # engine. Fold each long name to its ClubElo short name so it resolves as
+  # an exact hit (deterministic, independent of pool order). Six historical
+  # CL matches were priced off Sporting CP's rating instead of Braga's.
+  "Braga": ["Sporting Braga", "Sporting Clube de Braga", "SC Braga"]
+  "Sporting": ["Sporting CP", "Sporting Clube de Portugal", "Sporting Lisbon", "Sporting Portugal"]
+
   # ---- National teams (World Cup 2026) -----------------------------------
   # Markets and football-data.org disagree on national-team naming far more
   # than on clubs (Korea Republic vs South Korea, Türkiye vs Turkey, …). These
