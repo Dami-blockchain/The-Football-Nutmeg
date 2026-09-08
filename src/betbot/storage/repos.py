@@ -17,6 +17,7 @@ from betbot.storage.models import (
     GlickoRating,
     KillSwitch,
     ModelPrediction,
+    MorningNoticeListing,
     PaperBet,
     PredictionOutcome,
     PredictionReveal,
@@ -1880,3 +1881,115 @@ def rescore_drift_stats() -> dict:
             "mean_delta": (st["_sum"] / n) if n else 0.0,
         }
     return {"n_fixtures": n_fixtures, "stages": stages_out}
+
+
+# ----------------------------------------------------------------------
+# Morning high-confidence notice listings (drop-notice reconciliation)
+# ----------------------------------------------------------------------
+def record_morning_listing(
+    fixture_id: int,
+    competition_code: str,
+    home_team: str,
+    away_team: str,
+    kickoff: datetime,
+    notice_day: str,
+) -> bool:
+    """Snapshot that ``fixture_id`` was NAMED in today's high-confidence morning
+    notice. Idempotent: a second call for the same fixture (a re-run of the
+    morning cron) is a no-op and NEVER resets ``drop_notified`` -- a drop notice
+    already sent must not be un-marked. Returns True if a NEW row was inserted.
+    """
+    with session_scope() as s:
+        exists = s.execute(
+            select(MorningNoticeListing.id)
+            .where(MorningNoticeListing.fixture_id == fixture_id)
+            .limit(1)
+        ).scalar_one_or_none()
+        if exists is not None:
+            return False
+        s.add(
+            MorningNoticeListing(
+                fixture_id=fixture_id,
+                competition_code=competition_code or "",
+                home_team=home_team or "Home",
+                away_team=away_team or "Away",
+                notice_day=notice_day,
+                kickoff=kickoff,
+            )
+        )
+        try:
+            s.flush()
+        except IntegrityError:
+            # Concurrent insert of the same fixture (two processes racing) -- the
+            # unique constraint held; treat as already-recorded.
+            s.rollback()
+            return False
+        return True
+
+
+def morning_listings_pending_by_ids(
+    fixture_ids: list[int],
+) -> list[MorningNoticeListing]:
+    """Pending (not yet drop-notified) morning listings for the given fixtures.
+
+    The EVENT-DRIVEN entry point: called the instant a fixture's confirmed-XI
+    (late) alert is suppressed, so it is scoped to that fixture and does NOT
+    apply the kickoff-window clause (the suppression itself proves the late-alert
+    lifecycle is over). Already-notified listings are excluded, so a re-fire is a
+    no-op.
+    """
+    if not fixture_ids:
+        return []
+    with session_scope() as s:
+        rows = list(
+            s.execute(
+                select(MorningNoticeListing)
+                .where(MorningNoticeListing.drop_notified.is_(False))
+                .where(MorningNoticeListing.fixture_id.in_(fixture_ids))
+                .order_by(MorningNoticeListing.kickoff.asc())
+            ).scalars()
+        )
+        s.expunge_all()
+        return rows
+
+
+def morning_listings_pending_drop_notice(
+    now: datetime, lead_minutes: int = 0, days: int = 1
+) -> list[MorningNoticeListing]:
+    """Morning-listed fixtures whose confirmed-XI (late) alert time has PASSED
+    and that have NOT yet been drop-notified, bounded to the last ``days`` so an
+    un-reconciled listing can never re-queue forever. Drives the periodic RETRY
+    safety-net sweep (the primary delivery is event-driven at suppression time).
+
+    The late alert fires at ``kickoff - lineup_confirm_lead`` (~KO-10); once that
+    instant has passed the fixture's final disposition (alerted, or silently
+    dropped) is settled, which is what makes the drift-below-then-back-above case
+    unambiguous. Expressed as ``kickoff <= now + lead_minutes`` so the sweep does
+    NOT wait for kickoff itself.
+    """
+    floor = now - timedelta(days=days)
+    cutoff = now + timedelta(minutes=lead_minutes)
+    with session_scope() as s:
+        rows = list(
+            s.execute(
+                select(MorningNoticeListing)
+                .where(MorningNoticeListing.drop_notified.is_(False))
+                .where(MorningNoticeListing.kickoff <= cutoff)
+                .where(MorningNoticeListing.kickoff >= floor)
+                .order_by(MorningNoticeListing.kickoff.asc())
+            ).scalars()
+        )
+        s.expunge_all()
+        return rows
+
+
+def mark_morning_drop_notified(fixture_id: int) -> None:
+    """Flag a morning-listed fixture as handled by the drop path so it is never
+    re-queued (a real send, or a deliberate consume)."""
+    with session_scope() as s:
+        row = s.execute(
+            select(MorningNoticeListing)
+            .where(MorningNoticeListing.fixture_id == fixture_id)
+        ).scalar_one_or_none()
+        if row is not None:
+            row.drop_notified = True

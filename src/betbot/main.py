@@ -35,6 +35,7 @@ from betbot.daily_jobs import (
     nairobi_day_bounds,
     register_daily_jobs,
     run_matchday_notice,
+    run_morning_drop_notices,
     run_result_alerts,
     send_prediction_alert,
 )
@@ -938,6 +939,16 @@ def run_daemon(
         except Exception as e:  # noqa: BLE001 — never crash the daemon
             get_logger(__name__).warning("result_alerts_failed", error=str(e))
 
+    async def _morning_drop_notice_tick() -> None:
+        # Periodic: tell the morning notice's audience when a fixture it NAMED
+        # has since dropped below the high-confidence bar and its call will not
+        # be sent — instead of the silent suppression. FREE, read-only on the
+        # money path; idempotent per fixture (drop_notified).
+        try:
+            await run_morning_drop_notices(get_settings())
+        except Exception as e:  # noqa: BLE001 — never crash the daemon
+            get_logger(__name__).warning("morning_drop_notices_failed", error=str(e))
+
     async def _alert_matches_upstream(
         settings, fixture_id: int, *, lead_minutes: int
     ) -> bool:
@@ -1027,6 +1038,25 @@ def run_daemon(
                         min_p=float(settings.high_conf_alert_min_p),
                         at="fire",
                     )
+                    # The confirmed-XI (late) alert is the LAST alert opportunity;
+                    # its suppression is the deterministic moment the lifecycle
+                    # ends. If this fixture was NAMED in the morning notice, tell
+                    # that audience it has dropped below the bar NOW (~KO-10)
+                    # instead of silence — event-driven, no clock race: a fixture
+                    # that climbed back above 0.65 would have PASSED above and
+                    # never reached here. Only the LATE tag fires this; an early
+                    # suppression defers to the late fire (it may recover). The
+                    # notice is FREE/idempotent; the periodic sweep is the retry.
+                    if tag == "late":
+                        try:
+                            await run_morning_drop_notices(
+                                settings, fixture_ids=[fixture_id]
+                            )
+                        except Exception as e:  # noqa: BLE001 — never crash the fire
+                            get_logger(__name__).warning(
+                                "morning_drop_notice_hook_failed",
+                                fixture_id=fixture_id, error=str(e),
+                            )
                     return
             league = baseline.competition_code if baseline else ""
             lead = (
@@ -1298,6 +1328,18 @@ def run_daemon(
             _settle_and_results_tick,
             trigger=IntervalTrigger(hours=2, timezone=timezone.utc),
             id="settle_and_results",
+        )
+        # Periodic (every 15m) RETRY SAFETY-NET for the morning drop notice. The
+        # notice is delivered EVENT-DRIVEN the instant the confirmed-XI (late)
+        # alert is suppressed (see _fire_prediction_alert), so it lands at ~KO-10.
+        # This sweep only retries a send that failed and catches any listing whose
+        # late job never fired, bounded to listings whose late-alert time
+        # (KO - lineup_confirm_lead) has passed. Cheap, FREE, idempotent.
+        add_async_job(
+            scheduler,
+            _morning_drop_notice_tick,
+            trigger=IntervalTrigger(minutes=15, timezone=timezone.utc),
+            id="morning_drop_notices",
         )
         # Belt-and-braces: catch anything registered through a raw add_job
         # that bypassed add_async_job. Loud, but never fatal to the daemon.
