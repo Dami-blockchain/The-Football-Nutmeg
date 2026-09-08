@@ -222,3 +222,14 @@ def test_common_cl_short_names_still_resolve_uniquely():
     assert r.match("Bayer 04 Leverkusen", pool) == "Leverkusen"
     assert r.match("Eintracht Frankfurt", pool) == "Frankfurt"
     assert r.match("Real Sociedad de Fútbol", pool) == "Sociedad"
+
+
+def test_cl_feed_spellings_resolve_to_clubelo_names():
+    # Live-feed spellings that differ from the ClubElo snapshot must resolve,
+    # or the CL fixture silently prices on the naive form engine.
+    r = TeamAliasResolver.from_yaml(_CONFIG_ALIASES)
+    pool = ["Paphos", "Karabakh Agdam", "Real Madrid", "Barcelona"]
+    assert r.match("Pafos FC", pool) == "Paphos"
+    # Qarabag resolves with or without the "Agdam" token, deterministically.
+    assert r.match("Qarabag FK", pool) == "Karabakh Agdam"
+    assert r.match("Qarabağ Ağdam FK", pool) == "Karabakh Agdam"

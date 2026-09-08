@@ -55,6 +55,18 @@ aliases:
   "Braga": ["Sporting Braga", "Sporting Clube de Braga", "SC Braga"]
   "Sporting": ["Sporting CP", "Sporting Clube de Portugal", "Sporting Lisbon", "Sporting Portugal"]
 
+  # ---- Champions League clubs the live feed spells differently -------------
+  # football-data.org / market feeds use a short or transliterated form that
+  # does NOT match the ClubElo snapshot spelling, so without these the fixture
+  # prices silently on the naive form engine. Both verified present in
+  # clubelo_latest.csv under the canonical spelling below (2026-09-08):
+  #   * Pafos FC (feed) -> ClubElo "Paphos"
+  #   * Qarabag / Qarabağ FK (feed, with or without "Agdam") -> "Karabakh Agdam"
+  #     (the "Qarabağ Ağdam FK" form only scraped through at a fragile fuzzy 81;
+  #     these make every spelling a deterministic exact hit).
+  "Paphos": ["Pafos FC", "Pafos"]
+  "Karabakh Agdam": ["Qarabağ Ağdam FK", "Qarabag Agdam", "Qarabağ FK", "Qarabag FK", "Qarabag", "Qarabakh", "FK Qarabag"]
+
   # ---- National teams (World Cup 2026) -----------------------------------
   # Markets and football-data.org disagree on national-team naming far more
   # than on clubs (Korea Republic vs South Korea, Türkiye vs Turkey, …). These
