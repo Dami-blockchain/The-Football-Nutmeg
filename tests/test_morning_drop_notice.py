@@ -325,8 +325,10 @@ async def test_group_failure_does_not_block_user_dms(db, settings):
 
 
 async def test_lifecycle_not_over_is_deferred(db, settings):
-    """A listed fixture still BEFORE kickoff must not get a drop notice yet — it
-    may still drift back above and alert. It stays pending for a later tick."""
+    """A listed fixture still BEFORE its late-alert time (KO-10) must not get a
+    drop notice yet — it may still drift back above and alert. It stays pending
+    for a later sweep (the event hook fires it the instant the late alert is
+    suppressed)."""
     _gate_on(settings)
     now = datetime(2026, 9, 8, 20, 0, tzinfo=timezone.utc)
     _list(17, now + timedelta(hours=2))  # kickoff in the future
@@ -364,3 +366,61 @@ async def test_gate_off_short_circuits(db, settings):
     )
     assert n == 0 and sent == []
     assert _drop_notified(18) is False  # untouched when the flag is off
+
+
+async def test_event_hook_by_fixture_ids_sends_the_notice(db, settings):
+    """The EVENT-DRIVEN entry (fixture_ids) — what _fire_prediction_alert calls
+    at ~KO-10 the instant the confirmed-XI alert is suppressed. It fires
+    regardless of the kickoff-window clause (kickoff may be ~10 min ahead) and
+    marks the fixture once delivered."""
+    _gate_on(settings)
+    object.__setattr__(settings, "broadcast_chat_id", -1002)
+    now = datetime(2026, 9, 8, 20, 0, tzinfo=timezone.utc)
+    _list(20, now + timedelta(minutes=10))  # KO-10 == now: late alert just fired
+    preds = {20: _Pred("Man City", "Arsenal", 0.60, 0.25, 0.15)}
+    sent: list[int] = []
+
+    async def fake_send(s, cid, text):
+        sent.append(cid)
+        return True
+
+    n = await daily_jobs.run_morning_drop_notices(
+        settings, send_fn=fake_send, now=now, fixture_ids=[20],
+        users_fn=lambda: [_User(111)],
+        prediction_fn=lambda fid: preds.get(fid),
+    )
+    assert n == 2 and set(sent) == {999, 111, -1002}
+    assert _drop_notified(20) is True
+
+    # A duplicate late suppression re-fires the hook -> no-op (already notified).
+    sent.clear()
+    n2 = await daily_jobs.run_morning_drop_notices(
+        settings, send_fn=fake_send, now=now, fixture_ids=[20],
+        users_fn=lambda: [_User(111)],
+        prediction_fn=lambda fid: preds.get(fid),
+    )
+    assert n2 == 0 and sent == []
+
+
+async def test_drift_back_above_by_late_alert_gets_no_drop_notice(db, settings):
+    """Listed -> below by the early alert -> back ABOVE 0.65 by the confirmed-XI
+    rescore. The late alert PASSES the gate and fires the NORMAL call, so the
+    drop hook is never invoked; and when the sweep later reaches the listing the
+    live row still clears the gate -> HONOURED -> consumed, never a drop notice."""
+    _gate_on(settings)
+    now = datetime(2026, 9, 8, 20, 0, tzinfo=timezone.utc)
+    _list(21, now - timedelta(minutes=1))  # late-alert time has passed
+    preds = {21: _Pred("Man City", "Arsenal", 0.71, 0.19, 0.10)}  # recovered
+    sent: list[int] = []
+
+    async def fake_send(s, cid, text):  # pragma: no cover - must not fire
+        sent.append(cid)
+        return True
+
+    n = await daily_jobs.run_morning_drop_notices(
+        settings, send_fn=fake_send, now=now,
+        users_fn=lambda: [_User(111)],
+        prediction_fn=lambda fid: preds.get(fid),
+    )
+    assert n == 0 and sent == []       # no drop notice owed
+    assert _drop_notified(21) is True  # consumed silently as honoured

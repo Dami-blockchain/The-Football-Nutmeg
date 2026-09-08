@@ -1038,6 +1038,25 @@ def run_daemon(
                         min_p=float(settings.high_conf_alert_min_p),
                         at="fire",
                     )
+                    # The confirmed-XI (late) alert is the LAST alert opportunity;
+                    # its suppression is the deterministic moment the lifecycle
+                    # ends. If this fixture was NAMED in the morning notice, tell
+                    # that audience it has dropped below the bar NOW (~KO-10)
+                    # instead of silence — event-driven, no clock race: a fixture
+                    # that climbed back above 0.65 would have PASSED above and
+                    # never reached here. Only the LATE tag fires this; an early
+                    # suppression defers to the late fire (it may recover). The
+                    # notice is FREE/idempotent; the periodic sweep is the retry.
+                    if tag == "late":
+                        try:
+                            await run_morning_drop_notices(
+                                settings, fixture_ids=[fixture_id]
+                            )
+                        except Exception as e:  # noqa: BLE001 — never crash the fire
+                            get_logger(__name__).warning(
+                                "morning_drop_notice_hook_failed",
+                                fixture_id=fixture_id, error=str(e),
+                            )
                     return
             league = baseline.competition_code if baseline else ""
             lead = (
@@ -1310,10 +1329,12 @@ def run_daemon(
             trigger=IntervalTrigger(hours=2, timezone=timezone.utc),
             id="settle_and_results",
         )
-        # Periodic (every 15m): reconcile the morning high-confidence list —
-        # send a "dropped below the bar" notice for any NAMED fixture whose call
-        # was silently suppressed by drift, instead of leaving the reader in
-        # silence. Cheap (one bounded query), FREE, idempotent per fixture.
+        # Periodic (every 15m) RETRY SAFETY-NET for the morning drop notice. The
+        # notice is delivered EVENT-DRIVEN the instant the confirmed-XI (late)
+        # alert is suppressed (see _fire_prediction_alert), so it lands at ~KO-10.
+        # This sweep only retries a send that failed and catches any listing whose
+        # late job never fired, bounded to listings whose late-alert time
+        # (KO - lineup_confirm_lead) has passed. Cheap, FREE, idempotent.
         add_async_job(
             scheduler,
             _morning_drop_notice_tick,

@@ -1927,25 +1927,54 @@ def record_morning_listing(
         return True
 
 
-def morning_listings_pending_drop_notice(
-    now: datetime, days: int = 1
+def morning_listings_pending_by_ids(
+    fixture_ids: list[int],
 ) -> list[MorningNoticeListing]:
-    """Morning-listed fixtures whose alert lifecycle is OVER (kickoff reached)
-    and that have NOT yet been drop-notified, bounded to the last ``days`` so an
-    un-reconciled listing can never re-queue forever.
+    """Pending (not yet drop-notified) morning listings for the given fixtures.
 
-    ``kickoff <= now`` is the "lifecycle over" gate: both the early and the
-    confirmed-XI (late) pre-match alerts fire BEFORE kickoff, so by kickoff the
-    fixture's final disposition (alerted, or silently dropped) is settled --
-    this is what makes the drift-below-then-back-above case unambiguous.
+    The EVENT-DRIVEN entry point: called the instant a fixture's confirmed-XI
+    (late) alert is suppressed, so it is scoped to that fixture and does NOT
+    apply the kickoff-window clause (the suppression itself proves the late-alert
+    lifecycle is over). Already-notified listings are excluded, so a re-fire is a
+    no-op.
     """
-    floor = now - timedelta(days=days)
+    if not fixture_ids:
+        return []
     with session_scope() as s:
         rows = list(
             s.execute(
                 select(MorningNoticeListing)
                 .where(MorningNoticeListing.drop_notified.is_(False))
-                .where(MorningNoticeListing.kickoff <= now)
+                .where(MorningNoticeListing.fixture_id.in_(fixture_ids))
+                .order_by(MorningNoticeListing.kickoff.asc())
+            ).scalars()
+        )
+        s.expunge_all()
+        return rows
+
+
+def morning_listings_pending_drop_notice(
+    now: datetime, lead_minutes: int = 0, days: int = 1
+) -> list[MorningNoticeListing]:
+    """Morning-listed fixtures whose confirmed-XI (late) alert time has PASSED
+    and that have NOT yet been drop-notified, bounded to the last ``days`` so an
+    un-reconciled listing can never re-queue forever. Drives the periodic RETRY
+    safety-net sweep (the primary delivery is event-driven at suppression time).
+
+    The late alert fires at ``kickoff - lineup_confirm_lead`` (~KO-10); once that
+    instant has passed the fixture's final disposition (alerted, or silently
+    dropped) is settled, which is what makes the drift-below-then-back-above case
+    unambiguous. Expressed as ``kickoff <= now + lead_minutes`` so the sweep does
+    NOT wait for kickoff itself.
+    """
+    floor = now - timedelta(days=days)
+    cutoff = now + timedelta(minutes=lead_minutes)
+    with session_scope() as s:
+        rows = list(
+            s.execute(
+                select(MorningNoticeListing)
+                .where(MorningNoticeListing.drop_notified.is_(False))
+                .where(MorningNoticeListing.kickoff <= cutoff)
                 .where(MorningNoticeListing.kickoff >= floor)
                 .order_by(MorningNoticeListing.kickoff.asc())
             ).scalars()

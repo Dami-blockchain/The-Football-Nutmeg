@@ -499,6 +499,7 @@ async def run_morning_drop_notices(
     *,
     send_fn: SendFn | None = None,
     now: datetime | None = None,
+    fixture_ids: list[int] | None = None,
     listings_fn=None,
     prediction_fn=prediction_for_fixture,
     users_fn=list_users,
@@ -511,9 +512,20 @@ async def run_morning_drop_notices(
     The morning notice advertises fixtures that cleared the 0.65 gate on their
     EARLY stored triple. The alert gate is re-evaluated later (plan time, fire
     time) on the LIVE stored triple; a fixture that has drifted below is SILENTLY
-    suppressed and nothing is sent. This reconciler closes that gap: for each
-    morning-listed fixture whose alert lifecycle is over (kickoff reached) it
-    decides —
+    suppressed and nothing is sent. This reconciler closes that gap.
+
+    TWO entry points, both landing here:
+      * EVENT-DRIVEN (``fixture_ids`` set): called the instant the confirmed-XI
+        (late) alert is SUPPRESSED for a fixture, so the notice lands at ~KO-10
+        rather than on a clock sweep. There is no race with a drift-back-up: a
+        fixture that climbed back above 0.65 by then PASSES the late gate and
+        fires the normal alert, so it never reaches this call.
+      * SWEEP (``fixture_ids`` None): the periodic RETRY safety-net — retries a
+        send that failed and catches any listing whose late job never fired,
+        bounded to listings whose late-alert time (KO - lineup_confirm_lead) has
+        passed.
+
+    For each pending listing it decides —
 
       * HONOURED (the call went out): the live stored row still clears the gate,
         OR the fixture was ever revealed to a user (the drift-below-then-back-up
@@ -544,12 +556,21 @@ async def run_morning_drop_notices(
     from betbot.notify import send_telegram_to
 
     send = send_fn if send_fn is not None else send_telegram_to
-    listings_fn = listings_fn or morning_listings_pending_drop_notice
     ever_revealed_fn = ever_revealed_fn or fixture_was_ever_revealed
     mark_fn = mark_fn or mark_morning_drop_notified
     now = now or datetime.now(timezone.utc)
 
-    pending = list(listings_fn(now))
+    if fixture_ids is not None:
+        # Event-driven: reconcile exactly the fixture(s) whose late alert just
+        # got suppressed. Scoped by id, no kickoff-window clause (the suppression
+        # proves the late-alert lifecycle is over); already-notified -> no-op.
+        from betbot.storage.repos import morning_listings_pending_by_ids
+        pending = list(morning_listings_pending_by_ids(fixture_ids))
+    else:
+        # Sweep: bounded to listings whose late-alert time (KO - lead) has passed.
+        lead = settings.lineup_confirm_lead_minutes()
+        _fetch = listings_fn or morning_listings_pending_drop_notice
+        pending = list(_fetch(now, lead))
     if not pending:
         return 0
 
