@@ -215,3 +215,13 @@ def test_lineup_wrapper_carries_no_bet_call():
     text = format_prediction_with_lineup(pred, lineup, settings=_settings())
     assert "BET" not in text
     assert "[4-3-3]" in text
+
+
+def test_non_advice_caveat_on_prediction_surface():
+    from betbot.tips import NON_ADVICE_CAVEAT
+    text = format_prediction(_Pred())
+    assert NON_ADVICE_CAVEAT in text
+    assert "not betting advice" in text and "not +EV" in text
+    # Inherited by the confirmed-XI wrapper.
+    lineup = {"home": {"formation": "4-3-3", "xi": ["A"]}, "away": None}
+    assert NON_ADVICE_CAVEAT in format_prediction_with_lineup(_Pred(), lineup)

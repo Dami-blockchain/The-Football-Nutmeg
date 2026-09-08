@@ -335,6 +335,8 @@ def test_high_conf_message_home_favourite_no_market(settings):
     # NO BET line removed on operator instruction (2026-09-08).
     assert "NO BET" not in body
     assert "Band record: p>=0.65 hits 72.8%" in body
+    # Honesty caveat replaces the retired NO BET line.
+    assert "not betting advice" in body and "not +EV" in body
 
 
 def test_high_conf_message_unknown_code_degrades_to_raw_code(settings):

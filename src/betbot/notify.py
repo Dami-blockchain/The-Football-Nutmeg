@@ -21,6 +21,7 @@ pre-match alerts dead and said nothing.
 from __future__ import annotations
 
 from betbot.leagues import league_label
+from betbot.tips import NON_ADVICE_CAVEAT
 
 import re
 import asyncio
@@ -227,8 +228,10 @@ def format_high_conf_alert(
     operator instruction — next to a "HIGH-CONFIDENCE" banner he found it
     contradictory. This reverses the standing rule that every prediction
     carries a bet/no-bet call defaulting to NO BET. The remaining honesty
-    guard is the Market line (it says "unavailable" when there is no live
-    quote, and never fabricates a price) plus the band-record stats. ``market`` is ``(side, implied_prob, decimal_price)`` when a quote is
+    guard is the shared NON_ADVICE_CAVEAT footer ("Model call, not betting
+    advice — accuracy signal, not +EV") plus the Market line (it says
+    "unavailable" when there is no live quote, never a fabricated price) and
+    the band-record stats. ``market`` is ``(side, implied_prob, decimal_price)`` when a quote is
     available; the current high-conf caller passes ``None`` (no live
     quote is wired into this path), so the Market field says so HONESTLY
     rather than fabricating a price. NB Polymarket per-match 1X2 anchoring is
@@ -278,6 +281,7 @@ def format_high_conf_alert(
         pick_line,
         _model_triple_line(pred, top_pick, market_str),
         format_band_line(min_p, live_tally, sold=live_tally_sold),
+        NON_ADVICE_CAVEAT,
     ])
 
 

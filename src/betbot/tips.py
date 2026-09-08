@@ -29,6 +29,13 @@ from __future__ import annotations
 from betbot.leagues import league_label
 from betbot.timefmt import eat_time
 
+#: Honest non-advice caveat shown on every FORWARD-LOOKING prediction surface
+#: (the revealed prediction, the confirmed-XI alert, the high-confidence alert).
+#: It replaces the retired NO BET default (2026-09-08) as the honesty guard, and
+#: MUST stay anti-value: the pick is an accuracy signal, explicitly NOT +EV or
+#: betting advice. Kept in one place so both formatters render identical copy.
+NON_ADVICE_CAVEAT = "_Model call, not betting advice — accuracy signal, not +EV._"
+
 
 def _kickoff_str(pred) -> str:
     """Kickoff as ``HH:MM EAT`` (Africa/Nairobi); empty if absent.
@@ -77,7 +84,7 @@ def format_prediction(
     if pred.home_xg is not None and pred.away_xg is not None:
         model += f"   (xG {pred.home_xg:.2f}–{pred.away_xg:.2f})"
 
-    parts = [header, winner, model]
+    parts = [header, winner, model, NON_ADVICE_CAVEAT]
     return "\n".join(parts)
 
 
