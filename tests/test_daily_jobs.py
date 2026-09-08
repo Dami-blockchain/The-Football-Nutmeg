@@ -16,7 +16,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from betbot.config import Settings
 from betbot.daily_jobs import (
-    broadcast_chat_ids,
+    notice_recipient_ids,
     commit_reveals,
     high_conf_visible,
     nairobi_day_bounds,
@@ -452,6 +452,82 @@ async def test_run_matchday_notice_broadcasts_free_no_ledger(db, tmp_path):
     # FREE: no reveal recorded, no credit consumed.
     assert has_revealed(901, 1) is False
     assert get_user(901).predictions_consumed == 0
+
+
+async def test_run_matchday_notice_also_sends_to_group_broadcast(db, tmp_path):
+    """broadcast_chat_id set: users get their DMs AND the group gets ONE copy of
+    the SAME body, with no reveal/charge/registration side effects."""
+    s = _tg_settings(tmp_path)
+    s.broadcast_chat_id = -1002  # a Telegram group id (negative)
+    u = _paying_user(tmp_path, tid=901)
+    sent: list[tuple[int, str]] = []
+
+    async def fake_send(settings, chat_id, text):
+        sent.append((chat_id, text))
+        return True
+
+    preds = [_fixt(1, "Man City", "Arsenal",
+                   datetime(2026, 8, 1, 19, 30, tzinfo=timezone.utc), "PL")]
+    delivered = await run_matchday_notice(
+        s, send_fn=fake_send,
+        fixtures_source=lambda a, b: preds,
+        users_fn=lambda: [u],
+    )
+    # `delivered` counts user DMs only: operator (111) + user (901).
+    assert delivered == 2
+    # The group id ALSO received the notice, exactly once.
+    assert {cid for cid, _ in sent} == {111, 901, -1002}
+    assert sum(1 for cid, _ in sent if cid == -1002) == 1
+    # The group copy is byte-identical to the user body (one renderer).
+    bodies = {text for _, text in sent}
+    assert len(bodies) == 1
+    # FREE for the group too: no reveal row, no credit consumed.
+    assert has_revealed(901, 1) is False
+    assert get_user(901).predictions_consumed == 0
+
+
+async def test_run_matchday_notice_group_unset_is_unchanged(db, tmp_path):
+    """broadcast_chat_id unset (default): only user DMs, byte-identical to before."""
+    s = _tg_settings(tmp_path)
+    assert s.broadcast_chat_id is None
+    sent: list[int] = []
+
+    async def fake_send(settings, chat_id, text):
+        sent.append(chat_id)
+        return True
+
+    preds = [_fixt(1, "Man City", "Arsenal",
+                   datetime(2026, 8, 1, 19, 30, tzinfo=timezone.utc), "PL")]
+    delivered = await run_matchday_notice(
+        s, send_fn=fake_send, fixtures_source=lambda a, b: preds,
+        users_fn=lambda: [_User(111)],
+    )
+    assert delivered == 1
+    assert sent == [111]  # no group id, no extra send
+
+
+async def test_run_matchday_notice_group_failure_does_not_break_user_dms(db, tmp_path):
+    """A raising group send must not stop user delivery; it is caught + logged."""
+    s = _tg_settings(tmp_path)
+    s.broadcast_chat_id = -1002
+    delivered_to: list[int] = []
+
+    async def fake_send(settings, chat_id, text):
+        if chat_id == -1002:
+            raise RuntimeError("group send boom")
+        delivered_to.append(chat_id)
+        return True
+
+    preds = [_fixt(1, "Man City", "Arsenal",
+                   datetime(2026, 8, 1, 19, 30, tzinfo=timezone.utc), "PL")]
+    # Must NOT raise despite the group send blowing up.
+    delivered = await run_matchday_notice(
+        s, send_fn=fake_send, fixtures_source=lambda a, b: preds,
+        users_fn=lambda: [_User(111)],
+    )
+    # User DM still delivered; group failure swallowed.
+    assert delivered == 1
+    assert delivered_to == [111]
 
 
 async def test_run_matchday_notice_quiet_when_no_fixtures(db, tmp_path):
@@ -931,7 +1007,7 @@ def test_broadcast_includes_operator_and_users_deduplicated(tmp_path):
             self.telegram_user_id = tid
 
     s = _tg_settings(tmp_path)
-    ids = broadcast_chat_ids(s, [U(222), U(111), U(333)])
+    ids = notice_recipient_ids(s, [U(222), U(111), U(333)])
     assert ids == [111, 222, 333]  # operator first, no duplicate 111
 
 

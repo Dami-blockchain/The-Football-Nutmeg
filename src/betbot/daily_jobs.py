@@ -91,9 +91,14 @@ def nairobi_day_bounds(
 # ----------------------------------------------------------------------
 # Broadcast (operator + every registered user)
 # ----------------------------------------------------------------------
-def broadcast_chat_ids(settings, users) -> list[int]:
-    """Operator first, then registered users, de-duplicated (the operator is
-    usually also a registered user — they must not get the message twice)."""
+def notice_recipient_ids(settings, users) -> list[int]:
+    """The DM recipients of the morning notice: operator first, then registered
+    users, de-duplicated (the operator is usually also a registered user — they
+    must not get the message twice).
+
+    NOTE: distinct from ``settings.broadcast_chat_id`` (singular) — that is the
+    GROUP target, handled separately in :func:`run_matchday_notice`.
+    """
     ids: list[int] = []
     if settings.telegram_allowed_user_id:
         ids.append(settings.telegram_allowed_user_id)
@@ -393,7 +398,7 @@ async def run_matchday_notice(
         return 0
 
     sent = 0
-    for uid in broadcast_chat_ids(settings, users_fn()):
+    for uid in notice_recipient_ids(settings, users_fn()):
         try:
             if await send(settings, uid, body):
                 sent += 1
@@ -401,6 +406,28 @@ async def run_matchday_notice(
             log.warning(
                 "matchday_notice_send_failed",
                 telegram_user_id=uid, error=str(e),
+            )
+
+    # Group broadcast: the SAME body ALSO goes to the configured GROUP target
+    # (settings.broadcast_chat_id) when set — identical treatment to the
+    # prematch high-conf broadcast. NO entitlement, reveal ledger, credit charge
+    # or registration; the notice already lists only qualifying 0.65 calls, so
+    # this exposes nothing the group would not receive via the alert path. A
+    # failed group send must NEVER affect the user DMs above: it is caught,
+    # logged distinctly, and kept OUT of `sent` (which counts user-DM
+    # deliveries). Unset -> skipped, so behaviour is byte-identical to before.
+    broadcast_chat_id = getattr(settings, "broadcast_chat_id", None)
+    if broadcast_chat_id:
+        try:
+            if await send(settings, int(broadcast_chat_id), body):
+                log.info(
+                    "matchday_notice_broadcast_sent",
+                    chat_id=int(broadcast_chat_id), day=day.isoformat(),
+                )
+        except Exception as e:  # noqa: BLE001 — group send must never break DMs
+            log.warning(
+                "matchday_notice_broadcast_failed",
+                chat_id=int(broadcast_chat_id), error=str(e),
             )
 
     log.info(
