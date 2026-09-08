@@ -43,13 +43,17 @@ from betbot.notify import notify_operator
 from betbot.scheduling import add_async_job
 from betbot.timefmt import to_eat
 from betbot.storage.repos import (
+    fixture_was_ever_revealed,
     has_revealed,
     high_conf_band_tally,
     high_conf_band_tally_sold,
     increment_predictions_consumed,
     list_users,
+    mark_morning_drop_notified,
+    morning_listings_pending_drop_notice,
     predictions_for_kickoff_range,
     prediction_for_fixture,
+    record_morning_listing,
     record_rescore_drift,
     record_reveal,
     upsert_prediction,
@@ -397,6 +401,34 @@ async def run_matchday_notice(
         log.info("matchday_notice_no_fixtures", day=day.isoformat())
         return 0
 
+    # Persist WHICH fixtures this notice NAMED (gate ON only — the sole regime
+    # where the alert path can later SUPPRESS a listed fixture). The notice
+    # evaluates the gate on the EARLY stored triple; upsert_prediction overwrites
+    # that triple IN PLACE on every later rescore, so this set CANNOT be
+    # re-derived once a fixture drifts — it must be captured now. Same predicate
+    # as render_matchday_notice, so the recorded set == the named set. Recorded
+    # BEFORE the send loop (we record the PROMISE, not delivery). Best-effort:
+    # a listing write must never break the broadcast.
+    if getattr(settings, "high_conf_alerts_only", False):
+        from betbot.main import high_conf_alert_passes
+        for f in fixtures:
+            try:
+                if not high_conf_alert_passes(settings, f)[0]:
+                    continue
+                ko = f.kickoff
+                if ko.tzinfo is None:
+                    ko = ko.replace(tzinfo=timezone.utc)
+                record_morning_listing(
+                    f.fixture_id,
+                    getattr(f, "competition_code", "") or "",
+                    f.home_team, f.away_team, ko, day.isoformat(),
+                )
+            except Exception as e:  # noqa: BLE001 — listing must not break the notice
+                log.warning(
+                    "morning_listing_record_failed",
+                    fixture_id=getattr(f, "fixture_id", None), error=str(e),
+                )
+
     sent = 0
     for uid in notice_recipient_ids(settings, users_fn()):
         try:
@@ -434,6 +466,171 @@ async def run_matchday_notice(
         "matchday_notice_sent",
         day=day.isoformat(), fixtures=len(fixtures), delivered=sent,
     )
+    return sent
+
+
+# ----------------------------------------------------------------------
+# "Dropped below the bar" notice — reconciles the morning high-conf list
+# ----------------------------------------------------------------------
+def render_morning_drop_notice(listing) -> str:
+    """The short, plain, non-alarming notice for a fixture that was NAMED in the
+    morning high-confidence notice but whose promised call has since drifted
+    below the bar and will NOT be sent.
+
+    Distinct from HIGH_CONF_DOWNGRADE_NOTE (which rides ALONGSIDE a call still
+    being sent): here there is NO call, so the copy says so plainly and closes on
+    a BOLD NO BET. Carries NO probabilities/edge. Routes the league name through
+    ``league_label`` so it matches every other fixture-naming surface.
+    """
+    league = league_label(getattr(listing, "competition_code", None))
+    league_tag = f" \u00b7 {league}" if league else ""
+    return (
+        "*\u26bd High-confidence list \u2014 update*\n\n"
+        f"*{listing.home_team} (H) v {listing.away_team} (A)*{league_tag}\n\n"
+        "\u2139\ufe0f This was on this morning's high-confidence list, but a "
+        "fresh model run has since eased it below our confidence bar \u2014 so "
+        "we're not sending a call on it.\n\n"
+        "*NO BET.*"
+    )
+
+
+async def run_morning_drop_notices(
+    settings,
+    *,
+    send_fn: SendFn | None = None,
+    now: datetime | None = None,
+    listings_fn=None,
+    prediction_fn=prediction_for_fixture,
+    users_fn=list_users,
+    ever_revealed_fn=None,
+    mark_fn=None,
+) -> int:
+    """Tell the morning notice's audience when a NAMED high-confidence call has
+    since dropped below the bar and will NOT be sent — instead of silence.
+
+    The morning notice advertises fixtures that cleared the 0.65 gate on their
+    EARLY stored triple. The alert gate is re-evaluated later (plan time, fire
+    time) on the LIVE stored triple; a fixture that has drifted below is SILENTLY
+    suppressed and nothing is sent. This reconciler closes that gap: for each
+    morning-listed fixture whose alert lifecycle is over (kickoff reached) it
+    decides —
+
+      * HONOURED (the call went out): the live stored row still clears the gate,
+        OR the fixture was ever revealed to a user (the drift-below-then-back-up
+        case, where the confirmed-XI alert fired). CONSUME it (mark handled),
+        send nothing — exactly the ``passes OR ever_revealed`` predicate the
+        RESULT path uses one surface later.
+      * DROPPED (the promised call silently vanished): below the bar now AND
+        never revealed. SEND the short drop notice to the SAME audience as the
+        notice — the DM recipients (operator + registered users) AND the group
+        broadcast target when set.
+
+    FREE and READ-ONLY on the money path: NO PredictionReveal, NO charge, NO
+    free-limit draw, NO registration — this is information about a call we
+    already advertised for free. Idempotent: ``drop_notified`` flips True ONLY
+    after an actual successful send (or a deliberate consume), so a total send
+    failure leaves the fixture pending for the next tick's retry inside the
+    bounded window. A failed send to one recipient never blocks the others.
+    Returns messages delivered (DM copies). Injected fns keep it testable.
+    """
+    # Gate OFF: the alert path suppresses nothing, so no listed fixture can
+    # silently vanish and there is nothing to reconcile. (Listings are recorded
+    # gate-ON only, so pending is empty anyway — short-circuit for clarity and to
+    # touch no DB when the flag is off.)
+    if not getattr(settings, "high_conf_alerts_only", False):
+        return 0
+
+    from betbot.main import high_conf_alert_passes
+    from betbot.notify import send_telegram_to
+
+    send = send_fn if send_fn is not None else send_telegram_to
+    listings_fn = listings_fn or morning_listings_pending_drop_notice
+    ever_revealed_fn = ever_revealed_fn or fixture_was_ever_revealed
+    mark_fn = mark_fn or mark_morning_drop_notified
+    now = now or datetime.now(timezone.utc)
+
+    pending = list(listings_fn(now))
+    if not pending:
+        return 0
+
+    recipients = notice_recipient_ids(settings, users_fn())
+    group_id = getattr(settings, "broadcast_chat_id", None)
+
+    sent = 0
+    consumed = 0
+    for listing in pending:
+        pred = prediction_fn(listing.fixture_id)
+        # HONOURED? Same predicate as the result path: the live stored row still
+        # clears the gate (still qualifying / drifted back up and the late alert
+        # fired), OR the fixture was ever revealed to a user (it alerted at some
+        # fire). Either way the promised call went out — CONSUME, send nothing.
+        gate_passes = pred is not None and high_conf_alert_passes(settings, pred)[0]
+        if gate_passes or ever_revealed_fn(listing.fixture_id):
+            mark_fn(listing.fixture_id)
+            consumed += 1
+            log.info(
+                "morning_drop_notice_consumed_honoured",
+                fixture_id=listing.fixture_id, gate_passes=gate_passes,
+            )
+            continue
+
+        # DROPPED: below the bar now AND never alerted -> owe the audience a
+        # notice. No audience at all (no operator/users AND no group): the notice
+        # can never be delivered, so CONSUME it rather than log a failure forever.
+        if not recipients and not group_id:
+            mark_fn(listing.fixture_id)
+            log.info("morning_drop_notice_no_audience", fixture_id=listing.fixture_id)
+            continue
+
+        body = render_morning_drop_notice(listing)
+        any_success = False
+        for uid in recipients:
+            try:
+                if await send(settings, uid, body):
+                    sent += 1
+                    any_success = True
+            except Exception as e:  # noqa: BLE001 — one bad send must not drop the rest
+                log.warning(
+                    "morning_drop_notice_send_failed",
+                    telegram_user_id=uid, fixture_id=listing.fixture_id, error=str(e),
+                )
+        # Group broadcast (SAME body, ONCE) when set — identical treatment to the
+        # morning notice's group copy. A failed group send must NEVER affect the
+        # DMs above: caught, logged distinctly, kept OUT of ``sent`` (DM count).
+        group_success = False
+        if group_id:
+            try:
+                if await send(settings, int(group_id), body):
+                    group_success = True
+                    log.info(
+                        "morning_drop_notice_broadcast_sent",
+                        fixture_id=listing.fixture_id, chat_id=int(group_id),
+                    )
+            except Exception as e:  # noqa: BLE001 — group send must never break DMs
+                log.warning(
+                    "morning_drop_notice_broadcast_failed",
+                    fixture_id=listing.fixture_id, chat_id=int(group_id), error=str(e),
+                )
+
+        # Flag ONLY once at least one recipient (DM or group) actually got it, so
+        # drop_notified never lies. On a TOTAL send failure it is left False and
+        # the fixture stays pending for the next tick's retry inside the bounded
+        # window — better a retry than a "sent" that nobody received.
+        if any_success or group_success:
+            mark_fn(listing.fixture_id)
+            log.info(
+                "morning_drop_notice_sent",
+                fixture_id=listing.fixture_id,
+                dm_recipients=len(recipients), group=bool(group_success),
+            )
+        else:
+            log.warning(
+                "morning_drop_notice_all_sends_failed",
+                fixture_id=listing.fixture_id,
+                note="left un-notified for retry on the next tick",
+            )
+    if consumed:
+        log.info("morning_drop_notices_consumed_total", count=consumed)
     return sent
 
 

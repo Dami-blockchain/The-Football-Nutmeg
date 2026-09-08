@@ -517,3 +517,53 @@ class RescoreDriftLog(Base):
     observed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )
+
+
+class MorningNoticeListing(Base):
+    """One row per fixture NAMED in a morning high-confidence notice.
+
+    The morning matchday notice ("High-confidence calls — YYYY-MM-DD") lists the
+    fixtures that cleared the 0.65 alert gate on their EARLY stored triple at
+    notice time. The pre-match alert gate is re-evaluated later (plan time and
+    fire time) on the LIVE stored triple, which ``upsert_prediction`` overwrites
+    IN PLACE on every rescore — so a fixture advertised in the morning can drift
+    below the bar by alert time and be SILENTLY suppressed
+    (``prematch_alert_suppressed_low_conf``) with nothing sent. That set
+    ("what the morning notice named") is unrecoverable from live state once the
+    triple has drifted, so it is captured HERE at notice time.
+
+    ``run_morning_drop_notices`` reconciles this table against the live gate: a
+    listed fixture whose promised call never went out gets ONE short "dropped
+    below the bar" notice instead of silence. ``drop_notified`` is the
+    deliver-once flag; like ``PredictionOutcome.result_notified`` it flips True
+    ONLY after an actual successful send (or a deliberate consume), never merely
+    because the reconciliation ran.
+
+    ``fixture_id`` is unique: a fixture belongs to one matchday and is listed at
+    most once. The names/competition/kickoff are snapshotted so the drop notice
+    is self-contained and never depends on the (possibly rescored or absent)
+    prediction row.
+    """
+
+    __tablename__ = "morning_notice_listings"
+    __table_args__ = (
+        UniqueConstraint("fixture_id", name="uq_morning_notice_listings_fixture"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    fixture_id: Mapped[int] = mapped_column(Integer, index=True)
+    competition_code: Mapped[str] = mapped_column(String(8))
+    home_team: Mapped[str] = mapped_column(String(80))
+    away_team: Mapped[str] = mapped_column(String(80))
+    notice_day: Mapped[str] = mapped_column(String(10))  # ISO date the notice named it
+    kickoff: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+    # Deliver-once flag for the "dropped below the bar" notice. Mirrors
+    # PredictionOutcome.result_notified: True means "handled by the drop path" —
+    # a DELIBERATE consume (the call was honoured, so no notice is owed) OR a
+    # broadcast in which AT LEAST ONE recipient actually received the drop
+    # notice. Left False on a total send failure so the reconciliation retries.
+    drop_notified: Mapped[bool] = mapped_column(default=False)
+    listed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )

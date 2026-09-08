@@ -35,6 +35,7 @@ from betbot.daily_jobs import (
     nairobi_day_bounds,
     register_daily_jobs,
     run_matchday_notice,
+    run_morning_drop_notices,
     run_result_alerts,
     send_prediction_alert,
 )
@@ -938,6 +939,16 @@ def run_daemon(
         except Exception as e:  # noqa: BLE001 — never crash the daemon
             get_logger(__name__).warning("result_alerts_failed", error=str(e))
 
+    async def _morning_drop_notice_tick() -> None:
+        # Periodic: tell the morning notice's audience when a fixture it NAMED
+        # has since dropped below the high-confidence bar and its call will not
+        # be sent — instead of the silent suppression. FREE, read-only on the
+        # money path; idempotent per fixture (drop_notified).
+        try:
+            await run_morning_drop_notices(get_settings())
+        except Exception as e:  # noqa: BLE001 — never crash the daemon
+            get_logger(__name__).warning("morning_drop_notices_failed", error=str(e))
+
     async def _alert_matches_upstream(
         settings, fixture_id: int, *, lead_minutes: int
     ) -> bool:
@@ -1298,6 +1309,16 @@ def run_daemon(
             _settle_and_results_tick,
             trigger=IntervalTrigger(hours=2, timezone=timezone.utc),
             id="settle_and_results",
+        )
+        # Periodic (every 15m): reconcile the morning high-confidence list —
+        # send a "dropped below the bar" notice for any NAMED fixture whose call
+        # was silently suppressed by drift, instead of leaving the reader in
+        # silence. Cheap (one bounded query), FREE, idempotent per fixture.
+        add_async_job(
+            scheduler,
+            _morning_drop_notice_tick,
+            trigger=IntervalTrigger(minutes=15, timezone=timezone.utc),
+            id="morning_drop_notices",
         )
         # Belt-and-braces: catch anything registered through a raw add_job
         # that bypassed add_async_job. Loud, but never fatal to the daemon.
