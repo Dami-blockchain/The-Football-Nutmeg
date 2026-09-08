@@ -220,9 +220,15 @@ def format_high_conf_alert(
 ) -> str:
     """The high-conviction alert body for one fixture.
 
-    Standing format rules: home/away designation on both teams, market
-    anchoring, a BOLD bet/no-bet call defaulting to NO BET, and honest band
-    stats. ``market`` is ``(side, implied_prob, decimal_price)`` when a quote is
+    Format: home/away designation on both teams, an explicit named-club pick,
+    market anchoring, and honest band stats.
+
+    NOTE (2026-09-08): the BOLD "NO BET (default; ...)" line was REMOVED on
+    operator instruction — next to a "HIGH-CONFIDENCE" banner he found it
+    contradictory. This reverses the standing rule that every prediction
+    carries a bet/no-bet call defaulting to NO BET. The remaining honesty
+    guard is the Market line (it says "unavailable" when there is no live
+    quote, and never fabricates a price) plus the band-record stats. ``market`` is ``(side, implied_prob, decimal_price)`` when a quote is
     available; the Polymarket matching path has been dead for weeks, so it is
     normally ``None`` and the Market field says so HONESTLY rather than
     fabricating a price. ``live_tally`` is passed straight to
@@ -251,17 +257,6 @@ def format_high_conf_alert(
         m_side, m_prob, m_price = market
         market_str = f"{m_side} {m_prob:.0%} ({m_price:.2f})"
 
-    # Default NO BET, in BOLD, per the standing rule: the gate is a SELECTION on
-    # short-priced favourites (higher hit rate) and is NOT an edge/value claim,
-    # so the call defaults to NO BET rather than backing the favourite blind.
-    # With no live quote the reason must NOT claim an edge-vs-price comparison
-    # that never happened — the Market field already says the price is missing.
-    call = (
-        "*NO BET* (default; no live price to assess edge)"
-        if market is None
-        else "*NO BET* (default; edge vs price below threshold)"
-    )
-
     # Spell out the predicted CLUB so the reader never has to decode a bare
     # HOME/AWAY token into a team name (the operator found that confusing). The
     # home/away designation is kept ON the pick itself, satisfying the standing
@@ -278,7 +273,6 @@ def format_high_conf_alert(
         header,
         pick_line,
         _model_triple_line(pred, top_pick, market_str),
-        call,
         format_band_line(min_p, live_tally, sold=live_tally_sold),
     ])
 

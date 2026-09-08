@@ -332,8 +332,8 @@ def test_high_conf_message_home_favourite_no_market(settings):
     assert "Model: HOME 71% / draw 18% / away 11%" in body
     # Matching is dead: the Market field must say so, not fabricate a price.
     assert "Market: unavailable (no live quote)" in body
-    # Honest: with no quote the reason must NOT claim an edge-vs-price check.
-    assert "*NO BET* (default; no live price to assess edge)" in body
+    # NO BET line removed on operator instruction (2026-09-08).
+    assert "NO BET" not in body
     assert "Band record: p>=0.65 hits 72.8%" in body
 
 
@@ -362,8 +362,8 @@ def test_high_conf_message_renders_a_market_quote_when_supplied(settings):
         pred, _hc(settings), market=("HOME", 0.68, 1.47), live_tally=(3, 4)
     )
     assert "Market: HOME 68% (1.47)" in body
-    # With a real quote the edge-vs-price framing is legitimate.
-    assert "*NO BET* (default; edge vs price below threshold)" in body
+    # NO BET line removed on operator instruction (2026-09-08).
+    assert "NO BET" not in body
 
 
 # ----------------------------------------------------------------------
