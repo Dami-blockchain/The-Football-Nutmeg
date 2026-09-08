@@ -16,10 +16,9 @@ def _hermetic_settings_env():
     pydantic-settings resolves ``Settings.model_config["env_file"]`` (default
     ``".env"``) against the *current working directory*. Run ``pytest`` from
     ``~/tfsm`` and the live deployment ``.env`` bleeds into every test that
-    builds Settings via ``get_settings()`` — e.g. ``BETBOT_CONFIDENCE_FILTER``
-    injects the "NO BET - below our confidence bar" banner that several
-    ``test_tips`` / ``test_llm_agent`` cases assert is absent, so the suite is
-    green from a clean cwd and red from ``~/tfsm``.
+    builds Settings via ``get_settings()`` — a stray ``BETBOT_*`` override
+    bleeding in can flip behaviour that ``test_tips`` / ``test_llm_agent`` cases
+    assert on, so the suite is green from a clean cwd and red from ``~/tfsm``.
 
     Point ``env_file`` at a path that does not exist so no ``.env`` is ever
     read. This also neutralises the *direct* read in

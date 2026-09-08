@@ -170,13 +170,14 @@ def format_stale_message(status: SnapshotStatus, *, wall_now: datetime) -> str:
     """
     present = status.exists and status.clubs > 0 and status.snapshot_date is not None
     if present:
+        # Magnitude from the CL walk-forward on a ~6-month-stale snapshot
+        # (2026-09-08). Softened to a range in the copy because the exact
+        # figure is not reproducible from anything checked into the repo.
         impact = (
             f"CL is still priced, just off {_age_str(status)}-old ratings. The "
-            "measured cost is small: a walk-forward test put a 6-month-stale "
-            "snapshot at only ~1-2% higher RPS (0.2025 -> 0.2054), paired CIs "
-            "crossing zero — real but minor, and it grows only slowly with age. "
-            "(No hard cutoff: an aged API-scale snapshot still beats a fresh "
-            "mis-scaled one.)"
+            "measured cost is small — about ~1-2% higher RPS, and it grows only "
+            "slowly with age. (No hard cutoff: an aged API-scale snapshot still "
+            "beats a fresh mis-scaled one.)"
         )
     else:
         impact = (

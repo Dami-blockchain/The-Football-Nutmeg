@@ -471,12 +471,13 @@ class Settings(BaseSettings):
     cl_weight_dc: float = Field(default=1.0, alias="BETBOT_CL_W_DC")
     cl_weight_market: float = Field(default=1.0, alias="BETBOT_CL_W_MARKET")
 
-    # ---- Confidence filter on the BET / NO BET call (flag-gated, OFF) ---
+    # ---- Confidence filter — INTERNAL selection metric (flag-gated, OFF) ---
     # A PRE-REGISTERED selection rule, not a model change: it never alters a
-    # probability, it only decides whether the argmax is put forward as
-    # a BET or falls back to the standing NO BET default. See
-    # betbot/strategy/confidence.py. Default OFF, same discipline as the
-    # dispersion/MOV challengers — turn on only after the live gate below.
+    # probability, it only decides whether the argmax is put forward as a
+    # called pick. As of 2026-09-08 it renders NOTHING to users — the BET /
+    # NO BET call was RETIRED on every surface (see betbot/tips.py); this flag
+    # now feeds only internal backtests/selection stats. See
+    # betbot/strategy/confidence.py. Default OFF.
     #
     # Measured on data/club_results.csv (n=10,734, Pinnacle CLOSING odds — so
     # optimistic vs the T-24h prices we would have live): favourite hit rate

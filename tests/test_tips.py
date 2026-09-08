@@ -225,3 +225,18 @@ def test_non_advice_caveat_on_prediction_surface():
     # Inherited by the confirmed-XI wrapper.
     lineup = {"home": {"formation": "4-3-3", "xi": ["A"]}, "away": None}
     assert NON_ADVICE_CAVEAT in format_prediction_with_lineup(_Pred(), lineup)
+
+
+def test_prediction_copy_never_claims_value():
+    """Honesty pin (reinstated): no +EV / edge / market-beating language on the
+    user surface. The deliberate 'not +EV' disclaimer in NON_ADVICE_CAVEAT is
+    stripped before scanning — the ban is on CLAIMING value, not on disclaiming
+    it. This is the guard that stops +EV-flavoured copy creeping back in."""
+    from betbot.tips import NON_ADVICE_CAVEAT
+    for pred in (
+        _Pred(p_home=0.72, p_draw=0.16, p_away=0.12),
+        _Pred(p_home=0.55, p_draw=0.25, p_away=0.20),
+    ):
+        text = format_prediction(pred).replace(NON_ADVICE_CAVEAT, "").lower()
+        for banned in ("+ev", "expected value", "edge", "value bet", "beat the market"):
+            assert banned not in text

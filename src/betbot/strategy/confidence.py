@@ -1,4 +1,8 @@
-"""Pre-registered confidence filter on the BET / NO BET call.
+"""Pre-registered confidence filter — an INTERNAL selection metric.
+
+NOTE (2026-09-08): the user-facing BET / NO BET call this once drove was
+RETIRED on every surface; this module now feeds only backtests and
+selection stats, never user copy.
 
 The model always produces a most-likely outcome (the argmax of H/D/A). That is
 a PREDICTION. Whether we *call* it — i.e. put it forward as a bet — is a
