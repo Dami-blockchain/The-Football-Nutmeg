@@ -262,6 +262,7 @@ class SettlementWatcher:
                     settled_at=now,
                     result_notified=stale,
                     kickoff=ko,
+                    anchor_source=pred.anchor_source,
                 )
             except Exception as e:  # noqa: BLE001 — one bad row mustn't stop the rest
                 log.warning(

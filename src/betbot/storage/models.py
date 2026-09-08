@@ -59,6 +59,20 @@ class PredictionRow(Base):
     home_xg: Mapped[float | None] = mapped_column(Float, nullable=True)
     away_xg: Mapped[float | None] = mapped_column(Float, nullable=True)
 
+    # --- market-anchor provenance (Defect B) ------------------------------
+    # ``anchor_source`` names the market the stored ``p_*`` triple was anchored
+    # to ("odds" = free bookmaker feed, "market" = exchange price), or NULL when
+    # the row shipped as raw model output — including the silent per-fixture
+    # gaps a feed outage leaves (see betbot.data.odds.prime). ``raw_p_*`` is the
+    # model's PRE-anchor triple, so the pre-registered anchored-vs-raw gate is
+    # computable straight from the DB. All four are additive & nullable: rows
+    # written before they existed carry NULLs and every reader must treat a
+    # missing value explicitly. See PredictionReveal.p_* for the same pattern.
+    anchor_source: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    raw_p_home: Mapped[float | None] = mapped_column(Float, nullable=True)
+    raw_p_draw: Mapped[float | None] = mapped_column(Float, nullable=True)
+    raw_p_away: Mapped[float | None] = mapped_column(Float, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )
@@ -426,6 +440,11 @@ class PredictionOutcome(Base):
     predicted_draw: Mapped[float] = mapped_column(Float)
     predicted_away: Mapped[float] = mapped_column(Float)
     predicted_pick: Mapped[str] = mapped_column(String(4))  # HOME / DRAW / AWAY (argmax)
+    # Which market (if any) the SCORED triple was anchored to, carried over from
+    # the prediction row: "odds" / "market", or NULL for raw (unanchored, or a
+    # feed-outage gap). Additive & nullable — legacy rows carry NULLs. Lets the
+    # anchored-vs-unanchored validation split the ledger without re-deriving it.
+    anchor_source: Mapped[str | None] = mapped_column(String(8), nullable=True)
     actual_outcome: Mapped[str] = mapped_column(String(4))  # HOME / DRAW / AWAY
     correct: Mapped[bool] = mapped_column(default=False)
 

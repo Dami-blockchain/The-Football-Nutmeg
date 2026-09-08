@@ -41,6 +41,23 @@ def upsert_prediction(
     Returns the row id.
     """
     run_date = date.today().isoformat()
+    # Pre-anchor model triple: ``model_probs`` holds it when the displayed
+    # ``p_*`` were odds-anchored (see Prediction.model_probability); otherwise
+    # the displayed triple IS the raw one. ``anchor_source`` is None when the
+    # row shipped unanchored — including a feed-outage gap.
+    #
+    # CAVEAT for a future reader: on an EXCHANGE-anchored row
+    # (``anchor_source == \"market\"``) ``model_probs`` is cleared by
+    # ``Prediction.anchored_to_market``, so ``raw_p_*`` here equals the
+    # displayed (anchored) triple, NOT a true pre-anchor number. That is
+    # intentional and out of scope: the anchored-vs-raw validation gate this
+    # column exists for reads only ``anchor_source IN (odds, NULL)`` rows,
+    # where ``raw_p_*`` is genuinely the pre-anchor model triple. Do not compute
+    # a raw counterfactual off a ``market`` row — it would be a no-op diff.
+    raw = getattr(prediction, "model_probs", None) or (
+        prediction.p_home, prediction.p_draw, prediction.p_away
+    )
+    anchor_source = getattr(prediction, "anchor_source", None)
     with session_scope() as s:
         existing = s.execute(
             select(PredictionRow)
@@ -61,6 +78,8 @@ def upsert_prediction(
             existing.draw_score = prediction.draw_score
             existing.home_xg = prediction.home_xg
             existing.away_xg = prediction.away_xg
+            existing.anchor_source = anchor_source
+            existing.raw_p_home, existing.raw_p_draw, existing.raw_p_away = raw
             s.flush()
             return existing.id
         row = PredictionRow(
@@ -78,6 +97,10 @@ def upsert_prediction(
             draw_score=prediction.draw_score,
             home_xg=prediction.home_xg,
             away_xg=prediction.away_xg,
+            anchor_source=anchor_source,
+            raw_p_home=raw[0],
+            raw_p_draw=raw[1],
+            raw_p_away=raw[2],
         )
         s.add(row)
         s.flush()
@@ -267,6 +290,7 @@ def record_prediction_outcome(
     settled_at: datetime,
     result_notified: bool = False,
     kickoff: datetime | None = None,
+    anchor_source: str | None = None,
 ) -> bool:
     """INSERT-OR-IGNORE one scored prediction. Returns True iff NEWLY inserted.
 
@@ -305,6 +329,7 @@ def record_prediction_outcome(
                     away_goals=int(away_goals),
                     result_notified=result_notified,
                     settled_at=settled_at,
+                    anchor_source=anchor_source,
                 )
             )
         return True

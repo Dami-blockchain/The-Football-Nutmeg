@@ -50,6 +50,13 @@ _ADDITIVE_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("prediction_reveals", "p_home", "FLOAT"),
     ("prediction_reveals", "p_draw", "FLOAT"),
     ("prediction_reveals", "p_away", "FLOAT"),
+    # Market-anchor provenance + the pre-anchor raw triple (Defect B). Additive
+    # & nullable so a deployed predictions/outcomes table gains them cleanly.
+    ("predictions", "anchor_source", "VARCHAR(8)"),
+    ("predictions", "raw_p_home", "FLOAT"),
+    ("predictions", "raw_p_draw", "FLOAT"),
+    ("predictions", "raw_p_away", "FLOAT"),
+    ("prediction_outcomes", "anchor_source", "VARCHAR(8)"),
 )
 
 # Indexes for columns added by _ADDITIVE_COLUMNS. ``create_all`` only indexes
