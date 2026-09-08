@@ -44,6 +44,9 @@ def main() -> None:
         label = f"season {args.season}"
     else:
         rows = provider.fetch(args.leagues)
+        if rows is None:
+            print("live fixtures.csv UNREACHABLE (HTTP error / malformed body)")
+            return
         label = "live fixtures.csv"
 
     attempted = provider.attempted_fixtures

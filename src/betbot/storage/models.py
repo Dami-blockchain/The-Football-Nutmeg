@@ -68,6 +68,15 @@ class PredictionRow(Base):
     # computable straight from the DB. All four are additive & nullable: rows
     # written before they existed carry NULLs and every reader must treat a
     # missing value explicitly. See PredictionReveal.p_* for the same pattern.
+    #
+    # GATE JOIN RULE (do not get this wrong): ``fixture_id`` is NOT unique here
+    # — the daily run and each rescore land on different ``run_date``s, so a
+    # fixture has multiple rows (up to 4) and ``raw_p_*`` can differ between
+    # them. Settlement scores the LATEST row per fixture (MAX by run_date,id),
+    # and ``prediction_outcomes`` matches that ``MAX(id)`` row. The anchored-vs-
+    # raw gate MUST therefore join the outcome to the ``MAX(id) GROUP BY
+    # fixture_id`` prediction row, never a bare ``fixture_id`` — a naive join
+    # pairs outcomes with STALE raw triples for ~43% of fixtures.
     anchor_source: Mapped[str | None] = mapped_column(String(8), nullable=True)
     raw_p_home: Mapped[float | None] = mapped_column(Float, nullable=True)
     raw_p_draw: Mapped[float | None] = mapped_column(Float, nullable=True)

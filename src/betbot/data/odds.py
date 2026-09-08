@@ -238,6 +238,20 @@ class FootballDataCoUkProvider:
             # NOT the same as a 200 carrying no in-scope fixtures: a genuine
             # empty file parses to ``[]`` below. See the Protocol contract.
             return None
+        # A reached-but-MALFORMED 200 (maintenance page, an HTML landing, a
+        # truncated body) parses to ``[]`` too — but that is a FAILURE, not a
+        # reached-and-empty refresh, and letting it through would wipe the cache
+        # and advance the TTL exactly like Defect A, by a second door. Require
+        # the fixtures.csv header before trusting an empty parse. BOM-stripped
+        # to match ``parse`` (football-data.co.uk prefixes ``Div`` with one).
+        fields = {
+            (f or "").lstrip("\ufeff").strip()
+            for f in (csv.DictReader(io.StringIO(raw.lstrip("\ufeff"))).fieldnames or [])
+        }
+        if not {"Div", "Date", "HomeTeam"} <= fields:
+            log.warning("odds_fetch_malformed", url=self._fixtures_url,
+                        fields=sorted(fields)[:6])
+            return None
         return self.parse(raw, leagues, kind="prematch")
 
     def fetch_season(self, season: str, league: str, *, kind: str = "prematch") -> list[MatchOdds]:

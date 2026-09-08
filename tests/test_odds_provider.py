@@ -127,7 +127,9 @@ def test_dead_feed_returns_none_not_empty_list():
 
 
 def test_garbage_payload_returns_no_rows():
-    assert _provider(payload="not,a,fixtures,file\n1,2,3,4\n").fetch(["PL"]) == []
+    # A reached-but-malformed 200 (no fixtures.csv header) is a FAILURE, not a
+    # reached-and-empty refresh: it must surface as None so the cache is kept.
+    assert _provider(payload="not,a,fixtures,file\n1,2,3,4\n").fetch(["PL"]) is None
 
 
 def test_reached_but_empty_fixtures_file_is_empty_list_not_none():
@@ -246,7 +248,7 @@ def test_quote_for_league_we_do_not_cover_is_none():
 # ---------------------------------------------------------------------------
 # Defect A — a failed refresh must NOT wipe the last-good cache
 # ---------------------------------------------------------------------------
-_EMPTY_FIXTURES = "Div,Date,Time,HomeTeam,AwayTeam,B365H,B365D,B365A\\n"
+_EMPTY_FIXTURES = "Div,Date,Time,HomeTeam,AwayTeam,B365H,B365D,B365A\n"
 
 
 def _switchable_provider(state: dict, counter: list | None = None):
@@ -347,3 +349,24 @@ def test_recovered_feed_reindexes_normally():
     assert asyncio.run(svc.prime(["PD"])) >= 1
     assert _vallecano(svc) is not None
     assert svc._is_stale() is False
+
+
+def test_malformed_200_keeps_prior_index_like_a_503():
+    """A reached-but-malformed 200 (e.g. an HTML maintenance page — realistic
+    while the host is flapping) must be treated as a failure, NOT a
+    reached-and-empty refresh: the last-good index survives and the TTL is not
+    advanced, exactly as for a 503 (Defect A, second door)."""
+    now = [1000.0]
+    state = {"payload": FIXTURES_CSV}
+    svc = OddsService(_FastRetry(), providers=[_switchable_provider(state)],
+                      clock=lambda: now[0])
+    primed = asyncio.run(svc.prime(["PD"]))
+    assert primed >= 1 and _vallecano(svc) is not None
+
+    now[0] += 20.0
+    state["payload"] = "<html><body>We are down for maintenance</body></html>"
+    retained = asyncio.run(svc.prime(["PD"]))
+
+    assert retained == primed, "a malformed body must NOT wipe the index"
+    assert _vallecano(svc) is not None
+    assert svc._is_stale() is True, "TTL must not advance on a malformed body"
