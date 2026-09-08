@@ -30,6 +30,7 @@ imports / injected fns.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import date, datetime, timedelta, timezone
 from typing import Awaitable, Callable, Sequence
 from zoneinfo import ZoneInfo
@@ -472,6 +473,12 @@ async def run_matchday_notice(
 # ----------------------------------------------------------------------
 # "Dropped below the bar" notice — reconciles the morning high-conf list
 # ----------------------------------------------------------------------
+# Serialises run_morning_drop_notices across its TWO entry points (the KO-10
+# event hook and the 15-min sweep) so a listed fixture can never be advertised
+# as "dropped" twice under concurrent overlap on the daemon's single loop.
+_DROP_NOTICE_LOCK = asyncio.Lock()
+
+
 def render_morning_drop_notice(listing) -> str:
     """The short, plain, non-alarming notice for a fixture that was NAMED in the
     morning high-confidence notice but whose promised call has since drifted
@@ -560,99 +567,106 @@ async def run_morning_drop_notices(
     mark_fn = mark_fn or mark_morning_drop_notified
     now = now or datetime.now(timezone.utc)
 
-    if fixture_ids is not None:
-        # Event-driven: reconcile exactly the fixture(s) whose late alert just
-        # got suppressed. Scoped by id, no kickoff-window clause (the suppression
-        # proves the late-alert lifecycle is over); already-notified -> no-op.
-        from betbot.storage.repos import morning_listings_pending_by_ids
-        pending = list(morning_listings_pending_by_ids(fixture_ids))
-    else:
-        # Sweep: bounded to listings whose late-alert time (KO - lead) has passed.
-        lead = settings.lineup_confirm_lead_minutes()
-        _fetch = listings_fn or morning_listings_pending_drop_notice
-        pending = list(_fetch(now, lead))
-    if not pending:
-        return 0
-
-    recipients = notice_recipient_ids(settings, users_fn())
-    group_id = getattr(settings, "broadcast_chat_id", None)
-
-    sent = 0
-    consumed = 0
-    for listing in pending:
-        pred = prediction_fn(listing.fixture_id)
-        # HONOURED? Same predicate as the result path: the live stored row still
-        # clears the gate (still qualifying / drifted back up and the late alert
-        # fired), OR the fixture was ever revealed to a user (it alerted at some
-        # fire). Either way the promised call went out — CONSUME, send nothing.
-        gate_passes = pred is not None and high_conf_alert_passes(settings, pred)[0]
-        if gate_passes or ever_revealed_fn(listing.fixture_id):
-            mark_fn(listing.fixture_id)
-            consumed += 1
-            log.info(
-                "morning_drop_notice_consumed_honoured",
-                fixture_id=listing.fixture_id, gate_passes=gate_passes,
-            )
-            continue
-
-        # DROPPED: below the bar now AND never alerted -> owe the audience a
-        # notice. No audience at all (no operator/users AND no group): the notice
-        # can never be delivered, so CONSUME it rather than log a failure forever.
-        if not recipients and not group_id:
-            mark_fn(listing.fixture_id)
-            log.info("morning_drop_notice_no_audience", fixture_id=listing.fixture_id)
-            continue
-
-        body = render_morning_drop_notice(listing)
-        any_success = False
-        for uid in recipients:
-            try:
-                if await send(settings, uid, body):
-                    sent += 1
-                    any_success = True
-            except Exception as e:  # noqa: BLE001 — one bad send must not drop the rest
-                log.warning(
-                    "morning_drop_notice_send_failed",
-                    telegram_user_id=uid, fixture_id=listing.fixture_id, error=str(e),
-                )
-        # Group broadcast (SAME body, ONCE) when set — identical treatment to the
-        # morning notice's group copy. A failed group send must NEVER affect the
-        # DMs above: caught, logged distinctly, kept OUT of ``sent`` (DM count).
-        group_success = False
-        if group_id:
-            try:
-                if await send(settings, int(group_id), body):
-                    group_success = True
-                    log.info(
-                        "morning_drop_notice_broadcast_sent",
-                        fixture_id=listing.fixture_id, chat_id=int(group_id),
-                    )
-            except Exception as e:  # noqa: BLE001 — group send must never break DMs
-                log.warning(
-                    "morning_drop_notice_broadcast_failed",
-                    fixture_id=listing.fixture_id, chat_id=int(group_id), error=str(e),
-                )
-
-        # Flag ONLY once at least one recipient (DM or group) actually got it, so
-        # drop_notified never lies. On a TOTAL send failure it is left False and
-        # the fixture stays pending for the next tick's retry inside the bounded
-        # window — better a retry than a "sent" that nobody received.
-        if any_success or group_success:
-            mark_fn(listing.fixture_id)
-            log.info(
-                "morning_drop_notice_sent",
-                fixture_id=listing.fixture_id,
-                dm_recipients=len(recipients), group=bool(group_success),
-            )
+    # Serialise the whole read-decide-send-mark critical section. The KO-10
+    # event hook and the 15-min sweep run as separate coroutines on the one
+    # daemon loop, and each awaits Telegram sends BEFORE mark_fn. Without the
+    # lock both could read drop_notified=False for the SAME fixture and both
+    # send. Under the lock the second entrant re-reads `pending` after the
+    # first has marked, and finds nothing.
+    async with _DROP_NOTICE_LOCK:
+        if fixture_ids is not None:
+            # Event-driven: reconcile exactly the fixture(s) whose late alert just
+            # got suppressed. Scoped by id, no kickoff-window clause (the suppression
+            # proves the late-alert lifecycle is over); already-notified -> no-op.
+            from betbot.storage.repos import morning_listings_pending_by_ids
+            pending = list(morning_listings_pending_by_ids(fixture_ids))
         else:
-            log.warning(
-                "morning_drop_notice_all_sends_failed",
-                fixture_id=listing.fixture_id,
-                note="left un-notified for retry on the next tick",
-            )
-    if consumed:
-        log.info("morning_drop_notices_consumed_total", count=consumed)
-    return sent
+            # Sweep: bounded to listings whose late-alert time (KO - lead) has passed.
+            lead = settings.lineup_confirm_lead_minutes()
+            _fetch = listings_fn or morning_listings_pending_drop_notice
+            pending = list(_fetch(now, lead))
+        if not pending:
+            return 0
+
+        recipients = notice_recipient_ids(settings, users_fn())
+        group_id = getattr(settings, "broadcast_chat_id", None)
+
+        sent = 0
+        consumed = 0
+        for listing in pending:
+            pred = prediction_fn(listing.fixture_id)
+            # HONOURED? Same predicate as the result path: the live stored row still
+            # clears the gate (still qualifying / drifted back up and the late alert
+            # fired), OR the fixture was ever revealed to a user (it alerted at some
+            # fire). Either way the promised call went out — CONSUME, send nothing.
+            gate_passes = pred is not None and high_conf_alert_passes(settings, pred)[0]
+            if gate_passes or ever_revealed_fn(listing.fixture_id):
+                mark_fn(listing.fixture_id)
+                consumed += 1
+                log.info(
+                    "morning_drop_notice_consumed_honoured",
+                    fixture_id=listing.fixture_id, gate_passes=gate_passes,
+                )
+                continue
+
+            # DROPPED: below the bar now AND never alerted -> owe the audience a
+            # notice. No audience at all (no operator/users AND no group): the notice
+            # can never be delivered, so CONSUME it rather than log a failure forever.
+            if not recipients and not group_id:
+                mark_fn(listing.fixture_id)
+                log.info("morning_drop_notice_no_audience", fixture_id=listing.fixture_id)
+                continue
+
+            body = render_morning_drop_notice(listing)
+            any_success = False
+            for uid in recipients:
+                try:
+                    if await send(settings, uid, body):
+                        sent += 1
+                        any_success = True
+                except Exception as e:  # noqa: BLE001 — one bad send must not drop the rest
+                    log.warning(
+                        "morning_drop_notice_send_failed",
+                        telegram_user_id=uid, fixture_id=listing.fixture_id, error=str(e),
+                    )
+            # Group broadcast (SAME body, ONCE) when set — identical treatment to the
+            # morning notice's group copy. A failed group send must NEVER affect the
+            # DMs above: caught, logged distinctly, kept OUT of ``sent`` (DM count).
+            group_success = False
+            if group_id:
+                try:
+                    if await send(settings, int(group_id), body):
+                        group_success = True
+                        log.info(
+                            "morning_drop_notice_broadcast_sent",
+                            fixture_id=listing.fixture_id, chat_id=int(group_id),
+                        )
+                except Exception as e:  # noqa: BLE001 — group send must never break DMs
+                    log.warning(
+                        "morning_drop_notice_broadcast_failed",
+                        fixture_id=listing.fixture_id, chat_id=int(group_id), error=str(e),
+                    )
+
+            # Flag ONLY once at least one recipient (DM or group) actually got it, so
+            # drop_notified never lies. On a TOTAL send failure it is left False and
+            # the fixture stays pending for the next tick's retry inside the bounded
+            # window — better a retry than a "sent" that nobody received.
+            if any_success or group_success:
+                mark_fn(listing.fixture_id)
+                log.info(
+                    "morning_drop_notice_sent",
+                    fixture_id=listing.fixture_id,
+                    dm_recipients=len(recipients), group=bool(group_success),
+                )
+            else:
+                log.warning(
+                    "morning_drop_notice_all_sends_failed",
+                    fixture_id=listing.fixture_id,
+                    note="left un-notified for retry on the next tick",
+                )
+        if consumed:
+            log.info("morning_drop_notices_consumed_total", count=consumed)
+        return sent
 
 
 # ----------------------------------------------------------------------

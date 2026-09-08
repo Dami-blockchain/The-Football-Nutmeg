@@ -424,3 +424,41 @@ async def test_drift_back_above_by_late_alert_gets_no_drop_notice(db, settings):
     )
     assert n == 0 and sent == []       # no drop notice owed
     assert _drop_notified(21) is True  # consumed silently as honoured
+
+
+async def test_concurrent_hook_and_sweep_do_not_double_send(db, settings):
+    """Fable repro: the KO-10 event hook and the 15-min sweep overlap on the one
+    daemon loop. Without the module lock both read drop_notified=False for the
+    same fixture and BOTH send, advertising it as dropped twice. The lock must
+    serialise them so every surface is notified exactly ONCE."""
+    import asyncio
+
+    _gate_on(settings)
+    object.__setattr__(settings, "broadcast_chat_id", -1002)
+    now = datetime(2026, 9, 8, 20, 0, tzinfo=timezone.utc)
+    _list(777, now - timedelta(minutes=1))
+    preds = {777: _Pred("Man City", "Arsenal", 0.60, 0.25, 0.15)}
+    sent: list[int] = []
+
+    async def slow_send(s, cid, text):
+        await asyncio.sleep(0.05)  # widen the read->send->mark window
+        sent.append(cid)
+        return True
+
+    # Event hook (fixture_ids) and sweep (no ids) race on the same loop.
+    r1, r2 = await asyncio.gather(
+        daily_jobs.run_morning_drop_notices(
+            settings, send_fn=slow_send, now=now, fixture_ids=[777],
+            users_fn=lambda: [_User(111)], prediction_fn=lambda fid: preds.get(fid),
+        ),
+        daily_jobs.run_morning_drop_notices(
+            settings, send_fn=slow_send, now=now,
+            users_fn=lambda: [_User(111)], prediction_fn=lambda fid: preds.get(fid),
+        ),
+    )
+    # Exactly one delivery per surface — never doubled.
+    assert sorted(sent) == [-1002, 111, 999]
+    # One entrant sent (n == 2 DMs); the other re-read pending under the lock,
+    # found it already marked, and sent nothing.
+    assert {r1, r2} == {2, 0}
+    assert _drop_notified(777) is True

@@ -551,7 +551,8 @@ class MorningNoticeListing(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    fixture_id: Mapped[int] = mapped_column(Integer, index=True)
+    # No explicit index: the UniqueConstraint on fixture_id already creates one.
+    fixture_id: Mapped[int] = mapped_column(Integer)
     competition_code: Mapped[str] = mapped_column(String(8))
     home_team: Mapped[str] = mapped_column(String(80))
     away_team: Mapped[str] = mapped_column(String(80))
