@@ -966,9 +966,9 @@ async def send_prediction_alert(
             # Tell the reader plainly that the call has slipped below the bar
             # since the earlier alert, and that the result still follows. Plumbed
             # through the existing ``adj_note`` (appended, so a lineup caveat is
-            # kept) — the standard body already carries the "NO BET — below our
-            # confidence bar" line when the filter is live, and this reads
-            # coherently above it.
+            # kept). The standard body no longer carries a NO BET line (the
+            # bet/no-bet rule was retired 2026-09-08), so this downgrade note is
+            # what signals the slip.
             adj_note = (
                 f"{adj_note}\n{HIGH_CONF_DOWNGRADE_NOTE}"
                 if adj_note
