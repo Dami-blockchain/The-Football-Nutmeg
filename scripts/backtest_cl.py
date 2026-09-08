@@ -50,14 +50,24 @@ from betbot.strategy.glicko import DRAW_CAP, DRAW_FLOOR  # noqa: E402
 
 HA_GRID = [0.0, 25.0, 50.0, 65.0, 80.0, 100.0]
 RHO_GRID = [0.22, 0.24, 0.26, 0.28, 0.30, 0.32, 0.34]
+# Logistic Elo divisor. 400 = classic api.clubelo scale (unchanged behaviour).
+# Smaller divisors sharpen the same gap — needed for compressed site-scale
+# snapshots. Tuned on TRAIN only, alongside home-advantage and draw-rho.
+SCALE_GRID = [250.0, 300.0, 350.0, 400.0]
 DC_WEIGHT_GRID = [0.3, 0.6, 1.0]
 TRAIN_CUTOFF = date(2025, 7, 1)
 
 
-def _elo_probs(elo_home: float, elo_away: float, ha: float, rho: float):
-    """Elo 1X2 probabilities; draw split mirrors glicko.match_probabilities."""
+def _elo_probs(elo_home: float, elo_away: float, ha: float, rho: float,
+               scale: float = 400.0):
+    """Elo 1X2 probabilities; draw split mirrors glicko.match_probabilities.
+
+    ``scale`` is the logistic divisor (classic Elo = 400). Compressed snapshot
+    scales (e.g. ClubElo site-scale) need a smaller divisor to recover sharpness.
+    Mirrors betbot.strategy.cl_engine._elo_probs / cl_elo_scale.
+    """
     d = elo_home + ha - elo_away
-    p_home_raw = 1.0 / (1.0 + 10.0 ** (-d / 400.0))
+    p_home_raw = 1.0 / (1.0 + 10.0 ** (-d / scale))
     p_draw = rho * (1.0 - abs(p_home_raw - 0.5) * 2.0)
     p_draw = min(DRAW_CAP, max(DRAW_FLOOR, p_draw))
     p_home = (1.0 - p_draw) * p_home_raw
@@ -180,20 +190,22 @@ def main() -> None:
     ]
     print(f"train matches with both Elo ratings: {len(train_scored)}/{len(train)}")
 
-    best = None  # (mean_rps, ha, rho)
+    best = None  # (mean_rps, ha, rho, scale)
     for ha in HA_GRID:
         for rho in RHO_GRID:
-            tot = 0.0
-            for r in train_scored:
-                eh = elo_lookup(r["home"], r["date"])
-                ea = elo_lookup(r["away"], r["date"])
-                oi = OUT_IDX[_outcome(r["hs"], r["as"])]
-                tot += ranked_probability_score(_elo_probs(eh, ea, ha, rho), oi)
-            mrps = tot / max(len(train_scored), 1)
-            if best is None or mrps < best[0]:
-                best = (mrps, ha, rho)
-    best_rps, ha_star, rho_star = best
-    print(f"tuned Elo: HA={ha_star:.0f} rho={rho_star:.2f} "
+            for scale in SCALE_GRID:
+                tot = 0.0
+                for r in train_scored:
+                    eh = elo_lookup(r["home"], r["date"])
+                    ea = elo_lookup(r["away"], r["date"])
+                    oi = OUT_IDX[_outcome(r["hs"], r["as"])]
+                    tot += ranked_probability_score(
+                        _elo_probs(eh, ea, ha, rho, scale), oi)
+                mrps = tot / max(len(train_scored), 1)
+                if best is None or mrps < best[0]:
+                    best = (mrps, ha, rho, scale)
+    best_rps, ha_star, rho_star, scale_star = best
+    print(f"tuned Elo: HA={ha_star:.0f} rho={rho_star:.2f} scale={scale_star:.0f} "
           f"train mean RPS={best_rps:.5f}")
 
     # ---- Tune Elo+DC blend weight on train -----------------------------
@@ -210,7 +222,7 @@ def main() -> None:
             eh = elo_lookup(r["home"], r["date"])
             ea = elo_lookup(r["away"], r["date"])
             oi = OUT_IDX[_outcome(r["hs"], r["as"])]
-            elo_p = _elo_probs(eh, ea, ha_star, rho_star)
+            elo_p = _elo_probs(eh, ea, ha_star, rho_star, scale_star)
             dcp = dc_probs_or_none(r)
             if dcp is not None:
                 probs = log_pool([(1.0, elo_p), (dc_w, dcp)])
@@ -269,7 +281,7 @@ def main() -> None:
             if not scorable:
                 continue  # skip from Elo scoring; counted below via probe
 
-            elo_p = _elo_probs(eh, ea, ha_star, rho_star)
+            elo_p = _elo_probs(eh, ea, ha_star, rho_star, scale_star)
             probs_by = {"naive": naive_p, "elo": elo_p}
             if "elo_dc" in variants:
                 dcp = dc_probs_or_none(r)
@@ -324,7 +336,8 @@ def main() -> None:
               f"({'CI>0' if sig else 'includes 0'})")
 
     print(f"\ntuned params: HA={ha_star:.0f}, rho={rho_star:.2f}, "
-          f"dc_weight={dc_w_star:.1f} (blend shipped: {blend_beats_elo})")
+          f"scale={scale_star:.0f}, dc_weight={dc_w_star:.1f} "
+          f"(blend shipped: {blend_beats_elo})")
     print(f"\nFINAL VERDICT: {'GATE PASSED' if gate_pass else 'GATE FAILED'}")
 
 

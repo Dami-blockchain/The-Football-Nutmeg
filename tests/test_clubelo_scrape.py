@@ -127,6 +127,18 @@ def test_scrape_builds_valid_site_scale_csv(tmp_path):
     assert st.snapshot_date == date(2026, 9, 6)
 
 
+def test_scrape_writes_dated_site_archive(tmp_path):
+    # The monitor file is overwritten every run; a dated copy under
+    # data/clubelo_site/<snap_date>.csv must ALSO be written so a real
+    # site-scale history accrues (byte-identical to the monitor snapshot).
+    dest = _write_ref(tmp_path)
+    ref = tmp_path / "clubelo_latest.csv"
+    assert clubelo.scrape_latest(dest, reference=ref, html=_fixture_html()) is True
+    archive = tmp_path / "clubelo_site" / "2026-09-06.csv"
+    assert archive.exists()
+    assert archive.read_text() == dest.read_text()
+
+
 def test_names_are_canonicalised_to_the_reference(tmp_path):
     dest = _write_ref(tmp_path)
     ref = tmp_path / "clubelo_latest.csv"

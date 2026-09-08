@@ -611,7 +611,9 @@ def scrape_latest(
     silently mis-price every tie AND — because a scrape stamps today's ``From``
     date — quietly silence the staleness alarm on a mis-scaled file. So the
     engine keeps reading the last real API snapshot; this file is only for
-    coverage monitoring and a future re-tune.
+    coverage monitoring and a future re-tune. A dated copy of each successful
+    scrape is also written under ``data/clubelo_site/YYYY-MM-DD.csv`` so a
+    site-scale history actually accrues (``dest`` itself is overwritten daily).
 
     ``reference`` is the pinned API snapshot the scrape canonicalises names and
     takes its European scope from (defaults to ``clubelo_latest.csv`` beside
@@ -672,9 +674,25 @@ def scrape_latest(
         return False
 
     _write_atomic(dest, csv_text)
+    # Dated site-scale archive. ``dest`` is overwritten every run, so on its own
+    # NO history accrues (the old docstring claim was false). Also drop an
+    # immutable dated copy under ``data/clubelo_site/`` (~33 KB/day) so a genuine
+    # site-scale corpus builds up over time for a future re-tune. Best-effort:
+    # a failure here must never fail the scrape or reset any staleness clock.
+    archived: str | None = None
+    try:
+        archive_dir = dest.parent / "clubelo_site"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        archive_path = archive_dir / f"{snap_date.isoformat()}.csv"
+        _write_atomic(archive_path, csv_text)
+        archived = str(archive_path)
+    except OSError as e:  # archiving must never crash the caller
+        log.warning(
+            "clubelo_scrape_archive_failed", error=f"{e.__class__.__name__}: {e}"
+        )
     log.info(
         "clubelo_scrape_monitor_written",
-        source="scrape", dest=str(dest),
+        source="scrape", dest=str(dest), archived=archived,
         snapshot=snap_date.isoformat(), clubs=report["emitted"],
         note="site_scale_monitoring_only_not_engine_input", **report,
     )
@@ -695,8 +713,10 @@ def _scrape_monitor(engine_dest: Path, *, timeout: int, retries: int, sleep) -> 
     succeeded and NEVER touches ``engine_dest``: the site is a different rating
     scale, so it cannot serve as the CL engine's tuned input, and it must not
     reset the staleness clock on the engine snapshot. It exists only so the
-    operator can see live site coverage and so a site-scale history accrues for
-    a possible future re-tune. ``engine_dest`` is passed only as the reference
+    operator can see live site coverage and so a site-scale history accrues (as
+    dated per-run copies under ``data/clubelo_site/``, written by
+    :func:`scrape_latest`) for a possible future re-tune. ``engine_dest`` is
+    passed only as the reference
     (names + scope) — it is read, never written.
     """
     monitor = engine_dest.with_name(SCRAPE_MONITOR_NAME)

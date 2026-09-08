@@ -80,10 +80,16 @@ DEGENERATE_MIN_CLUSTER = 3
 DEGENERATE_MIN_FRACTION = 0.5
 
 
-def _elo_probs(elo_home: float, elo_away: float, home_adv: float, draw_rho: float):
-    """Elo 1X2 probabilities; draw split mirrors glicko.match_probabilities."""
+def _elo_probs(elo_home: float, elo_away: float, home_adv: float, draw_rho: float,
+               scale: float = 400.0):
+    """Elo 1X2 probabilities; draw split mirrors glicko.match_probabilities.
+
+    ``scale`` is the logistic divisor (classic Elo = 400). A smaller divisor
+    sharpens the same rating gap, needed when the snapshot ratings are on a
+    compressed scale (e.g. ClubElo site-scale vs api.clubelo scale).
+    """
     d = elo_home + home_adv - elo_away
-    p_home_raw = 1.0 / (1.0 + 10.0 ** (-d / 400.0))
+    p_home_raw = 1.0 / (1.0 + 10.0 ** (-d / scale))
     p_draw = draw_rho * (1.0 - abs(p_home_raw - 0.5) * 2.0)
     p_draw = min(DRAW_CAP, max(DRAW_FLOOR, p_draw))
     p_home = (1.0 - p_draw) * p_home_raw
@@ -359,7 +365,7 @@ class EuropeanStrategyEngine:
 
         elo_probs = _elo_probs(
             eh, ea,
-            s.cl_elo_home_adv, s.cl_elo_draw_rho,
+            s.cl_elo_home_adv, s.cl_elo_draw_rho, s.cl_elo_scale,
         )
         components: list[tuple[float, tuple[float, float, float]]] = [
             (s.cl_weight_elo, elo_probs)

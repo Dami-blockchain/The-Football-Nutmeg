@@ -466,6 +466,13 @@ class Settings(BaseSettings):
     )
     cl_elo_home_adv: float = Field(default=65.0, alias="BETBOT_CL_ELO_HOME_ADV")
     cl_elo_draw_rho: float = Field(default=0.26, alias="BETBOT_CL_ELO_DRAW_RHO")
+    # Logistic Elo divisor ("scale"). The classic Elo value is 400: a 400-point
+    # gap = ~91% win expectancy. ClubElo's own SITE-scale ratings are compressed
+    # (big-vs-small gaps ~0.65x the api.clubelo scale), so a smaller divisor is
+    # needed to recover the same sharpness. Default 400 keeps the api-scale
+    # engine byte-identical; retune this alongside home_adv/draw_rho if the
+    # snapshot scale changes. See scripts/backtest_cl.py.
+    cl_elo_scale: float = Field(default=400.0, alias="BETBOT_CL_ELO_SCALE")
     # Log-pool weights for the CL Elo ensemble components + market anchoring.
     cl_weight_elo: float = Field(default=1.0, alias="BETBOT_CL_W_ELO")
     cl_weight_dc: float = Field(default=1.0, alias="BETBOT_CL_W_DC")
