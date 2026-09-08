@@ -262,9 +262,21 @@ def format_high_conf_alert(
         else "*NO BET* (default; edge vs price below threshold)"
     )
 
+    # Spell out the predicted CLUB so the reader never has to decode a bare
+    # HOME/AWAY token into a team name (the operator found that confusing). The
+    # home/away designation is kept ON the pick itself, satisfying the standing
+    # format rule; a DRAW pick cannot read "<team> to win", so it renders plainly.
+    if top_pick == "DRAW":
+        pick_line = f"*Model pick: Draw* ({_top_p:.0%})"
+    else:
+        pick_team = home if top_pick == "HOME" else away
+        pick_side = "HOME" if top_pick == "HOME" else "AWAY"
+        pick_line = f"*Model pick: {pick_team} ({pick_side}) to win* ({_top_p:.0%})"
+
     min_p = float(getattr(settings, "high_conf_alert_min_p", 0.65))
     return "\n".join([
         header,
+        pick_line,
         _model_triple_line(pred, top_pick, market_str),
         call,
         format_band_line(min_p, live_tally, sold=live_tally_sold),

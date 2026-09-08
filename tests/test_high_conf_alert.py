@@ -328,6 +328,7 @@ def test_high_conf_message_home_favourite_no_market(settings):
     assert ", Premier League," in body
     assert ", PL," not in body
     assert "KO 17:00 EAT" in body  # 14:00 UTC -> 17:00 EAT (UTC+3)
+    assert "*Model pick: Arsenal (HOME) to win* (71%)" in body
     assert "Model: HOME 71% / draw 18% / away 11%" in body
     # Matching is dead: the Market field must say so, not fabricate a price.
     assert "Market: unavailable (no live quote)" in body
@@ -351,6 +352,7 @@ def test_high_conf_message_labels_away_favourite():
     s = Settings(_env_file=None, FOOTBALL_DATA_API_KEY="x", BETBOT_HIGH_CONF_ALERTS_ONLY=True)
     pred = _pred(1, 0.11, 0.18, 0.71)
     body = notify.format_high_conf_alert(pred, s, live_tally=None)
+    assert "*Model pick: Everton (AWAY) to win* (71%)" in body
     assert "Model: home 11% / draw 18% / AWAY 71%" in body
 
 
