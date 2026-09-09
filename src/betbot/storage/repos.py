@@ -2011,6 +2011,27 @@ def morning_listings_pending_drop_notice(
         return rows
 
 
+def morning_listing_drop_notified(fixture_id: int) -> bool:
+    """True iff a morning-listed fixture has already been through the drop path
+    (a real drop notice sent, or a deliberate consume).
+
+    Used by the LATE alert to acknowledge an earlier drop notice when a fixture
+    has recovered above the bar. At the late fire this is an exact proxy for "a
+    drop notice was SENT": the only writers before the late fire are the EARLY
+    suppression hook (gate failed -> DROPPED -> real send) and — never earlier
+    than the late fire — the sweep, which is bounded to kickoff <= now + late
+    lead, i.e. it cannot run for a fixture until the late-alert instant has
+    already passed. So a consume-without-send can only be recorded at/after the
+    late fire, never before it.
+    """
+    with session_scope() as s:
+        val = s.execute(
+            select(MorningNoticeListing.drop_notified)
+            .where(MorningNoticeListing.fixture_id == fixture_id)
+        ).scalar_one_or_none()
+        return bool(val)
+
+
 def mark_morning_drop_notified(fixture_id: int) -> None:
     """Flag a morning-listed fixture as handled by the drop path so it is never
     re-queued (a real send, or a deliberate consume)."""

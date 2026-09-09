@@ -1204,25 +1204,31 @@ def run_daemon(
                         min_p=float(settings.high_conf_alert_min_p),
                         at="fire",
                     )
-                    # The confirmed-XI (late) alert is the LAST alert opportunity;
-                    # its suppression is the deterministic moment the lifecycle
-                    # ends. If this fixture was NAMED in the morning notice, tell
-                    # that audience it has dropped below the bar NOW (~KO-10)
-                    # instead of silence — event-driven, no clock race: a fixture
-                    # that climbed back above 0.65 would have PASSED above and
-                    # never reached here. Only the LATE tag fires this; an early
-                    # suppression defers to the late fire (it may recover). The
-                    # notice is FREE/idempotent; the periodic sweep is the retry.
-                    if tag == "late":
-                        try:
-                            await run_morning_drop_notices(
-                                settings, fixture_ids=[fixture_id]
-                            )
-                        except Exception as e:  # noqa: BLE001 — never crash the fire
-                            get_logger(__name__).warning(
-                                "morning_drop_notice_hook_failed",
-                                fixture_id=fixture_id, error=str(e),
-                            )
+                    # If this fixture was NAMED in the morning notice, tell that
+                    # audience it has dropped below the bar NOW instead of
+                    # silence. Fire on EITHER suppression:
+                    #   * EARLY (KO-55, or KO-70 for the PL) is the PRIMARY
+                    #     trigger — it buys the operator ~45 min over the late
+                    #     gate. The operator has accepted that a fixture can
+                    #     recover by the confirmed-XI rescore: the drop notice
+                    #     then the real call at ~KO-10 is a coherent sequence,
+                    #     and the late alert carries a recovery line.
+                    #   * LATE (KO-10) remains a BACKSTOP for a missed early job
+                    #     (daemon restarted through the early window): it is
+                    #     idempotent (drop_notified) so it is a pure no-op when
+                    #     the early notice already went out.
+                    # The periodic sweep is the final backstop if BOTH jobs
+                    # miss. run_morning_drop_notices re-checks the gate, so a
+                    # fixture that recovered by call time is consumed, not sent.
+                    try:
+                        await run_morning_drop_notices(
+                            settings, fixture_ids=[fixture_id]
+                        )
+                    except Exception as e:  # noqa: BLE001 — never crash the fire
+                        get_logger(__name__).warning(
+                            "morning_drop_notice_hook_failed",
+                            fixture_id=fixture_id, error=str(e),
+                        )
                     return
             league = baseline.competition_code if baseline else ""
             lead = (
@@ -1508,10 +1514,11 @@ def run_daemon(
             id="score_reverification",
         )
         # Periodic (every 15m) RETRY SAFETY-NET for the morning drop notice. The
-        # notice is delivered EVENT-DRIVEN the instant the confirmed-XI (late)
-        # alert is suppressed (see _fire_prediction_alert), so it lands at ~KO-10.
-        # This sweep only retries a send that failed and catches any listing whose
-        # late job never fired, bounded to listings whose late-alert time
+        # notice is delivered EVENT-DRIVEN at the EARLY suppression (~KO-55, or
+        # KO-70 for the PL), with the late suppression as an idempotent backstop
+        # (see _fire_prediction_alert). This sweep is the FINAL backstop: it
+        # retries a send that failed and catches a listing whose alert jobs never
+        # fired at all, bounded to listings whose late-alert time
         # (KO - lineup_confirm_lead) has passed. Cheap, FREE, idempotent.
         add_async_job(
             scheduler,
