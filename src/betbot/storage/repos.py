@@ -291,6 +291,7 @@ def record_prediction_outcome(
     result_notified: bool = False,
     kickoff: datetime | None = None,
     anchor_source: str | None = None,
+    source_last_updated: str | None = None,
 ) -> bool:
     """INSERT-OR-IGNORE one scored prediction. Returns True iff NEWLY inserted.
 
@@ -330,6 +331,8 @@ def record_prediction_outcome(
                     result_notified=result_notified,
                     settled_at=settled_at,
                     anchor_source=anchor_source,
+                    source_last_updated=source_last_updated,
+                    score_verify_count=0,
                 )
             )
         return True
@@ -2020,7 +2023,9 @@ def mark_morning_drop_notified(fixture_id: int) -> None:
             row.drop_notified = True
 
 
-def outcomes_settled_since(hours: int) -> list[PredictionOutcome]:
+def outcomes_settled_since(
+    hours: int, *, max_verify_count: int | None = None
+) -> list[PredictionOutcome]:
     """Every scored outcome settled within the trailing ``hours`` (newest first).
 
     RAW and UNFILTERED (no epoch / degenerate / club / season scoping): this
@@ -2029,14 +2034,19 @@ def outcomes_settled_since(hours: int) -> list[PredictionOutcome]:
     ones a user-facing accuracy read would include.
     """
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    with session_scope() as s:
-        rows = list(
-            s.execute(
-                select(PredictionOutcome)
-                .where(PredictionOutcome.settled_at >= cutoff)
-                .order_by(PredictionOutcome.settled_at.desc())
-            ).scalars()
+    stmt = (
+        select(PredictionOutcome)
+        .where(PredictionOutcome.settled_at >= cutoff)
+        .order_by(PredictionOutcome.settled_at.desc())
+    )
+    if max_verify_count is not None:
+        # NULL count == never checked (legacy / pre-column) -> include it.
+        stmt = stmt.where(
+            (PredictionOutcome.score_verify_count.is_(None))
+            | (PredictionOutcome.score_verify_count < max_verify_count)
         )
+    with session_scope() as s:
+        rows = list(s.execute(stmt).scalars())
         s.expunge_all()
         return rows
 
@@ -2064,3 +2074,32 @@ def refresh_outcome_goals(fixture_id: int, home_goals: int, away_goals: int) -> 
         row.home_goals = int(home_goals)
         row.away_goals = int(away_goals)
         return True
+
+
+def mark_outcome_verified(
+    fixture_id: int,
+    *,
+    source_last_updated: str | None = None,
+    now: datetime | None = None,
+) -> None:
+    """Stamp an outcome as re-verified by the daily score-verification pass.
+
+    Sets ``score_verified_at`` to ``now``, increments ``score_verify_count``
+    (NULL treated as 0), and refreshes ``source_last_updated`` when the caller
+    passes the provider's latest value. Bounds the re-check: once the count
+    reaches the pass's cap the row is no longer selected, so a confirmed score
+    is checked a handful of times and then left alone.
+    """
+    when = now or datetime.now(timezone.utc)
+    with session_scope() as s:
+        row = s.execute(
+            select(PredictionOutcome).where(
+                PredictionOutcome.fixture_id == fixture_id
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            return
+        row.score_verified_at = when
+        row.score_verify_count = int(row.score_verify_count or 0) + 1
+        if source_last_updated is not None:
+            row.source_last_updated = source_last_updated

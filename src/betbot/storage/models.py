@@ -479,6 +479,19 @@ class PredictionOutcome(Base):
     kickoff: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, index=True
     )
+    # Score re-verification provenance (all additive & nullable). The
+    # provider's lastUpdated when we read the score, the last time the daily
+    # re-verify pass checked this row, and how many times it has (NULL == 0),
+    # so a confirmed score is checked a bounded number of times then dropped.
+    source_last_updated: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+    score_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    score_verify_count: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, default=0
+    )
 
 
 class ArbExecution(Base):

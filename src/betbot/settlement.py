@@ -31,6 +31,7 @@ from betbot.storage.repos import (
     record_settlement,
     refresh_outcome_goals,
     outcomes_settled_since,
+    mark_outcome_verified,
     score_model_prediction,
     settled_pnl_window,
     trip_kill_switch,
@@ -144,6 +145,22 @@ class SettlementSummary:
     kill_switch_tripped: bool
     window_pnl_usd: float
     window_staked_usd: float
+
+
+@dataclass(frozen=True)
+class CorrectedScore:
+    """One outcome whose stored scoreline the re-verify pass corrected."""
+
+    fixture_id: int
+    home_goals: int
+    away_goals: int
+
+
+@dataclass(frozen=True)
+class ScoreReverifySummary:
+    checked: int
+    corrected: list["CorrectedScore"]
+    winner_conflicts: int
 
 
 class SettlementWatcher:
@@ -265,6 +282,7 @@ class SettlementWatcher:
                     result_notified=stale,
                     kickoff=ko,
                     anchor_source=pred.anchor_source,
+                    source_last_updated=match.get("lastUpdated"),
                 )
             except Exception as e:  # noqa: BLE001 — one bad row mustn't stop the rest
                 log.warning(
@@ -292,6 +310,9 @@ class SettlementWatcher:
                     max(range(3), key=lambda i: (pred.p_home, pred.p_draw, pred.p_away)[i])
                 ],
                 result=outcome.value,
+                home_goals=hg,
+                away_goals=ag,
+                source_last_updated=match.get("lastUpdated"),
             )
             if stale:
                 continue  # backfill: ledger only — no rating nudge, no alert
@@ -317,8 +338,11 @@ class SettlementWatcher:
         return scored
 
     async def reverify_recent_scores(
-        self, now: datetime | None = None, window_hours: int = 72
-    ) -> int:
+        self,
+        now: datetime | None = None,
+        window_hours: int = 72,
+        max_checks: int = 3,
+    ) -> ScoreReverifySummary:
         """Re-check the source score for recently-settled outcomes and correct a
         PROVISIONAL scoreline the provider later fixed.
 
@@ -329,25 +353,36 @@ class SettlementWatcher:
         Because :func:`record_prediction_outcome` is one-shot (idempotent on
         fixture_id) and never re-reads, the published scoreline stayed wrong.
 
-        This pass re-fetches every outcome settled within ``window_hours`` and:
+        Re-fetches every outcome settled within ``window_hours`` that has been
+        checked fewer than ``max_checks`` times (so a confirmed score is
+        re-verified a handful of times, then left alone — a daily pass over a
+        72h window naturally gives ~3 checks per row without re-fetching the
+        whole window forever). For each:
 
           * source winner UNCHANGED, goals differ -> correct the goals via
             :func:`refresh_outcome_goals` and log ``outcome_score_corrected``.
             Safe: the pick, the Brier/RPS/log-loss and the ratings all key off
-            the WINNER, so only the cosmetic scoreline changes.
+            the WINNER, so only the cosmetic scoreline changes. The fixture is
+            returned so the caller can send a forward-only correction alert.
           * source winner CHANGED vs the stored outcome -> DO NOT silently
             re-score. A post-full-time winner flip is rare and consequential
             (it moves pick-correctness, the ratings already nudged, and any
-            RESULT ALERT already sent), so it is logged LOUD as
+            RESULT ALERT already sent), so it PAGES the operator
+            (``notify_operator``, per-fixture dedupe) and is logged
             ``outcome_winner_conflict`` for the review gate rather than
             auto-applied here.
 
-        Best-effort throughout: one bad fetch or row never aborts the pass.
-        Returns the number of scorelines corrected.
+        Every row actually re-read is stamped verified (``score_verified_at`` +
+        ``score_verify_count``) and its ``source_last_updated`` refreshed, which
+        is what bounds the re-check and keeps the "our data vs source" question
+        falsifiable. Best-effort throughout: one bad fetch or row never aborts
+        the pass. Returns a :class:`ScoreReverifySummary`.
         """
         now = now or datetime.now(timezone.utc)
-        corrected = 0
-        for row in outcomes_settled_since(window_hours):
+        corrected: list[CorrectedScore] = []
+        conflicts = 0
+        checked = 0
+        for row in outcomes_settled_since(window_hours, max_verify_count=max_checks):
             try:
                 match = await self._client.get_match(row.fixture_id)
             except Exception as e:  # noqa: BLE001 — one bad fetch mustn't stop the pass
@@ -356,23 +391,50 @@ class SettlementWatcher:
                 )
                 continue
             if match is None or match.get("status") not in SETTLED_STATUSES:
+                # Not final (yet) — do NOT consume a check; retry next pass.
                 continue
             src_outcome = _WINNER_TO_OUTCOME.get(
                 (match.get("score") or {}).get("winner")
             )
             if src_outcome is None:
                 continue
+            checked += 1
+            lu = match.get("lastUpdated")
             if src_outcome.value != row.actual_outcome:
-                # Consequential: never auto-apply — surface for review.
+                # Consequential: never auto-apply — PAGE the operator + log LOUD.
+                conflicts += 1
                 log.warning(
                     "outcome_winner_conflict",
                     fixture_id=row.fixture_id,
                     stored_outcome=row.actual_outcome,
                     source_outcome=src_outcome.value,
+                    source_last_updated=lu,
                 )
+                try:
+                    await notify_operator(
+                        self._settings,
+                        "*\u26a0\ufe0f Result WINNER conflict \u2014 needs review*\n\n"
+                        f"Fixture {row.fixture_id}: we recorded "
+                        f"*{row.actual_outcome}*, the source now says "
+                        f"*{src_outcome.value}*.\n\n"
+                        "A winner change rewrites pick-correctness, the public "
+                        "record and the ratings, so it is NOT auto-applied. "
+                        "Review and correct by hand if the source is right.",
+                        kind="outcome_winner_conflict",
+                        dedupe_key=f"outcome_winner_conflict:{row.fixture_id}",
+                    )
+                except Exception as e:  # noqa: BLE001 — paging must never abort the pass
+                    log.warning(
+                        "winner_conflict_page_failed",
+                        fixture_id=row.fixture_id, error=str(e),
+                    )
+                # Still stamp verified so it doesn't page every single day forever
+                # (notify_operator's per-key cooldown also collapses repeats).
+                mark_outcome_verified(row.fixture_id, source_last_updated=lu, now=now)
                 continue
             hg, ag = _final_goals(match)
             if hg == row.home_goals and ag == row.away_goals:
+                mark_outcome_verified(row.fixture_id, source_last_updated=lu, now=now)
                 continue
             try:
                 changed = refresh_outcome_goals(row.fixture_id, hg, ag)
@@ -381,17 +443,24 @@ class SettlementWatcher:
                     "reverify_update_failed", fixture_id=row.fixture_id, error=str(e)
                 )
                 continue
+            mark_outcome_verified(row.fixture_id, source_last_updated=lu, now=now)
             if changed:
-                corrected += 1
+                corrected.append(CorrectedScore(row.fixture_id, hg, ag))
                 log.info(
                     "outcome_score_corrected",
                     fixture_id=row.fixture_id,
                     stored=f"{row.home_goals}-{row.away_goals}",
                     corrected=f"{hg}-{ag}",
+                    source_last_updated=lu,
                 )
-        if corrected:
-            log.info("reverify_scores_done", corrected=corrected)
-        return corrected
+        if corrected or conflicts:
+            log.info(
+                "reverify_scores_done",
+                checked=checked,
+                corrected=len(corrected),
+                winner_conflicts=conflicts,
+            )
+        return ScoreReverifySummary(checked, corrected, conflicts)
 
     def _evaluate_kill_switch(self) -> tuple[bool, float, float]:
         s = self._settings

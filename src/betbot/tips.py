@@ -220,3 +220,31 @@ def format_locked(pred) -> str:
     if ko:
         header += f" — {ko}"
     return f"{header}\n🔒 send 1 USDC (Polygon) to unlock this prediction"
+
+
+def render_result_correction(
+    home_team: str,
+    away_team: str,
+    home_goals: int,
+    away_goals: int,
+    *,
+    competition_code: str | None = None,
+) -> str:
+    """Short, plain, non-alarming note that a full-time score we PUBLISHED has
+    been corrected.
+
+    Only goals-only corrections reach a user (a winner change is never
+    auto-applied — see SettlementWatcher.reverify_recent_scores), so the winner
+    — and therefore whether our call was right — is unchanged, and the copy says
+    so explicitly. Tone matches render_morning_drop_notice: an info line, the
+    corrected score in bold, no probabilities or alarm.
+    """
+    league = league_label(competition_code)
+    league_tag = f" \u00b7 {league}" if league else ""
+    return (
+        "*\u26bd Result correction*\n\n"
+        f"*{home_team} {home_goals}-{away_goals} {away_team}*{league_tag}\n\n"
+        "\u2139\ufe0f An earlier result feed had this match\u2019s score "
+        "wrong \u2014 it has now been corrected to the score above. The winner "
+        "is unchanged, so our call is unaffected."
+    )

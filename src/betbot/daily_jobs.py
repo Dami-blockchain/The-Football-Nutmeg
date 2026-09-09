@@ -1325,6 +1325,137 @@ async def run_result_alerts(
     return sent
 
 
+async def run_score_reverification(
+    settings,
+    *,
+    client=None,
+    send_fn: "SendFn | None" = None,
+    now=None,
+    window_hours: int = 72,
+    prediction_fn=prediction_for_fixture,
+    users_fn=list_users,
+    already_revealed_fn=has_revealed,
+    watcher=None,
+) -> int:
+    """Daily pass: re-verify recently-settled scorelines and send a FORWARD-ONLY
+    correction wherever we actually published the wrong score.
+
+    The DB correction + operator paging on a winner conflict live in
+    :meth:`betbot.settlement.SettlementWatcher.reverify_recent_scores` (owns the
+    provider fetch). This wrapper then, for each goals-only correction, decides
+    whether the result was PUBLISHED — reusing the exact predicate
+    run_result_alerts uses (high-conf gate now OR ever-revealed) — and if so
+    sends :func:`betbot.tips.render_result_correction` to the SAME audience the
+    result alert used (operator + revealed users) plus the group broadcast. A
+    never-published fixture is fixed silently in the DB: there is no one to
+    correct. Returns the number of fixtures a correction was announced for.
+    """
+    from betbot.main import high_conf_alert_passes
+    from betbot.notify import send_telegram_to
+    from betbot.storage.repos import fixture_was_ever_revealed
+    from betbot.tips import render_result_correction
+
+    send = send_fn if send_fn is not None else send_telegram_to
+
+    async def _reverify(w):
+        return await w.reverify_recent_scores(now=now, window_hours=window_hours)
+
+    if watcher is not None:
+        summary = await _reverify(watcher)
+    else:
+        from betbot.data.football_data import FootballDataClient
+        from betbot.settlement import SettlementWatcher
+
+        if client is not None:
+            summary = await _reverify(SettlementWatcher(client, settings))
+        else:
+            async with FootballDataClient(
+                api_key=settings.football_data_api_key,
+                base_url=settings.football_data_base_url,
+                rate_limit_per_min=settings.football_data_rate_limit_per_min,
+            ) as c:
+                summary = await _reverify(SettlementWatcher(c, settings))
+
+    if not summary.corrected:
+        return 0
+
+    users = users_fn()
+    operator_id = settings.telegram_allowed_user_id
+    broadcast_chat_id = getattr(settings, "broadcast_chat_id", None)
+    announced = 0
+    for cs in summary.corrected:
+        pred = prediction_fn(cs.fixture_id)
+        # PUBLISHED-ONLY (same predicate as run_result_alerts): correct only
+        # where a result actually went out. A None pred can't have cleared the
+        # pre-match gate, so under high_conf_alerts_only it is publishable only
+        # via a prior reveal.
+        if pred is None:
+            gate_passes = not getattr(settings, "high_conf_alerts_only", False)
+        else:
+            gate_passes = high_conf_alert_passes(settings, pred)[0]
+        ever_revealed = fixture_was_ever_revealed(cs.fixture_id)
+        if not (gate_passes or ever_revealed):
+            log.info(
+                "result_correction_suppressed_not_published",
+                fixture_id=cs.fixture_id,
+            )
+            continue
+
+        home = pred.home_team if pred is not None else "Home"
+        away = pred.away_team if pred is not None else "Away"
+        comp = getattr(pred, "competition_code", None) if pred is not None else None
+        body = render_result_correction(
+            home, away, cs.home_goals, cs.away_goals, competition_code=comp
+        )
+
+        # Group broadcast (BROADCAST-ONLY, isolated) — the group got the result,
+        # so it gets the correction. A group failure never affects DM delivery.
+        if broadcast_chat_id:
+            try:
+                if await send(settings, int(broadcast_chat_id), body):
+                    log.info(
+                        "result_correction_broadcast_sent",
+                        fixture_id=cs.fixture_id,
+                        chat_id=int(broadcast_chat_id),
+                    )
+            except Exception as e:  # noqa: BLE001 -- broadcast must never break DMs
+                log.warning(
+                    "result_correction_broadcast_failed",
+                    fixture_id=cs.fixture_id, error=str(e),
+                )
+
+        # Same audience the original result alert reached.
+        audience: list[int] = []
+        if operator_id:
+            audience.append(operator_id)
+        for u in users:
+            if u.telegram_user_id in audience:
+                continue
+            if already_revealed_fn(u.telegram_user_id, cs.fixture_id):
+                audience.append(u.telegram_user_id)
+
+        any_success = False
+        for uid in audience:
+            try:
+                if await send(settings, uid, body):
+                    any_success = True
+            except Exception as e:  # noqa: BLE001 — one bad send mustn't drop the rest
+                log.warning(
+                    "result_correction_send_failed",
+                    telegram_user_id=uid, fixture_id=cs.fixture_id, error=str(e),
+                )
+        if any_success:
+            announced += 1
+            log.info(
+                "result_correction_sent",
+                fixture_id=cs.fixture_id,
+                corrected=f"{cs.home_goals}-{cs.away_goals}",
+                delivered=len(audience),
+            )
+    return announced
+
+
+
 def _default_lineup_fn(settings):
     """Build the production ``lineup_fn`` closure over the SHARED LineupService.
 

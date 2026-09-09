@@ -37,6 +37,7 @@ from betbot.daily_jobs import (
     run_matchday_notice,
     run_morning_drop_notices,
     run_result_alerts,
+    run_score_reverification,
     send_prediction_alert,
 )
 from betbot.gate import evaluate_gate
@@ -953,6 +954,19 @@ def run_daemon(
         except Exception as e:  # noqa: BLE001 — never crash the daemon
             get_logger(__name__).warning("result_alerts_failed", error=str(e))
 
+    async def _score_reverify_tick() -> None:
+        # Daily 09:20 UTC: re-verify recently-settled scorelines against the
+        # provider and correct a provisional-then-fixed score, sending a
+        # forward-only correction where we published it. Chosen to sit AFTER the
+        # 08:00 heavy scoring/settle window and off every fixed cron minute; the
+        # pass is quota-contention-tolerant (best-effort per row, re-checks
+        # capped at 3, 72h window), so overlapping a 2h settle tick can only
+        # delay a row to the next day, never corrupt it or starve settlement.
+        try:
+            await run_score_reverification(get_settings())
+        except Exception as e:  # noqa: BLE001 — never crash the daemon
+            get_logger(__name__).warning("score_reverify_failed", error=str(e))
+
     async def _morning_drop_notice_tick() -> None:
         # Periodic: tell the morning notice's audience when a fixture it NAMED
         # has since dropped below the high-confidence bar and its call will not
@@ -1342,6 +1356,18 @@ def run_daemon(
             _settle_and_results_tick,
             trigger=IntervalTrigger(hours=2, timezone=timezone.utc),
             id="settle_and_results",
+        )
+        # Daily 09:20 UTC: re-verify recently-settled scorelines (Defect: the
+        # provider serves a PROVISIONAL score then corrects it hours later, and
+        # one-shot settlement never re-reads). ONCE daily on purpose — a 72h
+        # window is ~20-30 fixtures, and re-checking them every 2h would burn
+        # 300+ needless requests against the same free-tier quota settlement
+        # itself depends on. See _score_reverify_tick for the time rationale.
+        add_async_job(
+            scheduler,
+            _score_reverify_tick,
+            trigger=CronTrigger.from_crontab("20 9 * * *", timezone=timezone.utc),
+            id="score_reverification",
         )
         # Periodic (every 15m) RETRY SAFETY-NET for the morning drop notice. The
         # notice is delivered EVENT-DRIVEN the instant the confirmed-XI (late)

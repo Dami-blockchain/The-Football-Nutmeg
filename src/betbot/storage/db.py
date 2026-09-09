@@ -57,6 +57,14 @@ _ADDITIVE_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("predictions", "raw_p_draw", "FLOAT"),
     ("predictions", "raw_p_away", "FLOAT"),
     ("prediction_outcomes", "anchor_source", "VARCHAR(8)"),
+    # Score re-verification (Defect: provisional-then-corrected provider
+    # scores). ``source_last_updated`` is football-data.org's lastUpdated at
+    # the moment we read the score (the field that made 575324 diagnosable);
+    # ``score_verified_at``/``score_verify_count`` bound the daily re-check so
+    # each row is confirmed two-three times then left alone. Additive & nullable.
+    ("prediction_outcomes", "source_last_updated", "VARCHAR(32)"),
+    ("prediction_outcomes", "score_verified_at", "DATETIME"),
+    ("prediction_outcomes", "score_verify_count", "INTEGER"),
 )
 
 # Indexes for columns added by _ADDITIVE_COLUMNS. ``create_all`` only indexes
