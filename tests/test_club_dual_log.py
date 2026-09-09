@@ -8,16 +8,31 @@ skew). This is a PASSIVE ledger: it changes nothing about what is served.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 from sqlalchemy import select
 
 from betbot.storage.db import init_engine, session_scope
-from betbot.storage.models import ModelPrediction
+from betbot.storage.models import ModelPrediction, PredictionRow
 from betbot.storage.repos import (
     score_model_prediction,
     upsert_model_prediction,
 )
 from betbot.strategy.ensemble import ranked_probability_score
+
+
+def _seed_prediction_row(fixture_id: int, competition: str = "PL") -> None:
+    """Minimal predictions row so the club calibration fit's competition join
+    (which excludes CL/WC dual-log rows) sees this fixture as a club fixture."""
+    with session_scope() as s:
+        s.add(PredictionRow(
+            fixture_id=fixture_id, competition_code=competition,
+            kickoff=datetime.now(timezone.utc), run_date="2026-09-09",
+            home_team="A", away_team="B",
+            p_home=0.5, p_draw=0.25, p_away=0.25,
+            home_score=0.0, away_score=0.0, draw_score=0.0,
+        ))
 
 
 @pytest.fixture()
@@ -138,6 +153,7 @@ def _load_fit_module():
 def _seed_settled(n_home: int, n_away: int) -> None:
     fid = 1000
     for _ in range(n_home):
+        _seed_prediction_row(fid)
         upsert_model_prediction(
             fixture_id=fid, home_team="A", away_team="B",
             glicko=(0.5, 0.3, 0.2), ensemble=(0.55, 0.25, 0.20),
@@ -146,6 +162,7 @@ def _seed_settled(n_home: int, n_away: int) -> None:
         score_model_prediction(fixture_id=fid, actual_outcome="HOME")
         fid += 1
     for _ in range(n_away):
+        _seed_prediction_row(fid)
         upsert_model_prediction(
             fixture_id=fid, home_team="A", away_team="B",
             glicko=(0.3, 0.3, 0.4), ensemble=(0.25, 0.25, 0.50),
@@ -182,3 +199,27 @@ def test_fit_writes_artifact_from_raw_triples_when_sample_suffices(db, tmp_path,
 
     cals = _load_calibrators(out)
     assert cals is not None and len(cals) == 3
+
+
+def test_cl_rows_are_excluded_from_the_club_calibration_fit(db):
+    # Since 2026-09 the CL engine also writes model_predictions rows whose e_*
+    # slot is the site-scale CL Elo triple, NOT a club-ensemble triple. Those
+    # must NOT train the CLUB isotonic calibrator: only domestic-league fixtures
+    # (via the predictions.competition_code join) count.
+    mod = _load_fit_module()
+    _seed_prediction_row(2000, competition="PL")
+    upsert_model_prediction(
+        fixture_id=2000, home_team="A", away_team="B",
+        glicko=(0.3, 0.3, 0.4), ensemble=(0.5, 0.25, 0.25),
+        w_glicko=0.0, w_ensemble=1.0,
+    )
+    score_model_prediction(fixture_id=2000, actual_outcome="HOME")
+    _seed_prediction_row(2001, competition="CL")
+    upsert_model_prediction(
+        fixture_id=2001, home_team="X", away_team="Y",
+        glicko=(0.3, 0.3, 0.4), ensemble=(0.6, 0.2, 0.2),
+        w_glicko=0.0, w_ensemble=1.0,
+    )
+    score_model_prediction(fixture_id=2001, actual_outcome="HOME")
+    # Only the PL fixture's raw triple is loaded; the CL row is excluded.
+    assert mod._load_raw_triples() == [((0.5, 0.25, 0.25), "HOME")]

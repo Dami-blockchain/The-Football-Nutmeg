@@ -810,19 +810,33 @@ def run_daemon(
         _s = get_settings()
         if not _s.cl_elo_enabled:
             return
-        from betbot.data.clubelo import refresh_latest, snapshot_status
+        from betbot.data.clubelo import refresh_latest, scrape_latest, snapshot_status
 
-        path = Path(_s.clubelo_latest_path)
+        pin = Path(_s.clubelo_latest_path)   # api-scale pin = dual-log shadow only
+        site = Path(_s.cl_snapshot_path)      # the engine's LIVE source (site scale)
+        _log = get_logger(__name__)
         if fetch:
+            # The engine prices off the fresh site scrape, so refresh it
+            # UNCONDITIONALLY — otherwise a revived api.clubelo would refresh the
+            # pin, skip the scrape, and silently age the engine's source out.
             try:
-                await asyncio.to_thread(refresh_latest, path)
+                await asyncio.to_thread(scrape_latest, site, reference=pin)
             except Exception as e:  # noqa: BLE001 — never crash the tick
-                get_logger(__name__).warning("clubelo_refresh_tick_failed", error=str(e))
+                _log.warning("clubelo_scrape_tick_failed", error=str(e))
+            # Keep the pin (dual-log shadow) fresh only if api.clubelo revives.
+            # scrape_fallback=False: a dead API must NOT trigger a SECOND scrape
+            # of this small free site — that fetch is owned by the call above.
+            try:
+                await asyncio.to_thread(refresh_latest, pin, scrape_fallback=False)
+            except Exception as e:  # noqa: BLE001 — never crash the tick
+                _log.warning("clubelo_refresh_tick_failed", error=str(e))
+        # Freshness-alert on the ENGINE'S source (the site feed), not the frozen
+        # pin — the pin no longer refreshes and the engine never reads it.
         try:
-            status = await asyncio.to_thread(snapshot_status, path)
+            status = await asyncio.to_thread(snapshot_status, site)
             await run_clubelo_alert(_s, status, clubelo_alerter)
         except Exception as e:  # noqa: BLE001 — alerting must never crash the tick
-            get_logger(__name__).warning("clubelo_alert_failed", error=str(e))
+            _log.warning("clubelo_alert_failed", error=str(e))
 
     async def _tick() -> None:
         # Refresh + freshness-alert the ClubElo snapshot so a CL fixture is
@@ -845,7 +859,7 @@ def run_daemon(
             return
         from betbot.data.clubelo import snapshot_status
 
-        path = Path(_s.clubelo_latest_path)
+        path = Path(_s.cl_snapshot_path)  # the engine's live source, not the pin
         try:
             status = await asyncio.to_thread(snapshot_status, path)
         except Exception as e:  # noqa: BLE001 — never crash the daemon

@@ -313,3 +313,20 @@ def test_dual_triples_returns_none_without_a_shadow_snapshot(tmp_path, monkeypat
     eng = EuropeanStrategyEngine(s, dc_params=None, name_map={}, resolver=None)
     # Primary resolves, but the api pin is absent -> no head-to-head, no row.
     assert eng.dual_triples("Arsenal", "Bayern") is None
+
+
+def test_cl_paths_derive_from_a_repointed_pin(monkeypatch):
+    # cl_snapshot_path / cl_shadow_snapshot_path default to None and are derived
+    # from clubelo_latest_path, so repointing the pin carries through (no
+    # silent read of a file nobody writes). The scrape basename must also stay
+    # in sync with clubelo.SCRAPE_MONITOR_NAME.
+    from betbot.config import Settings
+    from betbot.data.clubelo import SCRAPE_MONITOR_NAME
+
+    monkeypatch.setenv("BETBOT_CLUBELO_LATEST_PATH", "/tmp/pins/pin.csv")
+    monkeypatch.delenv("BETBOT_CL_SNAPSHOT_PATH", raising=False)
+    monkeypatch.delenv("BETBOT_CL_SHADOW_SNAPSHOT_PATH", raising=False)
+    s = Settings()
+    assert s.cl_shadow_snapshot_path == Path("/tmp/pins/pin.csv")
+    assert s.cl_snapshot_path == Path("/tmp/pins") / SCRAPE_MONITOR_NAME
+    assert s.cl_snapshot_path.name == SCRAPE_MONITOR_NAME

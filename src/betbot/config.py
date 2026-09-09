@@ -292,6 +292,26 @@ class Settings(BaseSettings):
                 object.__setattr__(self, "highlightly_api_key", recovered)
         return self
 
+    @model_validator(mode="after")
+    def _derive_cl_paths(self) -> "Settings":
+        """Tie the CL engine's site feed + shadow to the pin path.
+
+        Both default to None so a repoint of ``clubelo_latest_path`` (the pin)
+        carries through instead of the engine silently reading a file nobody
+        writes: the site feed lands in the pin's directory under the scrape's
+        filename, and the shadow IS the pin. Set either env var to override.
+        The literal must match ``clubelo.SCRAPE_MONITOR_NAME`` (kept as a literal
+        here to avoid importing the data layer into config at startup).
+        """
+        pin = Path(self.clubelo_latest_path)
+        if self.cl_snapshot_path is None:
+            object.__setattr__(
+                self, "cl_snapshot_path", pin.with_name("clubelo_scrape_latest.csv")
+            )
+        if self.cl_shadow_snapshot_path is None:
+            object.__setattr__(self, "cl_shadow_snapshot_path", pin)
+        return self
+
     @property
     def allowed_telegram_ids(self) -> set[int]:
         ids: set[int] = set()
@@ -469,20 +489,24 @@ class Settings(BaseSettings):
     )
     # The CL engine's LIVE snapshot source. Switched (2026-09) from the ageing
     # api.clubelo pin to the fresh daily site-scale scrape (clubelo.com), which
-    # is refreshed every day and captures clubs the pin misses (e.g. Kairat).
+    # is refreshed every day (the pin froze ~2026-08-31). Both feeds list the
+    # same clubs (e.g. both carry Kairat); only the reconstructed HISTORY under
+    # data/clubelo_site/ lacks Kairat, which has no per-club page to rebuild from.
     # The engine reads this; if absent it falls back to the newest dated file
     # under ``data/clubelo_site/`` (also site-scale) — never to the api-scale
-    # pin, whose scale would not match the constants below.
-    cl_snapshot_path: Path = Field(
-        default=Path("./data/clubelo_scrape_latest.csv"),
-        alias="BETBOT_CL_SNAPSHOT_PATH",
+    # pin, whose scale would not match the constants below. Default (None) is
+    # DERIVED from clubelo_latest_path's directory + the scrape filename in
+    # _derive_cl_paths, so repointing BETBOT_CLUBELO_LATEST_PATH carries through
+    # rather than silently leaving the engine on a file nobody writes.
+    cl_snapshot_path: Path | None = Field(
+        default=None, alias="BETBOT_CL_SNAPSHOT_PATH",
     )
     # Dual-log shadow: the api.clubelo pin, priced with the INCUMBENT constants
     # (see cl_engine.INCUMBENT_*). Purely observational — records what the old
     # api-scale engine would have said, so the site switch is measured forward.
-    cl_shadow_snapshot_path: Path = Field(
-        default=Path("./data/clubelo_latest.csv"),
-        alias="BETBOT_CL_SHADOW_SNAPSHOT_PATH",
+    # Default (None) IS the pin: it resolves to clubelo_latest_path.
+    cl_shadow_snapshot_path: Path | None = Field(
+        default=None, alias="BETBOT_CL_SHADOW_SNAPSHOT_PATH",
     )
     # Home-advantage bump, on the ELO SCALE. Rescaled 65->51 for the site feed:
     # the site scale is compressed to ~0.77-0.79x of api.clubelo (measured over

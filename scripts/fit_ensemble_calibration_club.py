@@ -39,7 +39,7 @@ from sqlalchemy import select
 from betbot.config import get_settings
 from betbot.logging import configure_logging, get_logger
 from betbot.storage.db import init_engine, session_scope
-from betbot.storage.models import ModelPrediction
+from betbot.storage.models import ModelPrediction, PredictionRow
 from betbot.strategy.ensemble import IsotonicCalibrator
 
 log = get_logger("fit_ensemble_calibration_club")
@@ -47,13 +47,30 @@ log = get_logger("fit_ensemble_calibration_club")
 MIN_FIT_N = 500  # standing minimum; see module docstring.
 _IDX = {"HOME": 0, "DRAW": 1, "AWAY": 2}
 
+#: Domestic club leagues only. The dual-log ledger is SHARED: since 2026-09 the
+#: CL engine also writes model_predictions rows whose e_* slot is the site-scale
+#: CL Elo triple, NOT a club-ensemble triple (see cl_engine.dual_triples). Those
+#: would poison this CLUB isotonic calibrator, so we keep only domestic-league
+#: fixtures (excludes CL and the old WC backlog). This is settlement's
+#: _RATED_COMPETITIONS minus CL.
+_CLUB_COMPETITIONS = frozenset({"PL", "PD", "BL1", "SA", "FL1"})
+
 
 def _load_raw_triples() -> list[tuple[tuple[float, float, float], str]]:
-    """Every SETTLED dual-log row as (raw_ensemble_triple, outcome)."""
+    """Every SETTLED CLUB dual-log row as (raw_ensemble_triple, outcome).
+
+    CL/WC rows are excluded via a fixture-id subquery (predictions is keyed on
+    fixture_id+run_date, so a join would duplicate ModelPrediction rows).
+    """
     out: list[tuple[tuple[float, float, float], str]] = []
     with session_scope() as s:
+        club_fixture_ids = select(PredictionRow.fixture_id).where(
+            PredictionRow.competition_code.in_(_CLUB_COMPETITIONS)
+        )
         rows = s.execute(
-            select(ModelPrediction).where(ModelPrediction.outcome.is_not(None))
+            select(ModelPrediction)
+            .where(ModelPrediction.outcome.is_not(None))
+            .where(ModelPrediction.fixture_id.in_(club_fixture_ids))
         ).scalars()
         for r in rows:
             if r.outcome not in _IDX:

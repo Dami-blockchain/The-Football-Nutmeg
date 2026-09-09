@@ -239,15 +239,15 @@ def _write_atomic(dest: Path, text: str) -> None:
 # ----------------------------------------------------------------------------
 # The machine-readable CSV API (api.clubelo.com) was deactivated upstream
 # (``/Fixtures`` -> "Fixtures API deactivated"; dated endpoints -> 502). The
-# public website https://clubelo.com/ still serves ratings, fresh, as HTML, but
-# on a DIFFERENT numeric scale from the API CSV the CL engine was
-# tuned on (see SCRAPE_MONITOR_NAME). So this is NOT an engine fallback: it does
-# not feed clubelo_latest.csv and never lets the engine price off site numbers.
-# It fetches the page once per refresh, parses the ranking table, and writes a
-# labelled, non-authoritative MONITORING snapshot (SCRAPE_MONITOR_NAME) for
-# coverage tracking and a future re-tune corpus. The engine keeps pricing off
-# the last real API snapshot, and the staleness alarm on clubelo_latest.csv is
-# deliberately left to fire — a fresh-but-mis-scaled file must never silence it.
+# public website https://clubelo.com/ still serves ratings, fresh, as HTML, on
+# a DIFFERENT numeric scale from the old API CSV (see SCRAPE_MONITOR_NAME).
+# SINCE 2026-09 this site feed IS the CL engine's live source: the engine's
+# constants were rescaled to the site scale (cl_elo_scale 312, home_adv 51), so
+# it prices off SCRAPE_MONITOR_NAME (= cl_snapshot_path), NOT the api pin, which
+# stopped refreshing ~2026-08-31 and is now only the dual-log shadow. It fetches
+# the page once per refresh, parses the ranking table, and writes the site-scale
+# snapshot; a dated copy also accrues under data/clubelo_site/. (Historically
+# this was monitoring-only and the api pin was the engine input — no longer.)
 #
 # Two scrape-specific realities the API did not have:
 #  * The website ranking is now WORLDWIDE, while the API CSV was Europe-only.
@@ -602,18 +602,19 @@ def scrape_latest(
     resolver=None,
     html: str | None = None,
 ) -> bool:
-    """Scrape clubelo.com into ``dest`` as a SITE-SCALE monitoring snapshot.
+    """Scrape clubelo.com into ``dest`` as a SITE-SCALE snapshot.
 
-    ``dest`` is the monitoring file (:data:`SCRAPE_MONITOR_NAME`), NOT the CL
-    engine's tuned ``clubelo_latest.csv``: the website's table Elo is on a
-    different scale (cause unknown, country-dependent — not a Golo composite),
-    and writing it into the engine's input would
-    silently mis-price every tie AND — because a scrape stamps today's ``From``
-    date — quietly silence the staleness alarm on a mis-scaled file. So the
-    engine keeps reading the last real API snapshot; this file is only for
-    coverage monitoring and a future re-tune. A dated copy of each successful
-    scrape is also written under ``data/clubelo_site/YYYY-MM-DD.csv`` so a
-    site-scale history actually accrues (``dest`` itself is overwritten daily).
+    Since the 2026-09 switch this SITE-scale file IS the CL engine's live feed:
+    the daemon calls this with ``dest = settings.cl_snapshot_path`` and the
+    engine's constants were rescaled to the site scale (cl_elo_scale 312,
+    cl_elo_home_adv 51). The api.clubelo pin (``clubelo_latest.csv``) stopped
+    refreshing ~2026-08-31 and is now only the dual-log SHADOW. Historically
+    this file was monitoring-only, because the engine priced off the api pin and
+    the site scale would have mis-priced it — that is no longer the case.
+
+    A dated copy of each successful scrape is also written under
+    ``data/clubelo_site/YYYY-MM-DD.csv`` so a site-scale history accrues
+    (``dest`` itself is overwritten daily).
 
     ``reference`` is the pinned API snapshot the scrape canonicalises names and
     takes its European scope from (defaults to ``clubelo_latest.csv`` beside
@@ -694,7 +695,7 @@ def scrape_latest(
         "clubelo_scrape_monitor_written",
         source="scrape", dest=str(dest), archived=archived,
         snapshot=snap_date.isoformat(), clubs=report["emitted"],
-        note="site_scale_monitoring_only_not_engine_input", **report,
+        note="site_scale_feed_is_cl_engine_input_since_2026_09", **report,
     )
     if report["unrefreshed_count"]:
         log.warning(
@@ -707,17 +708,19 @@ def scrape_latest(
 
 
 def _scrape_monitor(engine_dest: Path, *, timeout: int, retries: int, sleep) -> None:
-    """Best-effort: refresh the site-scale monitoring file beside ``engine_dest``.
+    """Best-effort: refresh the site-scale feed beside ``engine_dest``.
 
     Runs when the API path has failed. Deliberately does NOT return whether it
-    succeeded and NEVER touches ``engine_dest``: the site is a different rating
-    scale, so it cannot serve as the CL engine's tuned input, and it must not
-    reset the staleness clock on the engine snapshot. It exists only so the
-    operator can see live site coverage and so a site-scale history accrues (as
-    dated per-run copies under ``data/clubelo_site/``, written by
-    :func:`scrape_latest`) for a possible future re-tune. ``engine_dest`` is
-    passed only as the reference
-    (names + scope) — it is read, never written.
+    succeeded and NEVER touches ``engine_dest`` (the api pin): it must not reset
+    the staleness clock on the pin. It writes the file at
+    ``engine_dest.with_name(SCRAPE_MONITOR_NAME)`` — which, since the 2026-09
+    switch, is the CL engine's live source (``cl_snapshot_path``), so this also
+    keeps the engine fed on an api outage; plus a dated copy under
+    ``data/clubelo_site/`` (see :func:`scrape_latest`). NOTE: the daemon now
+    scrapes the engine feed explicitly and calls ``refresh_latest`` with
+    ``scrape_fallback=False``, so this fallback only fires for other direct
+    ``refresh_latest`` callers. ``engine_dest`` is the reference (names + scope)
+    — read, never written.
     """
     monitor = engine_dest.with_name(SCRAPE_MONITOR_NAME)
     try:
@@ -748,14 +751,14 @@ def refresh_latest(
     existing snapshot is left UNTOUCHED, its age is checked (a stale one logs at
     ERROR so the degradation is visible), and this returns ``False``.
 
-    The clubelo.com website is NOT used to refresh ``dest``. Its table Elo is on
-    a different scale from this API CSV (cause unknown, country-dependent — not a
-    Golo composite), so substituting it
-    would silently mis-price the API-tuned CL engine and — by stamping today's
-    date — hide the fact that the real feed is down. Instead, on an API failure
-    a separate site-scale *monitoring* file is refreshed beside ``dest`` (see
-    :func:`_scrape_monitor`) and the engine keeps pricing off the last real API
-    snapshot; the staleness alarm is intentionally allowed to fire.
+    This refreshes ``dest`` = the api.clubelo PIN only, which since the 2026-09
+    switch is the dual-log SHADOW, not the engine input (the engine reads the
+    site scrape at ``cl_snapshot_path``). The clubelo.com website is on a
+    different scale from this API CSV, so it is never written INTO ``dest``.
+    Instead, on an API failure a separate site-scale file is refreshed beside
+    ``dest`` (see :func:`_scrape_monitor`) — which since the switch IS the
+    engine's feed. NOTE: the daemon calls this with ``scrape_fallback=False``
+    and scrapes the engine feed explicitly, so that fallback is legacy.
 
     ``snapshot_date`` pins a historical snapshot (the backtest cache under
     ``data/clubelo/``). Those files are old *by design*, so the staleness check
