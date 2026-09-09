@@ -313,6 +313,10 @@ COOLDOWN_SECONDS: dict[str, float] = {
     "alert_coverage_gap": 6 * 3600.0,
     "scheduler_jobs_not_awaitable": 24 * 3600.0,
     "kill_switch_tripped": 24 * 3600.0,
+    # A daily re-verify pass keeps re-detecting the same conflict until a
+    # human resolves it; 24h caps it to one page/day (not the 6h default =
+    # 4/day) while the row lives out its 72h window.
+    "outcome_winner_conflict": 24 * 3600.0,
     "lineup_gap": 6 * 3600.0,
     # ``challenger_dual_log_stale`` — a DAILY audit reporting a condition that
     # persists until someone writes code (no challenger writes

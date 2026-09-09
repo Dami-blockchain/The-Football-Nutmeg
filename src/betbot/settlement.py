@@ -149,11 +149,20 @@ class SettlementSummary:
 
 @dataclass(frozen=True)
 class CorrectedScore:
-    """One outcome whose stored scoreline the re-verify pass corrected."""
+    """One outcome whose stored scoreline the re-verify pass corrected.
+
+    Carries ``result_notified``/``kickoff``/``settled_at`` so the alert
+    wrapper can send a correction ONLY where a result was actually
+    published: a stale-backfill row (pre-notified, never sent) and a
+    pending-retry row (not yet notified) both need suppressing.
+    """
 
     fixture_id: int
     home_goals: int
     away_goals: int
+    result_notified: bool = False
+    kickoff: datetime | None = None
+    settled_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -432,7 +441,31 @@ class SettlementWatcher:
                 # (notify_operator's per-key cooldown also collapses repeats).
                 mark_outcome_verified(row.fixture_id, source_last_updated=lu, now=now)
                 continue
-            hg, ag = _final_goals(match)
+            # Finding A: in reverify the GOALS are the payload, so _final_goals'
+            # 0-0 null fallback is NOT safe here. Require concrete integer goals
+            # AND (unless AWARDED) a goals-implied winner that matches the
+            # source winner — this provider has already served provisional
+            # FINISHED states, and one must never overwrite a real score with a
+            # null/inconsistent one and then broadcast it as a "correction".
+            ft = (match.get("score") or {}).get("fullTime") or {}
+            raw_h, raw_a = ft.get("home"), ft.get("away")
+            if not isinstance(raw_h, int) or not isinstance(raw_a, int):
+                log.warning(
+                    "reverify_score_inconsistent",
+                    fixture_id=row.fixture_id, reason="null_fulltime",
+                    goals=f"{raw_h}-{raw_a}", source_last_updated=lu,
+                )
+                continue  # no stamp — retry next day
+            implied = "HOME" if raw_h > raw_a else ("AWAY" if raw_h < raw_a else "DRAW")
+            if match.get("status") != "AWARDED" and implied != src_outcome.value:
+                log.warning(
+                    "reverify_score_inconsistent",
+                    fixture_id=row.fixture_id, reason="winner_goal_mismatch",
+                    goals=f"{raw_h}-{raw_a}", implied=implied,
+                    winner=src_outcome.value, source_last_updated=lu,
+                )
+                continue  # no stamp — retry next day
+            hg, ag = raw_h, raw_a
             if hg == row.home_goals and ag == row.away_goals:
                 mark_outcome_verified(row.fixture_id, source_last_updated=lu, now=now)
                 continue
@@ -445,7 +478,12 @@ class SettlementWatcher:
                 continue
             mark_outcome_verified(row.fixture_id, source_last_updated=lu, now=now)
             if changed:
-                corrected.append(CorrectedScore(row.fixture_id, hg, ag))
+                corrected.append(CorrectedScore(
+                    row.fixture_id, hg, ag,
+                    result_notified=row.result_notified,
+                    kickoff=row.kickoff,
+                    settled_at=row.settled_at,
+                ))
                 log.info(
                     "outcome_score_corrected",
                     fixture_id=row.fixture_id,

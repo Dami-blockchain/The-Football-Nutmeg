@@ -244,7 +244,7 @@ def render_result_correction(
     return (
         "*\u26bd Result correction*\n\n"
         f"*{home_team} {home_goals}-{away_goals} {away_team}*{league_tag}\n\n"
-        "\u2139\ufe0f An earlier result feed had this match\u2019s score "
-        "wrong \u2014 it has now been corrected to the score above. The winner "
-        "is unchanged, so our call is unaffected."
+        "\u2139\ufe0f The full-time score we sent earlier was wrong "
+        "(our results source has since corrected it). The winner is "
+        "unchanged, so our call is unaffected."
     )

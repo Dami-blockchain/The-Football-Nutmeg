@@ -1,15 +1,16 @@
 """DEFECT 1 — re-verify recently-settled scorelines against the source, mark
 rows verified, page on a winner conflict, and send forward-only corrections.
 
-football-data.org's free tier serves a PROVISIONAL fullTime score then corrects
-it hours later; record_prediction_outcome is one-shot and never re-reads, so the
-wrong scoreline stayed published (2026-09-08 fixture 575324: stored 2-0, source
-later 1-0). Covered here:
+Covers the build plus the two review findings:
   * goals-only drift (winner unchanged) is corrected + returned + row stamped;
+  * FINDING A: a null or winner-inconsistent source score is NEVER applied
+    (P1, P1b) — the goals are the payload here, not a harmless fallback;
   * a winner FLIP is never auto-applied, PAGES the operator, is counted;
-  * the provider lastUpdated is stored; the verify counter caps re-checks;
-  * run_score_reverification sends a correction ONLY where we published, to the
-    same audience + the group, group failure isolated from DMs.
+  * provider lastUpdated stored; verify counter caps re-checks;
+  * FINDING B: run_score_reverification corrects ONLY where a result was
+    actually published — a pending (unsent) row is deferred (P5) and a stale
+    backfill row is suppressed (P4) — else same audience + group, group failure
+    isolated from DMs.
 """
 
 from __future__ import annotations
@@ -25,6 +26,9 @@ from betbot.storage.models import PredictionOutcome
 from betbot.storage.repos import record_reveal
 
 from tests.test_outcome_loop import FakeFD, _GatePred, _User, _seed_outcome
+
+BROADCAST_ID = -1003880403502
+NOW = datetime(2026, 9, 9, 12, 0, tzinfo=timezone.utc)
 
 
 @pytest.fixture
@@ -73,6 +77,15 @@ def _seed_old_outcome(fixture_id, hours_ago, verify_count=0):
         ))
 
 
+def _published_correction(fixture_id, hg, ag):
+    """A CorrectedScore for a fixture whose result WAS published: notified, and
+    kicked off recently (not a stale backfill)."""
+    return CorrectedScore(
+        fixture_id, hg, ag,
+        result_notified=True, kickoff=NOW - timedelta(hours=5), settled_at=NOW,
+    )
+
+
 # ----------------------------------------------------------------------
 # SettlementWatcher.reverify_recent_scores
 # ----------------------------------------------------------------------
@@ -83,12 +96,37 @@ async def test_corrects_provisional_scoreline_and_stamps_row(db, settings):
 
     assert isinstance(summary, ScoreReverifySummary)
     assert [cs.fixture_id for cs in summary.corrected] == [575324]
-    assert summary.corrected[0] == CorrectedScore(575324, 1, 0)
+    cs = summary.corrected[0]
+    assert (cs.home_goals, cs.away_goals) == (1, 0)
     hg, ag, outcome, correct, vcount, vat, lu = _row(575324)
     assert (hg, ag) == (1, 0)          # scoreline corrected
     assert outcome == "HOME" and correct is True   # winner/pick untouched
     assert vcount == 1 and vat is not None          # stamped verified
     assert lu == "2026-09-09T00:20:32Z"             # provider lastUpdated stored
+
+
+async def test_p1_null_fulltime_never_applied(db, settings):
+    # FINDING A: FINISHED + winner set but fullTime nulls must NOT become 0-0.
+    _seed_outcome(10, code="CL")  # HOME 2-0
+    fd = FakeFD({10: _match("HOME_TEAM", None, None)})
+    summary = await SettlementWatcher(fd, settings).reverify_recent_scores()
+
+    assert summary.corrected == []
+    hg, ag, *_rest, vcount, _vat, _lu = _row(10)
+    assert (hg, ag) == (2, 0)              # real score untouched
+    assert vcount in (0, None)             # NOT stamped -> retries next day
+
+
+async def test_p1b_goals_contradict_winner_never_applied(db, settings):
+    # FINDING A: winner HOME but goals 0-3 (inconsistent provisional payload).
+    _seed_outcome(11, code="CL")  # HOME 2-0
+    fd = FakeFD({11: _match("HOME_TEAM", 0, 3)})
+    summary = await SettlementWatcher(fd, settings).reverify_recent_scores()
+
+    assert summary.corrected == []
+    hg, ag, *_rest, vcount, _vat, _lu = _row(11)
+    assert (hg, ag) == (2, 0)
+    assert vcount in (0, None)
 
 
 async def test_match_stamps_verified_but_corrects_nothing(db, settings):
@@ -99,7 +137,7 @@ async def test_match_stamps_verified_but_corrects_nothing(db, settings):
     assert summary.corrected == []
     assert summary.checked == 1
     _, _, _, _, vcount, vat, _ = _row(1)
-    assert vcount == 1 and vat is not None   # confirmed-correct rows still counted
+    assert vcount == 1 and vat is not None
 
 
 async def test_winner_flip_pages_operator_never_auto_applies(db, settings, monkeypatch):
@@ -118,18 +156,17 @@ async def test_winner_flip_pages_operator_never_auto_applies(db, settings, monke
     assert summary.corrected == []
     assert summary.winner_conflicts == 1
     assert _row(2)[:4] == (2, 0, "HOME", True)          # nothing auto-applied
-    assert len(paged) == 1                               # operator PAGED
+    assert len(paged) == 1
     assert paged[0]["dedupe_key"] == "outcome_winner_conflict:2"
 
 
 async def test_verify_count_cap_stops_rechecking(db, settings):
-    # Already checked max_checks (3) times -> not re-selected.
     _seed_old_outcome(3, hours_ago=1, verify_count=3)
     fd = FakeFD({3: _match("HOME_TEAM", 1, 0)})
     summary = await SettlementWatcher(fd, settings).reverify_recent_scores(max_checks=3)
 
     assert summary.checked == 0
-    assert _row(3)[:2] == (2, 0)   # untouched
+    assert _row(3)[:2] == (2, 0)
 
 
 async def test_outside_window_is_skipped(db, settings):
@@ -152,9 +189,6 @@ class _FakeWatcher:
         return self._summary
 
 
-BROADCAST_ID = -1003880403502
-
-
 def _set(settings, **kw):
     for k, v in kw.items():
         object.__setattr__(settings, k, v)
@@ -162,10 +196,10 @@ def _set(settings, **kw):
 
 async def test_correction_sent_where_published_plus_group(db, settings):
     _set(settings, telegram_allowed_user_id=999, broadcast_chat_id=BROADCAST_ID)
-    _seed_outcome(575324, code="CL")  # a revealed, published fixture
+    _seed_outcome(575324, code="CL")
     record_reveal(111, 575324, charged=False)
 
-    summary = ScoreReverifySummary(1, [CorrectedScore(575324, 1, 0)], 0)
+    summary = ScoreReverifySummary(1, [_published_correction(575324, 1, 0)], 0)
     sent: list[tuple[int, str]] = []
 
     async def fake_send(s, cid, txt):
@@ -173,32 +207,26 @@ async def test_correction_sent_where_published_plus_group(db, settings):
         return True
 
     n = await daily_jobs.run_score_reverification(
-        settings,
-        watcher=_FakeWatcher(summary),
-        send_fn=fake_send,
+        settings, watcher=_FakeWatcher(summary), send_fn=fake_send,
         prediction_fn=lambda fid: _GatePred("PAE AEK", "LASK Linz", 0.71, 0.12, 0.17),
         users_fn=lambda: [_User(111)],
     )
     assert n == 1
-    targets = {cid for cid, _ in sent}
-    assert targets == {999, 111, BROADCAST_ID}          # operator + user + group
+    assert {cid for cid, _ in sent} == {999, 111, BROADCAST_ID}
     body = sent[0][1]
     assert "Result correction" in body and "1-0" in body
     assert "call is unaffected" in body
 
 
-async def test_no_correction_where_never_published(db, settings):
-    # Gate ON, below-bar, never revealed -> never published -> silent DB fix only.
-    _set(
-        settings,
-        telegram_allowed_user_id=999,
-        broadcast_chat_id=BROADCAST_ID,
-        high_conf_alerts_only=True,
-        high_conf_alert_min_p=0.65,
+async def test_p4_stale_backfill_gets_no_correction(db, settings):
+    # FINDING B: pre-notified, never-sent stale backfill -> silent DB fix only.
+    _set(settings, telegram_allowed_user_id=999, broadcast_chat_id=BROADCAST_ID,
+         high_conf_alerts_only=True, high_conf_alert_min_p=0.65)
+    cs = CorrectedScore(
+        40, 1, 0, result_notified=True,
+        kickoff=NOW - timedelta(days=6), settled_at=NOW,  # stale
     )
-    _seed_outcome(701, code="CL")  # not revealed to anyone
-
-    summary = ScoreReverifySummary(1, [CorrectedScore(701, 1, 0)], 0)
+    summary = ScoreReverifySummary(1, [cs], 0)
     sent: list[int] = []
 
     async def fake_send(s, cid, txt):
@@ -206,22 +234,60 @@ async def test_no_correction_where_never_published(db, settings):
         return True
 
     n = await daily_jobs.run_score_reverification(
-        settings,
-        watcher=_FakeWatcher(summary),
-        send_fn=fake_send,
-        prediction_fn=lambda fid: _GatePred("A", "B", 0.30, 0.45, 0.25),  # DRAW-top <0.65
+        settings, watcher=_FakeWatcher(summary), send_fn=fake_send,
+        prediction_fn=lambda fid: _GatePred("A", "B", 0.7, 0.2, 0.1),
         users_fn=lambda: [_User(111)],
     )
-    assert n == 0
-    assert sent == []              # nobody corrected, group included
+    assert n == 0 and sent == []
+
+
+async def test_p5_pending_unsent_row_defers(db, settings):
+    # FINDING B: result_notified False -> the result alert hasn't gone out yet
+    # and will carry the corrected goals itself; a correction now is premature.
+    _set(settings, telegram_allowed_user_id=999, broadcast_chat_id=BROADCAST_ID)
+    record_reveal(111, 50, charged=False)
+    cs = CorrectedScore(
+        50, 1, 0, result_notified=False,
+        kickoff=NOW - timedelta(hours=5), settled_at=NOW,
+    )
+    summary = ScoreReverifySummary(1, [cs], 0)
+    sent: list[int] = []
+
+    async def fake_send(s, cid, txt):
+        sent.append(cid)
+        return True
+
+    n = await daily_jobs.run_score_reverification(
+        settings, watcher=_FakeWatcher(summary), send_fn=fake_send,
+        prediction_fn=lambda fid: _GatePred("A", "B", 0.7, 0.2, 0.1),
+        users_fn=lambda: [_User(111)],
+    )
+    assert n == 0 and sent == []
+
+
+async def test_no_correction_where_never_published(db, settings):
+    # Gate ON, below-bar, never revealed -> published predicate fails -> silent.
+    _set(settings, telegram_allowed_user_id=999, broadcast_chat_id=BROADCAST_ID,
+         high_conf_alerts_only=True, high_conf_alert_min_p=0.65)
+    summary = ScoreReverifySummary(1, [_published_correction(701, 1, 0)], 0)
+    sent: list[int] = []
+
+    async def fake_send(s, cid, txt):
+        sent.append(cid)
+        return True
+
+    n = await daily_jobs.run_score_reverification(
+        settings, watcher=_FakeWatcher(summary), send_fn=fake_send,
+        prediction_fn=lambda fid: _GatePred("A", "B", 0.30, 0.45, 0.25),  # DRAW-top
+        users_fn=lambda: [_User(111)],
+    )
+    assert n == 0 and sent == []
 
 
 async def test_correction_group_failure_isolated_from_dms(db, settings):
     _set(settings, telegram_allowed_user_id=999, broadcast_chat_id=BROADCAST_ID)
-    _seed_outcome(575324, code="CL")
     record_reveal(111, 575324, charged=False)
-
-    summary = ScoreReverifySummary(1, [CorrectedScore(575324, 1, 0)], 0)
+    summary = ScoreReverifySummary(1, [_published_correction(575324, 1, 0)], 0)
     dm: list[int] = []
 
     async def flaky_send(s, cid, txt):
@@ -231,11 +297,8 @@ async def test_correction_group_failure_isolated_from_dms(db, settings):
         return True
 
     n = await daily_jobs.run_score_reverification(
-        settings,
-        watcher=_FakeWatcher(summary),
-        send_fn=flaky_send,
+        settings, watcher=_FakeWatcher(summary), send_fn=flaky_send,
         prediction_fn=lambda fid: _GatePred("PAE AEK", "LASK Linz", 0.71, 0.12, 0.17),
         users_fn=lambda: [_User(111)],
     )
-    assert n == 1                       # DM delivery unaffected by group failure
-    assert set(dm) == {999, 111}
+    assert n == 1 and set(dm) == {999, 111}

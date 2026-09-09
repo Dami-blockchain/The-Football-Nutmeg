@@ -1349,9 +1349,15 @@ async def run_score_reverification(
     result alert used (operator + revealed users) plus the group broadcast. A
     never-published fixture is fixed silently in the DB: there is no one to
     correct. Returns the number of fixtures a correction was announced for.
+
+    Forward-only and best-effort: a correction whose sends ALL fail is not
+    retried — by the next daily pass the stored goals already match the
+    source, so the fixture no longer appears in ``corrected``. Acceptable
+    because the DB is already right; only the courtesy note is dropped.
     """
     from betbot.main import high_conf_alert_passes
     from betbot.notify import send_telegram_to
+    from betbot.settlement import _STALE_RESULT_HOURS
     from betbot.storage.repos import fixture_was_ever_revealed
     from betbot.tips import render_result_correction
 
@@ -1384,6 +1390,32 @@ async def run_score_reverification(
     broadcast_chat_id = getattr(settings, "broadcast_chat_id", None)
     announced = 0
     for cs in summary.corrected:
+        # Finding B: "published" must mean the result WENT OUT, not merely
+        # that it should have. Two row types would otherwise be corrected
+        # for a result nobody received:
+        #   * pending retry (result_notified False): the result alert has
+        #     not been sent yet and will carry the corrected goals itself,
+        #     so a correction now is noise that PRECEDES the result;
+        #   * stale backfill (pre-notified, never sent): kickoff older than
+        #     settled_at - _STALE_RESULT_HOURS is scored silently, no alert.
+        if not cs.result_notified:
+            log.info(
+                "result_correction_deferred_pending_result",
+                fixture_id=cs.fixture_id,
+            )
+            continue
+        ko = cs.kickoff
+        sa = cs.settled_at or datetime.now(timezone.utc)
+        if ko is not None and ko.tzinfo is None:
+            ko = ko.replace(tzinfo=timezone.utc)
+        if sa.tzinfo is None:
+            sa = sa.replace(tzinfo=timezone.utc)
+        if ko is None or ko < sa - timedelta(hours=_STALE_RESULT_HOURS):
+            log.info(
+                "result_correction_suppressed_stale_backfill",
+                fixture_id=cs.fixture_id,
+            )
+            continue
         pred = prediction_fn(cs.fixture_id)
         # PUBLISHED-ONLY (same predicate as run_result_alerts): correct only
         # where a result actually went out. A None pred can't have cleared the
