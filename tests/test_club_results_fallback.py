@@ -316,3 +316,103 @@ def test_couk_supersedes_fallback_row_without_duplication(monkeypatch, tmp_path)
     lines = [ln for ln in out.read_text().splitlines() if "Arsenal,Chelsea" in ln]
     assert len(lines) == 1, f"fixture duplicated across sources: {lines}"
     assert "1.80,3.50,4.20" in lines[0], "the .co.uk row (with odds) did not win"
+
+
+# ----------------------------------------------------------------------
+# 8. FIX (Fable) — key-level merge: a SHORT .co.uk body must not reject
+#    legitimate data; its rows override, the uncarried existing row stays,
+#    and the current season never pages on a shrink.
+# ----------------------------------------------------------------------
+def test_short_couk_body_overrides_not_rejected(monkeypatch, tmp_path):
+    out = tmp_path / "club.csv"
+    # Last week's fallback wrote THREE current-season PL fixtures, no odds.
+    out.write_text(
+        "date,home_team,away_team,home_score,away_score,league,ps_home,ps_draw,ps_away\n"
+        "2026-09-01,Arsenal,Chelsea,2,1,PL,,,\n"
+        "2026-09-01,Liverpool,Everton,3,0,PL,,,\n"
+        "2026-09-01,Spurs,Fulham,1,1,PL,,,\n"
+    )
+    # .co.uk now serves only TWO of them (a shrink: 2 < 3) — WITH odds.
+    couk_pl = (
+        "Date,HomeTeam,AwayTeam,FTHG,FTAG,PSCH,PSCD,PSCA\n"
+        "01/09/2026,Arsenal,Chelsea,2,1,1.80,3.50,4.20\n"
+        "01/09/2026,Liverpool,Everton,3,0,1.40,4.80,7.00\n"
+    )
+    monkeypatch.setattr(
+        fcr, "_fetch",
+        lambda url, timeout: couk_pl if ("2627" in url and "E0" in url) else None,
+    )
+
+    seen = {}
+
+    def _fake_fb(dataset_names, present_keys, leagues=None):
+        seen["leagues"] = list(leagues) if leagues is not None else None
+        return [], {"mapped": 0, "unmapped": [], "coverage": 1.0, "rows": 0}
+
+    monkeypatch.setattr(fcr, "_fetch_fallback_current", _fake_fb)
+    monkeypatch.setattr(fcr, "REPORT_PATH", tmp_path / "report.json")
+    monkeypatch.setattr(
+        "sys.argv", ["fetch", "--out", str(out), "--seasons", "2627", "--timeout", "5"],
+    )
+
+    fcr.main()
+
+    body = out.read_text().splitlines()
+    rows = [ln for ln in body if ",PL," in ln]
+    assert len(rows) == 3, f"a short body dropped rows: {rows}"
+    # The two .co.uk fixtures now carry odds; the uncarried one is kept as-is.
+    assert any("Arsenal,Chelsea,2,1,PL,1.80,3.50,4.20" in ln for ln in rows)
+    assert any("Liverpool,Everton,3,0,PL,1.40,4.80,7.00" in ln for ln in rows)
+    assert any("Spurs,Fulham,1,1,PL,,," in ln for ln in rows)
+
+    import json
+    rep = json.loads((tmp_path / "report.json").read_text())
+    assert rep["rejected_partitions"] == [], (
+        "a current-season shrink was wrongly flagged as a rejection"
+    )
+    # PL was served, so the fallback must NOT re-fetch it.
+    assert seen["leagues"] is not None and "PL" not in seen["leagues"]
+
+
+# ----------------------------------------------------------------------
+# 9. a COMPLETED-season shrink IS recorded as a diagnostic (worth a page)
+# ----------------------------------------------------------------------
+def test_completed_season_shrink_is_diagnostic(monkeypatch, tmp_path):
+    out = tmp_path / "club.csv"
+    # Two existing completed-season (2425) PL rows.
+    out.write_text(
+        "date,home_team,away_team,home_score,away_score,league,ps_home,ps_draw,ps_away\n"
+        "2025-05-01,Arsenal,Chelsea,2,1,PL,1.80,3.50,4.20\n"
+        "2025-05-08,Liverpool,Everton,3,0,PL,1.40,4.80,7.00\n"
+    )
+    # .co.uk serves only ONE 2425 row (a completed-season shrink).
+    couk = (
+        "Date,HomeTeam,AwayTeam,FTHG,FTAG,PSCH,PSCD,PSCA\n"
+        "01/05/2025,Arsenal,Chelsea,2,1,1.85,3.40,4.30\n"
+    )
+    monkeypatch.setattr(
+        fcr, "_fetch",
+        lambda url, timeout: couk if ("2425" in url and "E0" in url) else None,
+    )
+    monkeypatch.setattr(
+        fcr, "_fetch_fallback_current",
+        lambda dn, pk, leagues=None: (
+            [], {"mapped": 0, "unmapped": [], "coverage": 1.0, "rows": 0}),
+    )
+    monkeypatch.setattr(fcr, "REPORT_PATH", tmp_path / "report.json")
+    monkeypatch.setattr(
+        "sys.argv", ["fetch", "--out", str(out), "--seasons", "2425", "--timeout", "5"],
+    )
+
+    fcr.main()
+
+    body = out.read_text()
+    # Both rows survive (key-level keeps the uncarried one) ...
+    assert "Liverpool,Everton,3,0,PL" in body
+    # ... but the shrink is surfaced as a diagnostic for a completed season.
+    import json
+    rep = json.loads((tmp_path / "report.json").read_text())
+    assert any(r["reason"] == "shrink" and r["season"] == "2425"
+               for r in rep["rejected_partitions"]), (
+        "a completed-season shrink was not recorded as a diagnostic"
+    )

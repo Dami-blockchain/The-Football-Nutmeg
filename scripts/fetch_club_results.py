@@ -24,9 +24,13 @@ re-seed and Dixon-Coles refit. So:
 
 * football-data.co.uk stays AUTHORITATIVE for historical seasons and for the
   ``ps_*`` closing-odds columns (the odds anchor's backtest depends on those).
-* Existing rows are PRESERVED per (league, season) partition. A partition is
-  only replaced when its .co.uk file was fetched successfully this run — a
-  failed fetch keeps the last-known-good rows rather than dropping them.
+* Merge is KEY-LEVEL (per fixture), not partition-level: a fresh .co.uk row
+  wins for any fixture it carries, and an existing row it does not carry is
+  kept. So a failed, truncated, lagging, or cross-source-mismatched body can
+  ADD or OVERRIDE rows but can never DELETE one. A body that parses to ZERO
+  rows (an IONOS shield HTML page served with HTTP 200) is refused outright.
+  Documented residual: a genuinely wrong existing row can no longer be removed
+  by a re-fetch — accepted, since losing history is worse than a stale row.
 * For the CURRENT season only, when .co.uk cannot supply it we fall back to
   football-data.org (already keyed, already rate-limited, free tier covers
   current-season results for all five domestic leagues) for FINISHED results.
@@ -225,15 +229,20 @@ def _fetch_couk(seasons, timeout, existing_counts):
                 print(f"  {season} {div}->{league}: 0 rows — REJECTED "
                       f"(kept {have} existing)")
                 continue
-            if len(parsed) < have:
-                # A completed season can only grow. A shrink means a partial /
-                # corrupt body; keep the fuller last-known-good.
+            # A short (but non-empty) body is TRUSTED at key level — main()
+            # merges per fixture, so it can only ADD or OVERRIDE rows, never
+            # delete one. So we do NOT reject a shrink. But a COMPLETED season
+            # that shrinks is genuinely anomalous (a provider correction, or a
+            # partial body) and worth a page, so we record it as a diagnostic.
+            # The CURRENT season legitimately shrinks across sources — .co.uk's
+            # D1 omits the relegation play-off FD.org counts (308 vs 306), and
+            # .co.uk lags FD.org mid-week — so it must NEVER be flagged.
+            if len(parsed) < have and season != CURRENT_SEASON:
                 rejected.append({
                     "league": league, "season": season,
                     "reason": "shrink", "fresh": len(parsed), "existing": have})
                 print(f"  {season} {div}->{league}: {len(parsed)} < {have} rows "
-                      f"— REJECTED (kept existing)")
-                continue
+                      f"— completed-season SHRINK (diagnostic; rows still merged)")
             rows.extend(parsed)
             fetched.add((league, season))
             print(f"  {season} {div}->{league}: +{len(parsed)} matches")
@@ -366,13 +375,16 @@ def main() -> None:
     couk_rows, fetched, rejected = _fetch_couk(
         args.seasons, args.timeout, existing_counts)
 
-    # Merge: start from last-known-good, drop only the partitions .co.uk
-    # actually (and validly) served, then add the fresh .co.uk rows. A failed
-    # OR rejected partition keeps its existing rows rather than vanishing.
-    merged = [
-        r for r in existing
-        if (r["league"], _season_code(r["date"])) not in fetched
-    ]
+    # KEY-LEVEL merge (not partition-level): a fresh .co.uk row WINS for any
+    # fixture it carries — so its closing odds land, even over a prior FD.org
+    # fallback row for the same fixture — while an existing row the fresh file
+    # does NOT carry is kept. A truncated, lagging, or cross-source-mismatched
+    # body can therefore add or override rows but can never DELETE one.
+    # Residual tradeoff: a genuinely wrong existing row can no longer be
+    # removed by a re-fetch. Accepted — losing history is worse than keeping a
+    # single stale row. ``fetched`` is now used only to compute missing_current.
+    fresh_keys = {_fixture_key(r) for r in couk_rows}
+    merged = [r for r in existing if _fixture_key(r) not in fresh_keys]
     merged.extend(couk_rows)
 
     # Which current-season leagues did .co.uk NOT serve this run? (Files are
