@@ -87,9 +87,11 @@ def _fd_match(home, away, hs, as_, date="2026-09-06"):
 def test_primary_wins_when_available(monkeypatch, tmp_path):
     out = tmp_path / "club.csv"
 
+    # Serve ALL five current-season divisions so coverage is complete and the
+    # per-league fallback (FIX B) has nothing missing to fetch.
     monkeypatch.setattr(
         fcr, "_fetch",
-        lambda url, timeout: _COUK_CSV if "2627" in url and "E0" in url else None,
+        lambda url, timeout: _COUK_CSV if "2627" in url else None,
     )
 
     def _boom(*a, **k):  # fallback must never be consulted here
@@ -122,7 +124,7 @@ def test_fallback_fires_when_primary_unreachable(monkeypatch, tmp_path):
 
     called = {}
 
-    def _fake_fb(dataset_names, present_keys):
+    def _fake_fb(dataset_names, present_keys, leagues=None):
         called["yes"] = True
         rows = [{
             "date": "2026-09-06", "home_team": "Arsenal", "away_team": "Chelsea",
@@ -162,7 +164,8 @@ def test_history_preserved_on_total_outage(monkeypatch, tmp_path):
     # Fallback yields nothing (e.g. FD.org also hiccups) — history must survive.
     monkeypatch.setattr(
         fcr, "_fetch_fallback_current",
-        lambda dn, pk: ([], {"mapped": 0, "unmapped": [], "coverage": 1.0, "rows": 0}),
+        lambda dn, pk, leagues=None: (
+            [], {"mapped": 0, "unmapped": [], "coverage": 1.0, "rows": 0}),
     )
     monkeypatch.setattr(fcr, "REPORT_PATH", tmp_path / "report.json")
     monkeypatch.setattr(
@@ -200,3 +203,116 @@ def test_unmapped_club_surfaces_and_is_kept(monkeypatch):
     # ... and the club is surfaced, not silently swallowed.
     assert any("Totally Unknown Zzz FC" in u for u in report["unmapped"])
     assert report["coverage"] < 1.0
+
+
+# ----------------------------------------------------------------------
+# 5. FIX A — a 200-but-malformed body must NOT delete the partition
+# ----------------------------------------------------------------------
+def test_malformed_200_preserves_partition(monkeypatch, tmp_path):
+    out = tmp_path / "club.csv"
+    # A completed-season partition already on disk (PL 2025-26 = code 2526).
+    out.write_text(
+        "date,home_team,away_team,home_score,away_score,league,ps_home,ps_draw,ps_away\n"
+        "2026-05-01,Arsenal,Chelsea,2,1,PL,1.80,3.50,4.20\n"
+    )
+    # .co.uk answers HTTP 200 with a shield/HTML body that parses to 0 rows.
+    shield = "<html><body>Service temporarily unavailable</body></html>"
+    monkeypatch.setattr(
+        fcr, "_fetch",
+        lambda url, timeout: shield if ("2526" in url and "E0" in url) else None,
+    )
+    monkeypatch.setattr(
+        fcr, "_fetch_fallback_current",
+        lambda dn, pk, leagues=None: (
+            [], {"mapped": 0, "unmapped": [], "coverage": 1.0, "rows": 0}),
+    )
+    monkeypatch.setattr(fcr, "REPORT_PATH", tmp_path / "report.json")
+    monkeypatch.setattr(
+        "sys.argv", ["fetch", "--out", str(out), "--seasons", "2526", "--timeout", "5"],
+    )
+
+    fcr.main()
+
+    body = out.read_text()
+    assert "Arsenal,Chelsea,2,1,PL,1.80,3.50,4.20" in body, (
+        "a 200-but-malformed body DELETED the historical partition"
+    )
+    import json
+    rep = json.loads((tmp_path / "report.json").read_text())
+    rej = rep["rejected_partitions"]
+    assert any(r["league"] == "PL" and r["season"] == "2526" and r["reason"] == "empty"
+               for r in rej), "the rejected partition was not surfaced in the report"
+
+
+# ----------------------------------------------------------------------
+# 6. FIX B — a PARTIAL current season runs the fallback for exactly the
+#    leagues .co.uk did not serve
+# ----------------------------------------------------------------------
+def test_partial_current_season_falls_back_for_missing_leagues(monkeypatch, tmp_path):
+    out = tmp_path / "club.csv"
+    # Only 2627/E0 (PL) is served; the other four divisions 503.
+    couk_pl = (
+        "Date,HomeTeam,AwayTeam,FTHG,FTAG,PSCH,PSCD,PSCA\n"
+        "01/09/2026,Arsenal,Chelsea,2,1,1.80,3.50,4.20\n"
+    )
+    monkeypatch.setattr(
+        fcr, "_fetch",
+        lambda url, timeout: couk_pl if ("2627" in url and "E0" in url) else None,
+    )
+
+    seen = {}
+
+    def _fake_fb(dataset_names, present_keys, leagues=None):
+        seen["leagues"] = list(leagues) if leagues is not None else None
+        return [], {"mapped": 0, "unmapped": [], "coverage": 1.0, "rows": 0}
+
+    monkeypatch.setattr(fcr, "_fetch_fallback_current", _fake_fb)
+    monkeypatch.setattr(fcr, "REPORT_PATH", tmp_path / "report.json")
+    monkeypatch.setattr(
+        "sys.argv", ["fetch", "--out", str(out), "--seasons", "2627", "--timeout", "5"],
+    )
+
+    fcr.main()
+
+    assert seen.get("leagues") is not None, "fallback did not run for a partial season"
+    assert set(seen["leagues"]) == {"PD", "BL1", "SA", "FL1"}, (
+        f"fallback ran for the wrong leagues: {seen['leagues']}"
+    )
+    assert "PL" not in seen["leagues"], "fallback re-fetched a league .co.uk served"
+
+
+# ----------------------------------------------------------------------
+# 7. a later .co.uk row SUPERSEDES a prior FD.org fallback row (no dupe)
+# ----------------------------------------------------------------------
+def test_couk_supersedes_fallback_row_without_duplication(monkeypatch, tmp_path):
+    out = tmp_path / "club.csv"
+    # Last week's fallback wrote this current-season fixture with NO odds.
+    out.write_text(
+        "date,home_team,away_team,home_score,away_score,league,ps_home,ps_draw,ps_away\n"
+        "2026-09-01,Arsenal,Chelsea,2,1,PL,,,\n"
+    )
+    # This week .co.uk publishes the SAME fixture, now WITH closing odds.
+    couk_pl = (
+        "Date,HomeTeam,AwayTeam,FTHG,FTAG,PSCH,PSCD,PSCA\n"
+        "01/09/2026,Arsenal,Chelsea,2,1,1.80,3.50,4.20\n"
+    )
+    monkeypatch.setattr(
+        fcr, "_fetch",
+        lambda url, timeout: couk_pl if ("2627" in url and "E0" in url) else None,
+    )
+    # PD/BL1/SA/FL1 are "missing" but the fallback adds nothing new.
+    monkeypatch.setattr(
+        fcr, "_fetch_fallback_current",
+        lambda dn, pk, leagues=None: (
+            [], {"mapped": 0, "unmapped": [], "coverage": 1.0, "rows": 0}),
+    )
+    monkeypatch.setattr(fcr, "REPORT_PATH", tmp_path / "report.json")
+    monkeypatch.setattr(
+        "sys.argv", ["fetch", "--out", str(out), "--seasons", "2627", "--timeout", "5"],
+    )
+
+    fcr.main()
+
+    lines = [ln for ln in out.read_text().splitlines() if "Arsenal,Chelsea" in ln]
+    assert len(lines) == 1, f"fixture duplicated across sources: {lines}"
+    assert "1.80,3.50,4.20" in lines[0], "the .co.uk row (with odds) did not win"

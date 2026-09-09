@@ -80,6 +80,19 @@ def _install_notify_recorder(monkeypatch):
     return pages
 
 
+def _fake_run_writing(report_json, rp):
+    """subprocess.run stand-in where the fetch step WRITES the report — as the
+    real fetch script does. The tick unlinks any stale report before running,
+    so a pre-seeded file would be gone; the fresh write is what it must read.
+    """
+    def _run(argv, **kw):
+        if argv[-1].endswith("fetch_club_results.py"):
+            rp.parent.mkdir(parents=True, exist_ok=True)
+            rp.write_text(report_json)
+        return _Proc(0)
+    return _run
+
+
 def test_fetch_failure_does_not_cancel_reseed_or_refit(monkeypatch, settings, tmp_path):
     # No report file at the patched repo root -> report{} path exercised too.
     monkeypatch.setattr(main, "_REPO_ROOT", tmp_path)
@@ -124,20 +137,82 @@ def test_all_steps_ok_does_not_page(monkeypatch, settings, tmp_path):
 
 def test_fallback_report_unmapped_pages(monkeypatch, settings, tmp_path):
     # A coverage report with an unmapped club must reach the operator.
-    (tmp_path / "data").mkdir()
-    (tmp_path / "data" / "club_fallback_report.json").write_text(
-        '{"fallback_used": true, "unmapped": ["Weird FC (PL)"], '
-        '"coverage": 0.9, "fallback_rows": 5}'
-    )
+    rp = tmp_path / "data" / "club_fallback_report.json"
+    content = ('{"couk_has_current": true, "fallback_used": true, '
+               '"unmapped": ["Weird FC (PL)"], "coverage": 0.9, '
+               '"fallback_rows": 5, "rejected_partitions": []}')
     monkeypatch.setattr(main, "_REPO_ROOT", tmp_path)
     tick = _club_refresh_job(monkeypatch, settings)
     pages = _install_notify_recorder(monkeypatch)
 
     import subprocess
-    monkeypatch.setattr(subprocess, "run", lambda argv, **kw: _Proc(0))
+    monkeypatch.setattr(subprocess, "run", _fake_run_writing(content, rp))
 
     asyncio.run(tick())
 
     assert any(p["kind"] == "club_refresh_unmapped" for p in pages), (
         "an unmapped fallback club did not page the operator"
     )
+
+
+def test_stale_current_season_pages(monkeypatch, settings, tmp_path):
+    # Total outage + a fallback that added nothing: current season is STALE.
+    rp = tmp_path / "data" / "club_fallback_report.json"
+    content = ('{"couk_has_current": false, "fallback_used": false, '
+               '"fallback_rows": 0, "unmapped": [], "rejected_partitions": []}')
+    monkeypatch.setattr(main, "_REPO_ROOT", tmp_path)
+    tick = _club_refresh_job(monkeypatch, settings)
+    pages = _install_notify_recorder(monkeypatch)
+
+    import subprocess
+    monkeypatch.setattr(subprocess, "run", _fake_run_writing(content, rp))
+
+    asyncio.run(tick())
+
+    assert any(p["kind"] == "club_refresh_stale" for p in pages), (
+        "a silently-stale current season did not page the operator"
+    )
+
+
+def test_rejected_partition_pages(monkeypatch, settings, tmp_path):
+    # A shield-200 that was refused must reach the operator.
+    rp = tmp_path / "data" / "club_fallback_report.json"
+    content = ('{"couk_has_current": true, "fallback_used": false, '
+               '"unmapped": [], "rejected_partitions": [{"league": "PL", '
+               '"season": "2526", "reason": "empty", "fresh": 0, '
+               '"existing": 380}]}')
+    monkeypatch.setattr(main, "_REPO_ROOT", tmp_path)
+    tick = _club_refresh_job(monkeypatch, settings)
+    pages = _install_notify_recorder(monkeypatch)
+
+    import subprocess
+    monkeypatch.setattr(subprocess, "run", _fake_run_writing(content, rp))
+
+    asyncio.run(tick())
+
+    assert any(p["kind"] == "club_refresh_rejected" for p in pages), (
+        "a rejected .co.uk partition did not page the operator"
+    )
+
+
+def test_stale_report_from_prior_week_is_not_read(monkeypatch, settings, tmp_path):
+    # A report left by a PREVIOUS run must be deleted before this run, so a
+    # fetch that crashes before writing one cannot be read as this run.
+    (tmp_path / "data").mkdir()
+    rp = tmp_path / "data" / "club_fallback_report.json"
+    rp.write_text('{"couk_has_current": false, "fallback_used": false, '
+                  '"fallback_rows": 0, "unmapped": ["Ghost FC (PL)"]}')
+    monkeypatch.setattr(main, "_REPO_ROOT", tmp_path)
+    tick = _club_refresh_job(monkeypatch, settings)
+    pages = _install_notify_recorder(monkeypatch)
+
+    # Fetch "runs" but does NOT rewrite the report (simulates a crash after the
+    # unlink); the stale report must be gone, so no unmapped/stale page fires.
+    import subprocess
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kw: _Proc(0))
+
+    asyncio.run(tick())
+
+    assert not rp.exists(), "stale report was not cleared before the run"
+    assert not any(p["kind"] in ("club_refresh_unmapped", "club_refresh_stale")
+                   for p in pages), "a prior week's report leaked into this run"

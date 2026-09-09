@@ -904,6 +904,14 @@ def run_daemon(
                 return 1, f"{type(e).__name__}: {e}"
 
         def _run_all():
+            # Drop any stale report from a previous week first: a fetch that
+            # crashes BEFORE writing one must not have last week's report read
+            # as if it described this run.
+            rp = _REPO_ROOT / "data" / "club_fallback_report.json"
+            try:
+                rp.unlink()
+            except OSError:
+                pass
             results = {}
             for script in ("fetch_club_results.py", "seed_glicko_club.py",
                            "fit_dixon_coles_club.py"):
@@ -911,7 +919,6 @@ def run_daemon(
             # Read the fetch coverage report (degraded/unmapped signalling).
             report = {}
             try:
-                rp = _REPO_ROOT / "data" / "club_fallback_report.json"
                 if rp.exists():
                     report = json.loads(rp.read_text(encoding="utf-8"))
             except Exception:  # noqa: BLE001 — report is advisory only
@@ -951,6 +958,30 @@ def run_daemon(
                 dedupe_key="club_refresh_step_failed",
             )
 
+        # A partition .co.uk answered with a 200 that parsed to too-few/zero
+        # rows was REFUSED (existing rows kept). That is a shield page, not
+        # data — surface it so it does not silently persist for weeks.
+        rejected = report.get("rejected_partitions") or []
+        if rejected:
+            lines = [
+                "*\u26a0\ufe0f Club results: rejected .co.uk partition(s)*",
+                "",
+                "football-data.co.uk returned a body that parsed to too few "
+                "rows (likely a shield page); existing rows were KEPT rather "
+                "than overwritten:",
+                "",
+            ]
+            for r in rejected[:20]:
+                lines.append(
+                    f"- `{r.get('league')}` {r.get('season')}: "
+                    f"{r.get('reason')} (fresh {r.get('fresh')} vs "
+                    f"existing {r.get('existing')})")
+            await notify_operator(
+                settings, "\n".join(lines),
+                kind="club_refresh_rejected",
+                dedupe_key="club_refresh_rejected",
+            )
+
         # Surface any club the fallback could not name-map (it is KEPT under
         # its football-data.org name so it never vanishes, but a split rating
         # history needs a human to add an alias).
@@ -983,6 +1014,23 @@ def run_daemon(
                 "needed unless it persists for weeks.",
                 kind="club_refresh_fallback",
                 dedupe_key="club_refresh_fallback",
+            )
+
+        # FIX C: current season neither served by .co.uk NOR covered by a
+        # working fallback (total outage + a fallback exception, or fallback
+        # disabled). fallback_used stays False in exactly those cases, which
+        # distinguishes this from a healthy "fallback ran, nothing new" run.
+        if (report and not report.get("couk_has_current")
+                and not report.get("fallback_used")):
+            await notify_operator(
+                settings,
+                "*\U0001f6a8 Club results are STALE*\n\n"
+                "The current season could not be refreshed from "
+                "football-data.co.uk OR the football-data.org fallback this "
+                "run. Ratings and the DC refit are running on frozen results "
+                "and will fall further behind each week until this is fixed.",
+                kind="club_refresh_stale",
+                dedupe_key="club_refresh_stale",
             )
 
     async def _season_title_refresh_tick() -> None:

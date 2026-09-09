@@ -334,6 +334,8 @@ COOLDOWN_SECONDS: dict[str, float] = {
     # page weekly, not swipe-trainingly often. 24h floor.
     "club_refresh_step_failed": 24 * 3600.0,
     "club_refresh_unmapped": 24 * 3600.0,
+    "club_refresh_rejected": 24 * 3600.0,
+    "club_refresh_stale": 24 * 3600.0,
     # "..._fallback" is pure awareness that .co.uk is down and FD.org is
     # covering; weekly so it is not a nag while the outage lasts.
     "club_refresh_fallback": 7 * 24 * 3600.0,

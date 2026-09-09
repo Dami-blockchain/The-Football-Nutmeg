@@ -166,21 +166,33 @@ def _load_existing(path: Path) -> list[dict]:
     return rows
 
 
-def _fetch_couk(seasons, timeout):
-    """Fetch .co.uk. Returns (rows, fetched_partitions).
+def _fetch_couk(seasons, timeout, existing_counts):
+    """Fetch .co.uk. Returns (rows, fetched_partitions, rejected).
 
-    ``fetched_partitions`` is the set of (league, season_code) actually served
-    this run; only those replace existing rows.
+    ``fetched_partitions`` is the set of (league, season_code) whose fresh file
+    is TRUSTED and therefore replaces existing rows. ``rejected`` is a list of
+    partitions whose fresh file was refused (and whose existing rows are kept),
+    with the reason — surfaced in the report so the daemon can page.
+
+    Why a partition can be refused even on HTTP 200: football-data.co.uk sits
+    behind an IONOS shield that answers requests with a 200 HTML page that
+    parses to ZERO result rows (the same "a 200 that is not your data"
+    footgun that has already bitten the odds provider and the ClubElo scrape).
+    Marking such a partition "served" would DROP every existing row for it. So
+    we refuse a partition whose fresh row count is 0, or is SMALLER than what
+    we already hold (a completed season never shrinks). ``existing_counts`` is
+    the last-known-good per-partition count.
     """
     rows: list[dict] = []
     fetched: set[tuple[str, str]] = set()
+    rejected: list[dict] = []
     for season in seasons:
         for div, league in DIV_TO_LEAGUE.items():
             url = BASE_URL.format(season=season, div=div)
             raw = _fetch(url, timeout)
             if not raw:
                 continue
-            n_before = len(rows)
+            parsed: list[dict] = []
             for r in csv.DictReader(io.StringIO(raw)):
                 d = _iso_date(r.get("Date", ""))
                 home = (r.get("HomeTeam") or "").strip()
@@ -192,7 +204,7 @@ def _fetch_couk(seasons, timeout):
                     hs, as_ = int(float(fthg)), int(float(ftag))
                 except ValueError:
                     continue
-                rows.append({
+                parsed.append({
                     "date": d,
                     "home_team": home,
                     "away_team": away,
@@ -203,18 +215,40 @@ def _fetch_couk(seasons, timeout):
                     "ps_draw": _first_float(r, ("PSCD", "PSD", "B365D", "AvgD", "BbAvD")),
                     "ps_away": _first_float(r, ("PSCA", "PSA", "B365A", "AvgA", "BbAvA")),
                 })
+            have = existing_counts.get((league, season), 0)
+            if not parsed:
+                # 200 (or otherwise) but zero parseable rows — a shield page or
+                # an empty file. Never let it delete the partition.
+                rejected.append({
+                    "league": league, "season": season,
+                    "reason": "empty", "fresh": 0, "existing": have})
+                print(f"  {season} {div}->{league}: 0 rows — REJECTED "
+                      f"(kept {have} existing)")
+                continue
+            if len(parsed) < have:
+                # A completed season can only grow. A shrink means a partial /
+                # corrupt body; keep the fuller last-known-good.
+                rejected.append({
+                    "league": league, "season": season,
+                    "reason": "shrink", "fresh": len(parsed), "existing": have})
+                print(f"  {season} {div}->{league}: {len(parsed)} < {have} rows "
+                      f"— REJECTED (kept existing)")
+                continue
+            rows.extend(parsed)
             fetched.add((league, season))
-            print(f"  {season} {div}->{league}: +{len(rows) - n_before} matches")
-    return rows, fetched
+            print(f"  {season} {div}->{league}: +{len(parsed)} matches")
+    return rows, fetched, rejected
 
 
-def _fetch_fallback_current(dataset_names, present_keys):
+def _fetch_fallback_current(dataset_names, present_keys, leagues=None):
     """football-data.org FINISHED results for the CURRENT season.
 
     Maps football-data.org names -> dataset (.co.uk) names via the market
     matcher's alias resolver so a club's history is not split across two keys.
-    Only adds fixtures not already present (``present_keys``). Returns
-    ``(rows, report)`` where ``report`` records coverage and any unmapped club.
+    Only adds fixtures not already present (``present_keys``). ``leagues`` is
+    the subset to fetch (the ones .co.uk did NOT serve this run); ``None`` means
+    all domestic leagues. Returns ``(rows, report)`` where ``report`` records
+    coverage and any unmapped club.
     """
     import asyncio
 
@@ -230,7 +264,8 @@ def _fetch_fallback_current(dataset_names, present_keys):
         norm_to_dataset.setdefault(normalize(n), n)
     dataset_list = list(dataset_names)
 
-    leagues = tuple(c for c in LEAGUE_CODES if c not in ("WC", "CL"))
+    domestic = tuple(c for c in LEAGUE_CODES if c not in ("WC", "CL"))
+    leagues = tuple(leagues) if leagues is not None else domestic
     # First of July of the current season's start year bounds the window.
     start_year = 2000 + int(CURRENT_SEASON[:2])
     date_from = f"{start_year}-07-01"
@@ -318,22 +353,41 @@ def main() -> None:
     args = ap.parse_args()
 
     existing = _load_existing(args.out)
-    couk_rows, fetched = _fetch_couk(args.seasons, args.timeout)
 
-    # Merge: start from last-known-good, drop partitions .co.uk just replaced,
-    # then add the fresh .co.uk rows. A partition whose fetch FAILED keeps its
-    # existing rows rather than vanishing.
+    # Per-partition counts of the last-known-good file, so _fetch_couk can
+    # refuse a fresh file that is empty or has shrunk (a shield 200).
+    existing_counts: dict[tuple[str, str], int] = {}
+    for r in existing:
+        sc = _season_code(r["date"])
+        if sc is not None:
+            existing_counts[(r["league"], sc)] = \
+                existing_counts.get((r["league"], sc), 0) + 1
+
+    couk_rows, fetched, rejected = _fetch_couk(
+        args.seasons, args.timeout, existing_counts)
+
+    # Merge: start from last-known-good, drop only the partitions .co.uk
+    # actually (and validly) served, then add the fresh .co.uk rows. A failed
+    # OR rejected partition keeps its existing rows rather than vanishing.
     merged = [
         r for r in existing
         if (r["league"], _season_code(r["date"])) not in fetched
     ]
     merged.extend(couk_rows)
 
-    couk_has_current = any(s == CURRENT_SEASON for (_lg, s) in fetched)
+    # Which current-season leagues did .co.uk NOT serve this run? (Files are
+    # published at different times, so a partial current season is normal.)
+    missing_current = [
+        lg for lg in DIV_TO_LEAGUE.values()
+        if (lg, CURRENT_SEASON) not in fetched
+    ]
+    couk_has_current = not missing_current
     report = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "couk_ok": bool(couk_rows),
         "couk_has_current": couk_has_current,
+        "couk_missing_leagues": missing_current,
+        "rejected_partitions": rejected,
         "fallback_used": False,
         "mapped": 0,
         "unmapped": [],
@@ -341,16 +395,17 @@ def main() -> None:
         "fallback_rows": 0,
     }
 
-    # Current-season fallback: whenever .co.uk did not serve the current season.
-    if not args.no_fallback and not couk_has_current:
+    # Current-season fallback: for exactly the leagues .co.uk did not serve.
+    if not args.no_fallback and missing_current:
         present = {_fixture_key(r) for r in merged}
         dataset_names = (
             {r["home_team"] for r in merged} | {r["away_team"] for r in merged}
         )
-        print(f"\nfootball-data.co.uk missing season {CURRENT_SEASON} "
-              f"— falling back to football-data.org for current-season results")
+        print(f"\nfootball-data.co.uk missing season {CURRENT_SEASON} for "
+              f"{missing_current} — falling back to football-data.org")
         try:
-            fb_rows, fb_report = _fetch_fallback_current(dataset_names, present)
+            fb_rows, fb_report = _fetch_fallback_current(
+                dataset_names, present, leagues=missing_current)
             merged.extend(fb_rows)
             report.update(
                 fallback_used=True,
