@@ -72,10 +72,16 @@ def _cache_path(settings) -> Path:
 
 
 def load_snapshot(settings) -> tuple[dict[str, float], Any]:
-    """Load the ClubElo snapshot exactly as EuropeanStrategyEngine does."""
-    path = Path(settings.clubelo_latest_path)
+    """Load the ClubElo snapshot exactly as EuropeanStrategyEngine does.
+
+    Reads the fresh site-scale feed (``cl_snapshot_path``); if absent, falls
+    back to the newest dated site-scale file under ``data/clubelo_site/`` —
+    never the api-scale pin, so the scale always matches the constants the
+    advance-prob fn prices with.
+    """
+    path = Path(settings.cl_snapshot_path)
     if not path.exists():
-        alt = _newest_clubelo_dir(Path("data/clubelo"))
+        alt = _newest_clubelo_dir(Path("data/clubelo_site"))
         if alt is not None:
             path = alt
     return _load_snapshot(path)
@@ -108,7 +114,8 @@ def build_advance_prob_fn(
     def _p_home_only(elo_a: float, elo_b: float) -> float:
         # renormalise the draw out of a single a-home match
         p_h, _p_d, p_a = _elo_probs(
-            elo_a, elo_b, settings.cl_elo_home_adv, settings.cl_elo_draw_rho
+            elo_a, elo_b, settings.cl_elo_home_adv, settings.cl_elo_draw_rho,
+            settings.cl_elo_scale,
         )
         denom = p_h + p_a
         return p_h / denom if denom > 0 else 0.5

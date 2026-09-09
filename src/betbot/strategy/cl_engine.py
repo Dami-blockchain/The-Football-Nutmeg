@@ -69,6 +69,15 @@ log = get_logger(__name__)
 
 STALE_AFTER_DAYS = 14
 
+#: Incumbent (api.clubelo-scale) constants, kept for the dual-log SHADOW only.
+#: When the engine switched to the compressed site scale (home_adv 65->51,
+#: scale 400->312), these froze the api-scale config so the shadow can price
+#: each fixture the way the old engine would have. They are NOT settings on
+#: purpose — the shadow is the fixed baseline we are measuring the switch
+#: against, not a knob to tune.
+INCUMBENT_ELO_HOME_ADV = 65.0
+INCUMBENT_ELO_SCALE = 400.0
+
 #: Degenerate-country guard thresholds (see _drop_degenerate_countries).
 #: ClubElo emits one identical placeholder Elo for every club of a league it
 #: has stopped rating; we drop a whole country only when a single Elo value is
@@ -251,14 +260,22 @@ class EuropeanStrategyEngine:
         self.snapshot_age_days: int | None = None
         self.snapshot_reason = "injected"
 
+        # Dual-log shadow state (populated only when loading from files).
+        self._shadow_snapshot: dict[str, float] = {}
+        self._shadow_clubs: list[str] = []
+        self._shadow_res_cache: dict[str, str | None] = {}
+
         if snapshot is not None:
             self._snapshot = snapshot
             self._clubs = list(snapshot.keys())
             self._snapshot_date: date | None = None
         else:
-            path = Path(settings.clubelo_latest_path)
+            # Primary = the fresh site-scale feed. Fallback stays site-scale
+            # (newest dated file under data/clubelo_site/) — never the api-scale
+            # pin, whose scale would not match the tuned site constants.
+            path = Path(settings.cl_snapshot_path)
             if not path.exists():
-                alt = _newest_clubelo_dir(Path("data/clubelo"))
+                alt = _newest_clubelo_dir(Path("data/clubelo_site"))
                 if alt is not None:
                     path = alt
             snap, snap_date = _load_snapshot(path)
@@ -266,6 +283,7 @@ class EuropeanStrategyEngine:
             self._clubs = list(snap.keys())
             self._snapshot_date = snap_date
             self._check_freshness(path)
+            self._load_shadow(Path(settings.cl_shadow_snapshot_path))
 
         self._res_cache: dict[str, str | None] = {}
 
@@ -324,6 +342,86 @@ class EuropeanStrategyEngine:
     def _dc_key(self, name: str) -> str:
         n = normalize(name)
         return self._name_map.get(n, n)
+
+    def _load_shadow(self, path: Path) -> None:
+        """Load the api.clubelo pin as the dual-log shadow. Best-effort: a
+        missing or unparseable pin simply means no shadow rows (dual_triples
+        returns None), never an error into the engine."""
+        try:
+            snap, _ = _load_snapshot(path)
+        except Exception:  # noqa: BLE001 — shadow load must never break the engine
+            snap = {}
+        self._shadow_snapshot = snap or {}
+        self._shadow_clubs = list(self._shadow_snapshot.keys())
+
+    def _resolve_shadow(self, name: str) -> str | None:
+        if name in self._shadow_res_cache:
+            return self._shadow_res_cache[name]
+        hit = (
+            self._resolver.match(name, self._shadow_clubs)
+            if self._shadow_clubs else None
+        )
+        self._shadow_res_cache[name] = hit
+        return hit
+
+    def _model_triple(
+        self, snapshot: dict[str, float], hit_h: str, hit_a: str,
+        home_name: str, away_name: str, home_adv: float, scale: float,
+    ) -> tuple[float, float, float]:
+        """Elo(+DC) triple for one (snapshot, constants) pair — the SAME blend
+        predict() serves, so the shadow is a like-for-like comparison."""
+        s = self._settings
+        elo_probs = _elo_probs(
+            snapshot[hit_h], snapshot[hit_a],
+            home_adv, s.cl_elo_draw_rho, scale,
+        )
+        components: list[tuple[float, tuple[float, float, float]]] = [
+            (s.cl_weight_elo, elo_probs)
+        ]
+        if s.cl_weight_dc > 0 and self._dc_params is not None:
+            kh, ka = self._dc_key(home_name), self._dc_key(away_name)
+            if kh in self._dc_params.teams and ka in self._dc_params.teams:
+                components.append((s.cl_weight_dc, dc.match_probabilities(
+                    self._dc_params, kh, ka, home_field=True)))
+        return log_pool(components)
+
+    def dual_triples(
+        self, home_name: str, away_name: str,
+    ) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:
+        """(shadow, served) 1X2 triples for the ``model_predictions`` dual-log.
+
+        * ``served`` = the SITE-scale config the engine now prices off, stored
+          in the ensemble slot (``e_*``);
+        * ``shadow`` = the frozen api.clubelo incumbent (INCUMBENT_* constants
+          on the ageing pin), stored in the glicko slot (``g_*``).
+
+        Returns ``None`` unless BOTH feeds resolve BOTH clubs, so the forward
+        ledger only records fixtures with a genuine head-to-head. Purely
+        observational: it never changes what ``predict()`` serves.
+
+        NOTE for analysts: these CL rows reuse the club dual-log's columns with
+        different meaning (glicko slot = api shadow, ensemble slot = site
+        served). Separate them from club rows by joining ``fixture_id`` to
+        ``predictions.competition_code == 'CL'``.
+        """
+        hit_h = self._resolve(home_name)
+        hit_a = self._resolve(away_name)
+        if hit_h is None or hit_a is None:
+            return None
+        sh_h = self._resolve_shadow(home_name)
+        sh_a = self._resolve_shadow(away_name)
+        if sh_h is None or sh_a is None:
+            return None
+        s = self._settings
+        served = self._model_triple(
+            self._snapshot, hit_h, hit_a, home_name, away_name,
+            s.cl_elo_home_adv, s.cl_elo_scale,
+        )
+        shadow = self._model_triple(
+            self._shadow_snapshot, sh_h, sh_a, home_name, away_name,
+            INCUMBENT_ELO_HOME_ADV, INCUMBENT_ELO_SCALE,
+        )
+        return shadow, served
 
     def model_weight(self) -> float:
         """Summed log-pool weight of the ACTIVE model components.

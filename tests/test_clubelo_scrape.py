@@ -139,6 +139,23 @@ def test_scrape_writes_dated_site_archive(tmp_path):
     assert archive.read_text() == dest.read_text()
 
 
+def test_scrape_archive_failure_does_not_fail_the_scrape(tmp_path):
+    # If the archive dir cannot be created (here: a regular FILE sits where the
+    # clubelo_site/ directory should be), the scrape must STILL succeed — dest
+    # written, returns True — and log clubelo_scrape_archive_failed. The monitor
+    # snapshot is the contract; the dated archive is best-effort.
+    import structlog
+
+    (tmp_path / "clubelo_site").write_text("i am a file, not a dir\n")
+    dest = _write_ref(tmp_path)
+    ref = tmp_path / "clubelo_latest.csv"
+    with structlog.testing.capture_logs() as logs:
+        assert clubelo.scrape_latest(dest, reference=ref, html=_fixture_html()) is True
+    assert dest.read_text().splitlines()[0] == HEADER
+    assert not (tmp_path / "clubelo_site" / "2026-09-06.csv").exists()
+    assert any(e.get("event") == "clubelo_scrape_archive_failed" for e in logs)
+
+
 def test_names_are_canonicalised_to_the_reference(tmp_path):
     dest = _write_ref(tmp_path)
     ref = tmp_path / "clubelo_latest.csv"

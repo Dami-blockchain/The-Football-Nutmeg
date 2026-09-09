@@ -461,18 +461,42 @@ class Settings(BaseSettings):
     # +0.056 RPS/match vs naive on the held-out 2025 season). The DC blend
     # beat pure Elo on train, so cl_weight_dc ships non-zero.
     cl_elo_enabled: bool = Field(default=True, alias="BETBOT_CL_ELO")
+    # ``clubelo_latest_path`` is the api.clubelo pin AND the refresh_latest write
+    # target. api.clubelo stopped refreshing ~2026-08-31, so this file now ages
+    # in place — it is kept ONLY as the dual-log shadow (the incumbent we left).
     clubelo_latest_path: Path = Field(
         default=Path("./data/clubelo_latest.csv"), alias="BETBOT_CLUBELO_LATEST_PATH"
     )
-    cl_elo_home_adv: float = Field(default=65.0, alias="BETBOT_CL_ELO_HOME_ADV")
+    # The CL engine's LIVE snapshot source. Switched (2026-09) from the ageing
+    # api.clubelo pin to the fresh daily site-scale scrape (clubelo.com), which
+    # is refreshed every day and captures clubs the pin misses (e.g. Kairat).
+    # The engine reads this; if absent it falls back to the newest dated file
+    # under ``data/clubelo_site/`` (also site-scale) — never to the api-scale
+    # pin, whose scale would not match the constants below.
+    cl_snapshot_path: Path = Field(
+        default=Path("./data/clubelo_scrape_latest.csv"),
+        alias="BETBOT_CL_SNAPSHOT_PATH",
+    )
+    # Dual-log shadow: the api.clubelo pin, priced with the INCUMBENT constants
+    # (see cl_engine.INCUMBENT_*). Purely observational — records what the old
+    # api-scale engine would have said, so the site switch is measured forward.
+    cl_shadow_snapshot_path: Path = Field(
+        default=Path("./data/clubelo_latest.csv"),
+        alias="BETBOT_CL_SHADOW_SNAPSHOT_PATH",
+    )
+    # Home-advantage bump, on the ELO SCALE. Rescaled 65->51 for the site feed:
+    # the site scale is compressed to ~0.77-0.79x of api.clubelo (measured over
+    # 6 snapshots), so 65*0.78 ~= 51 keeps the same real home edge.
+    cl_elo_home_adv: float = Field(default=51.0, alias="BETBOT_CL_ELO_HOME_ADV")
     cl_elo_draw_rho: float = Field(default=0.26, alias="BETBOT_CL_ELO_DRAW_RHO")
-    # Logistic Elo divisor ("scale"). The classic Elo value is 400: a 400-point
-    # gap = ~91% win expectancy. ClubElo's own SITE-scale ratings are compressed
-    # (big-vs-small gaps ~0.65x the api.clubelo scale), so a smaller divisor is
-    # needed to recover the same sharpness. Default 400 keeps the api-scale
-    # engine byte-identical; retune this alongside home_adv/draw_rho if the
-    # snapshot scale changes. See scripts/backtest_cl.py.
-    cl_elo_scale: float = Field(default=400.0, alias="BETBOT_CL_ELO_SCALE")
+    # Logistic Elo divisor ("scale"). Classic Elo = 400 (a 400-point gap = ~91%).
+    # ClubElo's SITE-scale ratings are compressed to ~0.77-0.79x of the
+    # api.clubelo scale (measured: SD ratio 0.772-0.796 across 6 snapshots), so
+    # the divisor is rescaled 400->312 (=400*0.78) to recover the same sharpness.
+    # This is the MEASURED rescale of the incumbent, NOT a train-tuned value:
+    # tuning on n=314 was demonstrably unstable (see scripts/backtest_cl.py). If
+    # the snapshot scale changes again, rescale by the new measured spread ratio.
+    cl_elo_scale: float = Field(default=312.0, alias="BETBOT_CL_ELO_SCALE")
     # Log-pool weights for the CL Elo ensemble components + market anchoring.
     cl_weight_elo: float = Field(default=1.0, alias="BETBOT_CL_W_ELO")
     cl_weight_dc: float = Field(default=1.0, alias="BETBOT_CL_W_DC")

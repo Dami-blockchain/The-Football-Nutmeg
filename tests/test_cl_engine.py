@@ -140,9 +140,11 @@ def _csv(frm: date, rows: int = 3) -> str:
 
 
 def _engine_on_file(path, monkeypatch, tmp_path):
-    # chdir so the data/clubelo/ directory fallback cannot reach the real repo
+    # chdir so the data/clubelo_site/ directory fallback cannot reach the real
+    # repo. The engine now reads its live snapshot from cl_snapshot_path (the
+    # site feed), so point that at the test file.
     monkeypatch.chdir(tmp_path)
-    s = get_settings().model_copy(update={"clubelo_latest_path": Path(path)})
+    s = get_settings().model_copy(update={"cl_snapshot_path": Path(path)})
     return EuropeanStrategyEngine(s, dc_params=None, name_map={}, resolver=None)
 
 
@@ -259,3 +261,55 @@ def test_degenerate_country_fixture_falls_back_to_naive(tmp_path, monkeypatch):
     from betbot.strategy.engine import StrategyEngine
     naive = StrategyEngine(get_settings()).predict(ff)
     assert (got.p_home, got.p_draw, got.p_away) == (naive.p_home, naive.p_draw, naive.p_away)
+
+
+# --------------------------------------------------------------------------
+# Dual-log shadow: site-served vs api-incumbent triples (the 2026-09 switch)
+# --------------------------------------------------------------------------
+
+
+def _snap_csv(path: Path, rows: list[tuple[str, float]]) -> None:
+    frm = date.today().isoformat()
+    lines = ["Rank,Club,Country,Level,Elo,From,To"]
+    for i, (club, elo) in enumerate(rows, 1):
+        lines.append(f"{i},{club},ENG,1,{elo},{frm},{frm}")
+    path.write_text("\n".join(lines) + "\n")
+
+
+def test_dual_triples_pairs_site_served_with_api_shadow(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    site = tmp_path / "site.csv"
+    api = tmp_path / "api.csv"
+    # Site scale: Bayern stronger. Api scale: Arsenal stronger. So the served
+    # (site) triple and the shadow (api) triple must disagree on the favourite.
+    _snap_csv(site, [("Arsenal", 1900.0), ("Bayern", 1990.0)])
+    _snap_csv(api, [("Arsenal", 2050.0), ("Bayern", 1980.0)])
+    s = get_settings().model_copy(update={
+        "cl_snapshot_path": site, "cl_shadow_snapshot_path": api,
+    })
+    eng = EuropeanStrategyEngine(s, dc_params=None, name_map={}, resolver=None)
+
+    out = eng.dual_triples("Arsenal", "Bayern")
+    assert out is not None
+    shadow, served = out
+    assert abs(sum(shadow) - 1.0) < 1e-9
+    assert abs(sum(served) - 1.0) < 1e-9
+    # api incumbent favours the home side (Arsenal); site favours the away side.
+    assert shadow[0] > served[0]
+    assert served[2] > shadow[2]
+
+    # No shadow row unless BOTH feeds resolve BOTH clubs.
+    assert eng.dual_triples("Arsenal", "Unknown Team FC") is None
+
+
+def test_dual_triples_returns_none_without_a_shadow_snapshot(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    site = tmp_path / "site.csv"
+    _snap_csv(site, [("Arsenal", 1900.0), ("Bayern", 1990.0)])
+    s = get_settings().model_copy(update={
+        "cl_snapshot_path": site,
+        "cl_shadow_snapshot_path": tmp_path / "missing_pin.csv",
+    })
+    eng = EuropeanStrategyEngine(s, dc_params=None, name_map={}, resolver=None)
+    # Primary resolves, but the api pin is absent -> no head-to-head, no row.
+    assert eng.dual_triples("Arsenal", "Bayern") is None
