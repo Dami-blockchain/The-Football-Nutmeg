@@ -330,6 +330,13 @@ COOLDOWN_SECONDS: dict[str, float] = {
     # will keep firing until the operator acts; 6h keeps it present without
     # sending 96 pushes a day.
     "telegram_bot_not_polling": 6 * 3600.0,
+    # Club learning-loop watchdog. Weekly job; a persistent failure should
+    # page weekly, not swipe-trainingly often. 24h floor.
+    "club_refresh_step_failed": 24 * 3600.0,
+    "club_refresh_unmapped": 24 * 3600.0,
+    # "..._fallback" is pure awareness that .co.uk is down and FD.org is
+    # covering; weekly so it is not a nag while the outage lasts.
+    "club_refresh_fallback": 7 * 24 * 3600.0,
 }
 
 #: ``(kind, dedupe_key) -> monotonic timestamp of the last SUCCESSFUL send``.

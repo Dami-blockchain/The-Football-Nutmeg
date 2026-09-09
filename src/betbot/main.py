@@ -879,21 +879,111 @@ def run_daemon(
         # ratings track the season instead of freezing at seed time.
         # Subprocess (not import): the scripts are argparse mains; isolation
         # means a bad refresh can never corrupt the daemon.
+        #
+        # The three steps run INDEPENDENTLY: a fetch failure must NOT cancel
+        # the re-seed and the DC refit (they can still run on the last-known-
+        # good CSV). A step that fails PAGES the operator — this whole loop
+        # sat silently broken for a week when football-data.co.uk went 503,
+        # because the old ``check=True`` single-loop aborted on the first
+        # failure and only logged a warning.
+        import json
         import subprocess
 
-        def _run() -> None:
+        settings = get_settings()
+        log = get_logger(__name__)
+
+        def _run_one(script: str):
+            try:
+                proc = subprocess.run(
+                    [".venv/bin/python", f"scripts/{script}"],
+                    cwd=str(_REPO_ROOT), timeout=1800, check=False,
+                    capture_output=True, text=True,
+                )
+                return proc.returncode, (proc.stderr or "")[-500:]
+            except Exception as e:  # noqa: BLE001 — never let one step sink the rest
+                return 1, f"{type(e).__name__}: {e}"
+
+        def _run_all():
+            results = {}
             for script in ("fetch_club_results.py", "seed_glicko_club.py",
                            "fit_dixon_coles_club.py"):
-                subprocess.run(
-                    [".venv/bin/python", f"scripts/{script}"],
-                    cwd=str(_REPO_ROOT), timeout=1800, check=True,
-                    capture_output=True,
-                )
-        try:
-            await asyncio.to_thread(_run)
-            get_logger(__name__).info("club_data_refreshed")
-        except Exception as e:  # noqa: BLE001 — never crash the daemon
-            get_logger(__name__).warning("club_refresh_failed", error=str(e))
+                results[script] = _run_one(script)
+            # Read the fetch coverage report (degraded/unmapped signalling).
+            report = {}
+            try:
+                rp = _REPO_ROOT / "data" / "club_fallback_report.json"
+                if rp.exists():
+                    report = json.loads(rp.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001 — report is advisory only
+                report = {}
+            return results, report
+
+        results, report = await asyncio.to_thread(_run_all)
+
+        failed = {s: err for s, (rc, err) in results.items() if rc != 0}
+        for s, (rc, _err) in results.items():
+            if rc == 0:
+                log.info("club_refresh_step_ok", script=s)
+            else:
+                log.warning("club_refresh_step_failed", script=s)
+
+        if not failed:
+            log.info("club_data_refreshed",
+                     fallback_used=bool(report.get("fallback_used")))
+
+        # Page on any FAILED step — an independent failure no longer hides
+        # behind an earlier one, and a silent skip is what broke us before.
+        if failed:
+            lines = [
+                "*\U0001f6a8 Club data refresh: step(s) failed*",
+                "",
+                "The weekly club learning loop had a failing step. The other "
+                "steps still ran on whatever data we have, but this needs a "
+                "look:",
+                "",
+            ]
+            for s, err in failed.items():
+                tail = err.strip().splitlines()[-1] if err.strip() else "(no stderr)"
+                lines.append(f"- `{s}`: {tail[:200]}")
+            await notify_operator(
+                settings, "\n".join(lines),
+                kind="club_refresh_step_failed",
+                dedupe_key="club_refresh_step_failed",
+            )
+
+        # Surface any club the fallback could not name-map (it is KEPT under
+        # its football-data.org name so it never vanishes, but a split rating
+        # history needs a human to add an alias).
+        unmapped = report.get("unmapped") or []
+        if unmapped:
+            body = (
+                "*⚠️ Club results: unmapped clubs*\n\n"
+                "The football-data.org fallback could not map these clubs to "
+                "dataset names (kept under their FD.org name for now — add "
+                "aliases in `config/team_aliases.yaml`):\n"
+                + "\n".join(f"- `{u}`" for u in unmapped[:20])
+            )
+            await notify_operator(
+                settings, body, kind="club_refresh_unmapped",
+                dedupe_key="club_refresh_unmapped",
+            )
+
+        # Let the operator know once (long cooldown) that we are running on the
+        # FD.org fallback because football-data.co.uk is unreachable — useful
+        # operational awareness without nagging every weekly tick.
+        elif report.get("fallback_used") and not failed:
+            await notify_operator(
+                settings,
+                "*ℹ️ Club results on fallback*\n\n"
+                "football-data.co.uk is unreachable; current-season results "
+                "are coming from the football-data.org fallback "
+                f"({report.get('fallback_rows', 0)} rows, "
+                f"{(report.get('coverage') or 1.0):.0%} name-map coverage). "
+                "Historical rows and closing odds are unchanged. No action "
+                "needed unless it persists for weeks.",
+                kind="club_refresh_fallback",
+                dedupe_key="club_refresh_fallback",
+            )
 
     async def _season_title_refresh_tick() -> None:
         # Weekly: refresh the season-title Monte-Carlo cache for each domestic

@@ -15,9 +15,32 @@ downstream seeding lines up with the live scoring loop. ``ps_*`` are the closing
 decimal odds (Pinnacle, falling back to Bet365 then the market average) — used
 ONLY by the backtest as a market reference, never for training.
 
+CURRENT-SEASON FALLBACK
+-----------------------
+football-data.co.uk goes down for days at a time (an IONOS shield answering
+HTTP 503 for every UA/path). When that happens the whole file used to be
+rewritten empty and the script exited 1, which silently froze the weekly Glicko
+re-seed and Dixon-Coles refit. So:
+
+* football-data.co.uk stays AUTHORITATIVE for historical seasons and for the
+  ``ps_*`` closing-odds columns (the odds anchor's backtest depends on those).
+* Existing rows are PRESERVED per (league, season) partition. A partition is
+  only replaced when its .co.uk file was fetched successfully this run — a
+  failed fetch keeps the last-known-good rows rather than dropping them.
+* For the CURRENT season only, when .co.uk cannot supply it we fall back to
+  football-data.org (already keyed, already rate-limited, free tier covers
+  current-season results for all five domestic leagues) for FINISHED results.
+  Those rows carry no closing odds (``ps_*`` empty) — odds stay a .co.uk-only
+  concern. Names are mapped football-data.org -> dataset names with the SAME
+  alias resolver the market matcher uses; any club that fails to map is kept
+  (under its football-data.org name, so it never silently vanishes) and
+  SURFACED loudly plus written to ``data/club_fallback_report.json`` for the
+  daemon to page on.
+
 Run (repo root, venv active):
     python scripts/fetch_club_results.py
     python scripts/fetch_club_results.py --seasons 2223 2324 2425 --out data/club_results.csv
+    python scripts/fetch_club_results.py --no-fallback   # .co.uk only (offline test)
 """
 
 from __future__ import annotations
@@ -25,8 +48,10 @@ from __future__ import annotations
 import argparse
 import csv
 import io
+import json
 import sys
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 # football-data.co.uk division code -> our football-data.org competition code.
@@ -46,6 +71,14 @@ BASE_URL = "https://www.football-data.co.uk/mmz4281/{season}/{div}.csv"
 # of freezing ratings at the end of 2025-26 every Monday.
 DEFAULT_SEASONS = ("2021", "2122", "2223", "2324", "2425", "2526", "2627")
 
+# The season whose results the football-data.org fallback is allowed to supply.
+# Keep in lockstep with the newest entry in DEFAULT_SEASONS.
+CURRENT_SEASON = "2627"
+
+# Where the fallback records its coverage so the daemon can page on unmapped
+# clubs / a degraded (.co.uk-down) run without parsing captured stdout.
+REPORT_PATH = Path("data/club_fallback_report.json")
+
 
 def _iso_date(raw: str) -> str | None:
     """football-data.co.uk uses dd/mm/yyyy (older files dd/mm/yy)."""
@@ -62,6 +95,23 @@ def _iso_date(raw: str) -> str | None:
             year += 2000
         return f"{year:04d}-{int(m):02d}-{int(d):02d}"
     return None
+
+
+def _season_code(date_iso: str) -> str | None:
+    """ISO date -> football-data.co.uk 4-digit season code.
+
+    Seasons run Aug->May; we cut at July. ``2026-08-15`` -> ``2627``,
+    ``2026-03-01`` -> ``2526``. Used to partition existing rows so a
+    successful .co.uk fetch replaces exactly the season it covers and a
+    failed one leaves every other season's rows untouched.
+    """
+    try:
+        y, m, _ = date_iso.split("-")
+        year, month = int(y), int(m)
+    except (ValueError, AttributeError):
+        return None
+    start = year if month >= 7 else year - 1
+    return f"{start % 100:02d}{(start + 1) % 100:02d}"
 
 
 def _first_float(row: dict, keys: tuple[str, ...]) -> str:
@@ -86,24 +136,55 @@ def _fetch(url: str, timeout: int) -> str | None:
         return None
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--seasons", nargs="+", default=list(DEFAULT_SEASONS))
-    ap.add_argument("--out", type=Path, default=Path("data/club_results.csv"))
-    ap.add_argument("--timeout", type=int, default=60)
-    args = ap.parse_args()
+def _fixture_key(row: dict) -> tuple:
+    """Dedupe/identity key for a fixture, spelling-insensitive on team names."""
+    from betbot.exchanges.matcher import normalize
+    return (
+        row["league"],
+        row["date"],
+        normalize(str(row["home_team"])),
+        normalize(str(row["away_team"])),
+    )
 
-    out_rows: list[dict] = []
-    for season in args.seasons:
+
+def _load_existing(path: Path) -> list[dict]:
+    """Last-known-good rows, so a failed fetch never drops history."""
+    if not path.exists():
+        return []
+    rows: list[dict] = []
+    try:
+        with path.open(newline="") as f:
+            for r in csv.DictReader(f):
+                try:
+                    r["home_score"] = int(float(r["home_score"]))
+                    r["away_score"] = int(float(r["away_score"]))
+                except (ValueError, KeyError, TypeError):
+                    continue
+                rows.append(r)
+    except OSError as e:
+        print(f"  could not read existing {path}: {e}")
+    return rows
+
+
+def _fetch_couk(seasons, timeout):
+    """Fetch .co.uk. Returns (rows, fetched_partitions).
+
+    ``fetched_partitions`` is the set of (league, season_code) actually served
+    this run; only those replace existing rows.
+    """
+    rows: list[dict] = []
+    fetched: set[tuple[str, str]] = set()
+    for season in seasons:
         for div, league in DIV_TO_LEAGUE.items():
             url = BASE_URL.format(season=season, div=div)
-            raw = _fetch(url, args.timeout)
+            raw = _fetch(url, timeout)
             if not raw:
                 continue
-            n_before = len(out_rows)
+            n_before = len(rows)
             for r in csv.DictReader(io.StringIO(raw)):
                 d = _iso_date(r.get("Date", ""))
-                home, away = (r.get("HomeTeam") or "").strip(), (r.get("AwayTeam") or "").strip()
+                home = (r.get("HomeTeam") or "").strip()
+                away = (r.get("AwayTeam") or "").strip()
                 fthg, ftag = (r.get("FTHG") or "").strip(), (r.get("FTAG") or "").strip()
                 if not (d and home and away and fthg and ftag):
                     continue
@@ -111,7 +192,7 @@ def main() -> None:
                     hs, as_ = int(float(fthg)), int(float(ftag))
                 except ValueError:
                     continue
-                out_rows.append({
+                rows.append({
                     "date": d,
                     "home_team": home,
                     "away_team": away,
@@ -122,23 +203,208 @@ def main() -> None:
                     "ps_draw": _first_float(r, ("PSCD", "PSD", "B365D", "AvgD", "BbAvD")),
                     "ps_away": _first_float(r, ("PSCA", "PSA", "B365A", "AvgA", "BbAvA")),
                 })
-            print(f"  {season} {div}->{league}: +{len(out_rows) - n_before} matches")
+            fetched.add((league, season))
+            print(f"  {season} {div}->{league}: +{len(rows) - n_before} matches")
+    return rows, fetched
 
-    if not out_rows:
-        print("no rows fetched — aborting (network? season codes?)")
+
+def _fetch_fallback_current(dataset_names, present_keys):
+    """football-data.org FINISHED results for the CURRENT season.
+
+    Maps football-data.org names -> dataset (.co.uk) names via the market
+    matcher's alias resolver so a club's history is not split across two keys.
+    Only adds fixtures not already present (``present_keys``). Returns
+    ``(rows, report)`` where ``report`` records coverage and any unmapped club.
+    """
+    import asyncio
+
+    from betbot.config import LEAGUE_CODES, get_settings
+    from betbot.exchanges.matcher import TeamAliasResolver, normalize
+    from betbot.data.football_data import FootballDataClient
+
+    settings = get_settings()
+    resolver = TeamAliasResolver.from_yaml("config/team_aliases.yaml")
+    # normalised dataset name -> canonical dataset spelling (for exact hits).
+    norm_to_dataset = {}
+    for n in dataset_names:
+        norm_to_dataset.setdefault(normalize(n), n)
+    dataset_list = list(dataset_names)
+
+    leagues = tuple(c for c in LEAGUE_CODES if c not in ("WC", "CL"))
+    # First of July of the current season's start year bounds the window.
+    start_year = 2000 + int(CURRENT_SEASON[:2])
+    date_from = f"{start_year}-07-01"
+    date_to = datetime.now(timezone.utc).date().isoformat()
+
+    def _resolve(name):
+        nf = normalize(name)
+        return norm_to_dataset.get(nf) or resolver.match(name, dataset_list)
+
+    async def _run():
+        rows = []
+        unmapped = []
+        mapped = 0
+        async with FootballDataClient(
+            api_key=settings.football_data_api_key,
+            base_url=settings.football_data_base_url,
+            rate_limit_per_min=settings.football_data_rate_limit_per_min,
+        ) as client:
+            for league in leagues:
+                try:
+                    matches = await client.list_matches(
+                        league, date_from, date_to, status="FINISHED")
+                except Exception as e:  # noqa: BLE001 — one league failing isn't fatal
+                    print(f"  fallback {league}: FD.org error {type(e).__name__}: {e}")
+                    continue
+                added = 0
+                for m in matches:
+                    ft = (m.get("score") or {}).get("fullTime") or {}
+                    hs, as_ = ft.get("home"), ft.get("away")
+                    if hs is None or as_ is None:
+                        continue
+                    utc = m.get("utcDate") or ""
+                    d = utc[:10]
+                    if not d:
+                        continue
+                    raw_home = ((m.get("homeTeam") or {}).get("name") or "").strip()
+                    raw_away = ((m.get("awayTeam") or {}).get("name") or "").strip()
+                    if not (raw_home and raw_away):
+                        continue
+                    mh, ma = _resolve(raw_home), _resolve(raw_away)
+                    # Never let an unmapped club vanish: keep the FD.org name and
+                    # surface it so a human can add an alias.
+                    for raw, mapped_name in ((raw_home, mh), (raw_away, ma)):
+                        if mapped_name is None:
+                            unmapped.append(f"{raw} ({league})")
+                        else:
+                            mapped += 1
+                    row = {
+                        "date": d,
+                        "home_team": mh or raw_home,
+                        "away_team": ma or raw_away,
+                        "home_score": int(hs),
+                        "away_score": int(as_),
+                        "league": league,
+                        "ps_home": "",
+                        "ps_draw": "",
+                        "ps_away": "",
+                    }
+                    if _fixture_key(row) in present_keys:
+                        continue
+                    present_keys.add(_fixture_key(row))
+                    rows.append(row)
+                    added += 1
+                print(f"  fallback {league}: +{added} FINISHED matches (FD.org)")
+        total_names = mapped + len(unmapped)
+        coverage = (mapped / total_names) if total_names else 1.0
+        report = {
+            "mapped": mapped,
+            "unmapped": sorted(set(unmapped)),
+            "coverage": round(coverage, 4),
+            "rows": len(rows),
+        }
+        return rows, report
+
+    return asyncio.run(_run())
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--seasons", nargs="+", default=list(DEFAULT_SEASONS))
+    ap.add_argument("--out", type=Path, default=Path("data/club_results.csv"))
+    ap.add_argument("--timeout", type=int, default=60)
+    ap.add_argument("--no-fallback", action="store_true",
+                    help="skip the football-data.org current-season fallback.")
+    args = ap.parse_args()
+
+    existing = _load_existing(args.out)
+    couk_rows, fetched = _fetch_couk(args.seasons, args.timeout)
+
+    # Merge: start from last-known-good, drop partitions .co.uk just replaced,
+    # then add the fresh .co.uk rows. A partition whose fetch FAILED keeps its
+    # existing rows rather than vanishing.
+    merged = [
+        r for r in existing
+        if (r["league"], _season_code(r["date"])) not in fetched
+    ]
+    merged.extend(couk_rows)
+
+    couk_has_current = any(s == CURRENT_SEASON for (_lg, s) in fetched)
+    report = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "couk_ok": bool(couk_rows),
+        "couk_has_current": couk_has_current,
+        "fallback_used": False,
+        "mapped": 0,
+        "unmapped": [],
+        "coverage": None,
+        "fallback_rows": 0,
+    }
+
+    # Current-season fallback: whenever .co.uk did not serve the current season.
+    if not args.no_fallback and not couk_has_current:
+        present = {_fixture_key(r) for r in merged}
+        dataset_names = (
+            {r["home_team"] for r in merged} | {r["away_team"] for r in merged}
+        )
+        print(f"\nfootball-data.co.uk missing season {CURRENT_SEASON} "
+              f"— falling back to football-data.org for current-season results")
+        try:
+            fb_rows, fb_report = _fetch_fallback_current(dataset_names, present)
+            merged.extend(fb_rows)
+            report.update(
+                fallback_used=True,
+                mapped=fb_report["mapped"],
+                unmapped=fb_report["unmapped"],
+                coverage=fb_report["coverage"],
+                fallback_rows=len(fb_rows),
+            )
+            print(f"  fallback added {len(fb_rows)} rows; "
+                  f"name-map coverage {fb_report['coverage']:.1%} "
+                  f"({fb_report['mapped']} mapped, "
+                  f"{len(fb_report['unmapped'])} unmapped)")
+            if fb_report["unmapped"]:
+                print("  UNMAPPED CLUBS (kept under FD.org name, add aliases):")
+                for u in fb_report["unmapped"]:
+                    print(f"    - {u}")
+        except Exception as e:  # noqa: BLE001 — fallback failure must not wipe history
+            print(f"  fallback FAILED ({type(e).__name__}: {e}); "
+                  f"keeping last-known-good rows")
+
+    # Write the coverage report for the daemon to page on (best-effort).
+    try:
+        REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        REPORT_PATH.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    except OSError as e:
+        print(f"  could not write {REPORT_PATH}: {e}")
+
+    if not merged:
+        print("no rows (fetch failed AND no existing file) — aborting")
         sys.exit(1)
 
-    out_rows.sort(key=lambda r: (r["date"], r["league"]))
+    # Dedupe (existing + fresh could overlap on a partial partition) and sort.
+    seen = set()
+    deduped = []
+    for r in merged:
+        k = _fixture_key(r)
+        if k in seen:
+            continue
+        seen.add(k)
+        deduped.append(r)
+    deduped.sort(key=lambda r: (r["date"], r["league"]))
+
+    fieldnames = ["date", "home_team", "away_team", "home_score",
+                  "away_score", "league", "ps_home", "ps_draw", "ps_away"]
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(out_rows[0].keys()))
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         w.writeheader()
-        w.writerows(out_rows)
+        w.writerows(deduped)
 
-    leagues = sorted({r["league"] for r in out_rows})
-    seasons = sorted({r["date"][:4] for r in out_rows})
-    teams = {r["home_team"] for r in out_rows} | {r["away_team"] for r in out_rows}
-    print(f"\nwrote {args.out}: {len(out_rows)} matches, "
+    leagues = sorted({r["league"] for r in deduped})
+    seasons = sorted({r["date"][:4] for r in deduped})
+    teams = {r["home_team"] for r in deduped} | {r["away_team"] for r in deduped}
+    print(f"\nwrote {args.out}: {len(deduped)} matches, "
           f"{len(teams)} clubs, leagues={leagues}, years={seasons}")
 
 
