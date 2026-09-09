@@ -1177,6 +1177,10 @@ async def run_result_alerts(
     operator_id = settings.telegram_allowed_user_id
     sent = 0
     suppressed = 0
+    # Fetched once: the OPTIONAL group/channel broadcast target. Same
+    # semantics as the pre-match high-conf broadcast (send_prediction_alert)
+    # and the morning notice -- BROADCAST-ONLY, no reveal/charge/free-draw.
+    broadcast_chat_id = getattr(settings, "broadcast_chat_id", None)
     for row in pending:
         pred = prediction_fn(row.fixture_id)
 
@@ -1245,6 +1249,30 @@ async def run_result_alerts(
             competition_code=getattr(row, "competition_code", None),
             sold_triple=sold_triple(row.fixture_id),
         )
+
+        # Group broadcast (BROADCAST-ONLY): the SAME result body ALSO goes to
+        # the configured group when set, mirroring the pre-match high-conf
+        # broadcast. This point is reached ONLY for fixtures that passed the
+        # high-conf gate (or were ever revealed), so the group sees exactly
+        # the calls it was alerted pre-match -- no result for a fixture it
+        # never heard of. NO reveal row, charge, or free-limit draw (the
+        # paywall keys on telegram_user_id) and DELIBERATELY not counted in
+        # ``sent``. A group failure is fully isolated from DM delivery and
+        # never touches the result_notified flag (driven solely by DM
+        # any_success below). Default unset -> skipped, byte-identical.
+        if broadcast_chat_id:
+            try:
+                if await send(settings, int(broadcast_chat_id), body):
+                    log.info(
+                        "result_alert_broadcast_sent",
+                        fixture_id=row.fixture_id,
+                        chat_id=int(broadcast_chat_id),
+                    )
+            except Exception as e:  # noqa: BLE001 -- broadcast must never break DMs
+                log.warning(
+                    "result_alert_broadcast_failed",
+                    fixture_id=row.fixture_id, error=str(e),
+                )
 
         # Audience: the operator (always) + every user who saw this prediction.
         audience: list[int] = []

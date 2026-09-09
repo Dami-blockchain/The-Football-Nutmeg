@@ -2018,3 +2018,49 @@ def mark_morning_drop_notified(fixture_id: int) -> None:
         ).scalar_one_or_none()
         if row is not None:
             row.drop_notified = True
+
+
+def outcomes_settled_since(hours: int) -> list[PredictionOutcome]:
+    """Every scored outcome settled within the trailing ``hours`` (newest first).
+
+    RAW and UNFILTERED (no epoch / degenerate / club / season scoping): this
+    drives the score RE-VERIFICATION pass, which must be able to correct a
+    provisional-then-corrected scoreline on ANY settled fixture, not just the
+    ones a user-facing accuracy read would include.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    with session_scope() as s:
+        rows = list(
+            s.execute(
+                select(PredictionOutcome)
+                .where(PredictionOutcome.settled_at >= cutoff)
+                .order_by(PredictionOutcome.settled_at.desc())
+            ).scalars()
+        )
+        s.expunge_all()
+        return rows
+
+
+def refresh_outcome_goals(fixture_id: int, home_goals: int, away_goals: int) -> bool:
+    """Correct ONLY the stored scoreline of an already-scored outcome.
+
+    Goals-only by design: it never touches ``actual_outcome``/``correct``/the
+    Brier/RPS/log-loss metrics/ratings/the ``result_notified`` flag. Those all
+    derive from the WINNER, and the re-verification caller invokes this ONLY
+    when the source winner is UNCHANGED and just the goal count moved (the
+    observed provider-correction failure mode). Returns True iff a row existed
+    and its goals actually changed.
+    """
+    with session_scope() as s:
+        row = s.execute(
+            select(PredictionOutcome).where(
+                PredictionOutcome.fixture_id == fixture_id
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            return False
+        if row.home_goals == int(home_goals) and row.away_goals == int(away_goals):
+            return False
+        row.home_goals = int(home_goals)
+        row.away_goals = int(away_goals)
+        return True

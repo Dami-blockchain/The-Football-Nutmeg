@@ -29,6 +29,8 @@ from betbot.storage.repos import (
     rating_exists,
     record_prediction_outcome,
     record_settlement,
+    refresh_outcome_goals,
+    outcomes_settled_since,
     score_model_prediction,
     settled_pnl_window,
     trip_kill_switch,
@@ -313,6 +315,83 @@ class SettlementWatcher:
                         fixture_id=pred.fixture_id, error=str(e),
                     )
         return scored
+
+    async def reverify_recent_scores(
+        self, now: datetime | None = None, window_hours: int = 72
+    ) -> int:
+        """Re-check the source score for recently-settled outcomes and correct a
+        PROVISIONAL scoreline the provider later fixed.
+
+        football-data.org's free tier occasionally flips a match to FINISHED
+        carrying a PROVISIONAL fullTime score, then corrects it hours later
+        (observed 2026-09-08 fixture 575324: read 2-0 at 21:10 settlement,
+        corrected upstream to 1-0 ~3h later; and 564631 Real Madrid, 5-1 -> 4-1).
+        Because :func:`record_prediction_outcome` is one-shot (idempotent on
+        fixture_id) and never re-reads, the published scoreline stayed wrong.
+
+        This pass re-fetches every outcome settled within ``window_hours`` and:
+
+          * source winner UNCHANGED, goals differ -> correct the goals via
+            :func:`refresh_outcome_goals` and log ``outcome_score_corrected``.
+            Safe: the pick, the Brier/RPS/log-loss and the ratings all key off
+            the WINNER, so only the cosmetic scoreline changes.
+          * source winner CHANGED vs the stored outcome -> DO NOT silently
+            re-score. A post-full-time winner flip is rare and consequential
+            (it moves pick-correctness, the ratings already nudged, and any
+            RESULT ALERT already sent), so it is logged LOUD as
+            ``outcome_winner_conflict`` for the review gate rather than
+            auto-applied here.
+
+        Best-effort throughout: one bad fetch or row never aborts the pass.
+        Returns the number of scorelines corrected.
+        """
+        now = now or datetime.now(timezone.utc)
+        corrected = 0
+        for row in outcomes_settled_since(window_hours):
+            try:
+                match = await self._client.get_match(row.fixture_id)
+            except Exception as e:  # noqa: BLE001 — one bad fetch mustn't stop the pass
+                log.warning(
+                    "reverify_fetch_failed", fixture_id=row.fixture_id, error=str(e)
+                )
+                continue
+            if match is None or match.get("status") not in SETTLED_STATUSES:
+                continue
+            src_outcome = _WINNER_TO_OUTCOME.get(
+                (match.get("score") or {}).get("winner")
+            )
+            if src_outcome is None:
+                continue
+            if src_outcome.value != row.actual_outcome:
+                # Consequential: never auto-apply — surface for review.
+                log.warning(
+                    "outcome_winner_conflict",
+                    fixture_id=row.fixture_id,
+                    stored_outcome=row.actual_outcome,
+                    source_outcome=src_outcome.value,
+                )
+                continue
+            hg, ag = _final_goals(match)
+            if hg == row.home_goals and ag == row.away_goals:
+                continue
+            try:
+                changed = refresh_outcome_goals(row.fixture_id, hg, ag)
+            except Exception as e:  # noqa: BLE001 — one bad row mustn't stop the rest
+                log.warning(
+                    "reverify_update_failed", fixture_id=row.fixture_id, error=str(e)
+                )
+                continue
+            if changed:
+                corrected += 1
+                log.info(
+                    "outcome_score_corrected",
+                    fixture_id=row.fixture_id,
+                    stored=f"{row.home_goals}-{row.away_goals}",
+                    corrected=f"{hg}-{ag}",
+                )
+        if corrected:
+            log.info("reverify_scores_done", corrected=corrected)
+        return corrected
 
     def _evaluate_kill_switch(self) -> tuple[bool, float, float]:
         s = self._settings
