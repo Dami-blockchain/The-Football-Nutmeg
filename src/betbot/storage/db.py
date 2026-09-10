@@ -65,6 +65,11 @@ _ADDITIVE_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("prediction_outcomes", "source_last_updated", "VARCHAR(32)"),
     ("prediction_outcomes", "score_verified_at", "DATETIME"),
     ("prediction_outcomes", "score_verify_count", "INTEGER"),
+    # When the "dropped below the bar" notice was actually SENT (nullable,
+    # tz-aware). Distinct from drop_notified, which also flips on a consume;
+    # only a real send stamps this, so the recovery line can key off "a
+    # notice went out" exactly. Additive & nullable.
+    ("morning_notice_listings", "drop_notice_sent_at", "DATETIME"),
 )
 
 # Indexes for columns added by _ADDITIVE_COLUMNS. ``create_all`` only indexes

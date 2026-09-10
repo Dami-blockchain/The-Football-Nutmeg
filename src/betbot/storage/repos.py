@@ -1960,11 +1960,11 @@ def morning_listings_pending_by_ids(
 ) -> list[MorningNoticeListing]:
     """Pending (not yet drop-notified) morning listings for the given fixtures.
 
-    The EVENT-DRIVEN entry point: called the instant a fixture's confirmed-XI
-    (late) alert is suppressed, so it is scoped to that fixture and does NOT
-    apply the kickoff-window clause (the suppression itself proves the late-alert
-    lifecycle is over). Already-notified listings are excluded, so a re-fire is a
-    no-op.
+    The EVENT-DRIVEN entry point: called with the fixtures a scheduling pass
+    (plan hook, primary) or a fire-time suppression has judged currently below
+    the bar, so it is scoped to those ids and does NOT apply the kickoff-window
+    clause. A recovered fixture is still HONOURED (consumed, not sent) by the
+    caller. Already-notified listings are excluded, so a re-fire is a no-op.
     """
     if not fixture_ids:
         return []
@@ -2011,9 +2011,48 @@ def morning_listings_pending_drop_notice(
         return rows
 
 
+def morning_listing_drop_notice_sent(fixture_id: int) -> bool:
+    """True iff a drop notice was actually SENT for this morning-listed fixture.
+
+    Reads ``drop_notice_sent_at`` (set ONLY by the send branch of
+    run_morning_drop_notices), NOT ``drop_notified`` — the latter also flips on
+    a HONOURED consume (gate re-passed, or the fixture was ever revealed) and on
+    a no-audience consume, none of which put a notice in front of a user. The
+    LATE-alert recovery line keys off THIS so it can never tell a user "this was
+    below our bar in the earlier notice" when no notice was ever sent.
+    """
+    with session_scope() as s:
+        val = s.execute(
+            select(MorningNoticeListing.drop_notice_sent_at)
+            .where(MorningNoticeListing.fixture_id == fixture_id)
+        ).scalar_one_or_none()
+        return val is not None
+
+
+def mark_morning_drop_notice_sent(fixture_id: int, when: datetime | None = None) -> None:
+    """Record that a drop notice actually WENT OUT: set ``drop_notified`` (the
+    deliver-once flag) AND stamp ``drop_notice_sent_at`` in ONE session, so a
+    crash can never leave the benign-but-untidy split state
+    (drop_notified=True, sent_at=NULL). Called only from the send branch; a
+    consume uses :func:`mark_morning_drop_notified` (flag only). Idempotent-safe.
+    """
+    when = when or datetime.now(timezone.utc)
+    with session_scope() as s:
+        row = s.execute(
+            select(MorningNoticeListing)
+            .where(MorningNoticeListing.fixture_id == fixture_id)
+        ).scalar_one_or_none()
+        if row is not None:
+            row.drop_notified = True
+            row.drop_notice_sent_at = when
+
+
 def mark_morning_drop_notified(fixture_id: int) -> None:
-    """Flag a morning-listed fixture as handled by the drop path so it is never
-    re-queued (a real send, or a deliberate consume)."""
+    """Flag a morning-listed fixture as HANDLED by the drop path (the
+    deliver-once / idempotency flag) so it is never re-queued. Set on EITHER a
+    real send OR a deliberate consume, so it does NOT by itself mean a notice
+    reached a user — that is ``drop_notice_sent_at`` (see
+    :func:`mark_morning_drop_notice_sent` / :func:`morning_listing_drop_notice_sent`)."""
     with session_scope() as s:
         row = s.execute(
             select(MorningNoticeListing)

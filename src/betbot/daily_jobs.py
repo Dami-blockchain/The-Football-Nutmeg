@@ -51,6 +51,8 @@ from betbot.storage.repos import (
     increment_predictions_consumed,
     list_users,
     mark_morning_drop_notified,
+    mark_morning_drop_notice_sent,
+    morning_listing_drop_notice_sent,
     morning_listings_pending_drop_notice,
     predictions_for_kickoff_range,
     prediction_for_fixture,
@@ -522,13 +524,17 @@ async def run_morning_drop_notices(
     suppressed and nothing is sent. This reconciler closes that gap.
 
     TWO entry points, both landing here:
-      * EVENT-DRIVEN (``fixture_ids`` set): called the instant the confirmed-XI
-        (late) alert is SUPPRESSED for a fixture, so the notice lands at ~KO-10
-        rather than on a clock sweep. There is no race with a drift-back-up: a
-        fixture that climbed back above 0.65 by then PASSES the late gate and
-        fires the normal alert, so it never reaches this call.
+      * EVENT-DRIVEN (``fixture_ids`` set): the PRIMARY trigger is PLAN time —
+        _schedule_kickoff_alerts_locked passes the gate-failing fixture ids the
+        instant they drop (a sub-threshold fixture gets no alert job, so a
+        fire-time hook never runs for it). The fire-time hook calls this too as
+        a SECONDARY catch (passed-at-plan, drifted-at-fire). A fixture that has
+        since drifted back above the bar is HONOURED (consumed, no send) by the
+        predicate below, so a drop then a later recovery sends the notice once
+        and then the real call (which carries a recovery line) — coherent, not
+        a race.
       * SWEEP (``fixture_ids`` None): the periodic RETRY safety-net — retries a
-        send that failed and catches any listing whose late job never fired,
+        send that failed and catches any listing whose alert jobs never fired,
         bounded to listings whose late-alert time (KO - lineup_confirm_lead) has
         passed.
 
@@ -576,8 +582,11 @@ async def run_morning_drop_notices(
     async with _DROP_NOTICE_LOCK:
         if fixture_ids is not None:
             # Event-driven: reconcile exactly the fixture(s) whose late alert just
-            # got suppressed. Scoped by id, no kickoff-window clause (the suppression
-            # proves the late-alert lifecycle is over); already-notified -> no-op.
+            # is currently below the bar. Scoped by id, no kickoff-window clause:
+            # the caller (plan hook = primary, or fire hook) has judged it below
+            # the bar NOW; the honoured-consume predicate below still lets a
+            # recovered fixture be consumed rather than sent. Already-notified
+            # -> no-op (idempotent).
             from betbot.storage.repos import morning_listings_pending_by_ids
             pending = list(morning_listings_pending_by_ids(fixture_ids))
         else:
@@ -652,7 +661,12 @@ async def run_morning_drop_notices(
             # the fixture stays pending for the next tick's retry inside the bounded
             # window — better a retry than a "sent" that nobody received.
             if any_success or group_success:
-                mark_fn(listing.fixture_id)
+                # ONE session: set the deliver-once flag AND stamp
+                # drop_notice_sent_at atomically, so a crash can never leave
+                # drop_notified=True with sent_at NULL. The recovery line keys
+                # off sent_at (a real send), never the shared flag (a consume
+                # sets that too).
+                mark_morning_drop_notice_sent(listing.fixture_id, now)
                 log.info(
                     "morning_drop_notice_sent",
                     fixture_id=listing.fixture_id,
@@ -808,6 +822,17 @@ HIGH_CONF_DOWNGRADE_NOTE = (
     "ℹ️ Update: since this call was first flagged, a fresh model run has eased "
     "it below our high-confidence bar. We're still sending it, and the "
     "full-time result will follow."
+)
+
+
+#: Rides on the LATE (confirmed-XI) high-confidence alert when a fixture that
+#: got an EARLY drop notice has since recovered above the bar. Makes the
+#: sequence "drop notice at KO-55 -> real call at KO-10" read as one coherent
+#: story rather than a contradiction.
+HIGH_CONF_RECOVERY_NOTE = (
+    "\U0001f504 Update: this was below our high-confidence bar in the earlier "
+    "notice, but a fresh model run has lifted it back above \u2014 so the "
+    "call is ON."
 )
 
 
@@ -998,6 +1023,25 @@ async def send_prediction_alert(
                 pred, settings, market=None,
                 live_tally=tally, live_tally_sold=tally_sold,
             )
+            # Recovery acknowledgement: if a drop notice was actually SENT for
+            # this fixture (it dropped below the bar earlier) but it has since
+            # climbed back above by this LATE (confirmed-XI) fire, say so
+            # plainly so the earlier "no call" note and this call read
+            # coherently. Keys off drop_notice_sent_at (a real send), NOT the
+            # drop_notified flag which a HONOURED/ever-revealed consume also
+            # sets — so a fixture merely consumed (no notice sent) never
+            # carries a spurious recovery line. Best-effort, never blocks.
+            if alert_tag == "late":
+                try:
+                    if morning_listing_drop_notice_sent(fixture_id):
+                        high_conf_body = (
+                            f"{high_conf_body}\n\n{HIGH_CONF_RECOVERY_NOTE}"
+                        )
+                except Exception as e:  # noqa: BLE001 — never block the alert
+                    log.warning(
+                        "recovery_note_check_failed",
+                        fixture_id=fixture_id, error=str(e),
+                    )
 
     sent = 0
     for user in users_fn():
