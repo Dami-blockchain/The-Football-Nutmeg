@@ -477,6 +477,18 @@ def plan_kickoff_alert_jobs(settings, preds, now, *, log_suppressed: bool = Fals
     return plan
 
 
+def suppressed_fixture_ids(settings, preds) -> list[int]:
+    """Fixture ids in ``preds`` that FAIL the high-conviction alert gate.
+
+    Exactly the set :func:`plan_kickoff_alert_jobs` drops (yields no jobs
+    for), pulled out pure so the drop-notice plan hook's selection is
+    unit-testable. Empty when the gate is off (every fixture passes).
+    """
+    return [
+        p.fixture_id for p in preds if not high_conf_alert_passes(settings, p)[0]
+    ]
+
+
 def drop_alert_jobs(scheduler, fixture_ids) -> list[str]:
     """Remove both pre-match jobs for each fixture. Returns the ids removed.
 
@@ -1330,29 +1342,8 @@ def run_daemon(
             # Same gate function as the planner (single source of truth); with
             # the flag OFF every fixture passes, so suppressed is 0 and the line
             # is byte-identical to before.
-            suppressed_ids = [
-                p.fixture_id for p in preds if not high_conf_alert_passes(_s, p)[0]
-            ]
+            suppressed_ids = suppressed_fixture_ids(_s, preds)
             suppressed = len(suppressed_ids)
-            # PRIMARY drop-notice trigger: PLAN time is the true drop moment.
-            # A sub-threshold fixture yields NO alert job (plan_kickoff_alert_jobs
-            # skips it), so the fire-time hook never runs for it — the reason the
-            # relocated fire-time hook was dead in production (1,364 plan-time
-            # suppressions, 0 at fire). This planning pass runs at daemon start,
-            # daily at 05:00, AND hourly via the coverage watchdog, so a listed
-            # fixture is drop-noticed within the hour it drops rather than at the
-            # KO-10 sweep (which on 2026-09-09 fired 4 min AFTER kickoff).
-            # run_morning_drop_notices is idempotent (drop_notified) and honours
-            # a fixture that still clears the gate, so re-running it every pass
-            # with the current sub-threshold set sends each drop exactly once.
-            if suppressed_ids:
-                try:
-                    await run_morning_drop_notices(_s, fixture_ids=suppressed_ids)
-                except Exception as e:  # noqa: BLE001 — never crash scheduling
-                    get_logger(__name__).warning(
-                        "morning_drop_notice_plan_hook_failed",
-                        fixtures=suppressed_ids, error=str(e),
-                    )
             scheduled = 0
             for job_id, run_at in plan:
                 # job_id is predict_early_<fid> / predict_late_<fid>; recover the
@@ -1376,6 +1367,27 @@ def run_daemon(
                 scheduled=scheduled,
                 suppressed=suppressed,
             )
+            # PRIMARY drop-notice trigger, fired AFTER the alert jobs are on the
+            # scheduler so a slow/hanging Telegram send can never delay
+            # registration of the money-path alert jobs above. PLAN time is the
+            # true drop moment: a sub-threshold fixture yields NO alert job
+            # (plan_kickoff_alert_jobs skips it), so the fire-time hook never runs
+            # for it (dead in production: 1,364 plan suppressions, 0 at fire).
+            # This pass runs at daemon start, 05:00, AND hourly via the coverage
+            # watchdog, so a listed fixture is drop-noticed within the hour it
+            # drops, not at the KO-10 sweep (which on 2026-09-09 fired 4 min AFTER
+            # kickoff). run_morning_drop_notices is idempotent (drop_notified) and
+            # honours a fixture still clearing the gate, so re-running it every
+            # pass sends each drop exactly once. suppressed_ids stays valid here:
+            # preds is unchanged by the registration loop.
+            if suppressed_ids:
+                try:
+                    await run_morning_drop_notices(_s, fixture_ids=suppressed_ids)
+                except Exception as e:  # noqa: BLE001 — never crash scheduling
+                    get_logger(__name__).warning(
+                        "morning_drop_notice_plan_hook_failed",
+                        fixtures=suppressed_ids, error=str(e),
+                    )
             # Self-check: everything we just planned must actually be on the
             # scheduler. A pass that quietly schedules nothing is the failure
             # mode that hid this bug for days, so it is now loud.
@@ -1527,12 +1539,13 @@ def run_daemon(
             id="score_reverification",
         )
         # Periodic (every 15m) RETRY SAFETY-NET for the morning drop notice. The
-        # notice is delivered EVENT-DRIVEN at the EARLY suppression (~KO-55, or
-        # KO-70 for the PL), with the late suppression as an idempotent backstop
-        # (see _fire_prediction_alert). This sweep is the FINAL backstop: it
-        # retries a send that failed and catches a listing whose alert jobs never
-        # fired at all, bounded to listings whose late-alert time
-        # (KO - lineup_confirm_lead) has passed. Cheap, FREE, idempotent.
+        # notice is delivered EVENT-DRIVEN at PLAN time (the primary hook, every
+        # scheduling pass) with the fire-time suppression as a secondary catch
+        # (see _schedule_kickoff_alerts_locked / _fire_prediction_alert). This
+        # sweep is the FINAL backstop: it retries a send that failed and catches
+        # a listing whose scheduling passes never ran at all, bounded to listings
+        # whose late-alert time (KO - lineup_confirm_lead) has passed — the last
+        # instant the honoured-consume is safe. Cheap, FREE, idempotent.
         add_async_job(
             scheduler,
             _morning_drop_notice_tick,

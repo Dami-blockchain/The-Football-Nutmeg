@@ -51,8 +51,8 @@ from betbot.storage.repos import (
     increment_predictions_consumed,
     list_users,
     mark_morning_drop_notified,
+    mark_morning_drop_notice_sent,
     morning_listing_drop_notice_sent,
-    record_drop_notice_sent,
     morning_listings_pending_drop_notice,
     predictions_for_kickoff_range,
     prediction_for_fixture,
@@ -524,14 +524,15 @@ async def run_morning_drop_notices(
     suppressed and nothing is sent. This reconciler closes that gap.
 
     TWO entry points, both landing here:
-      * EVENT-DRIVEN (``fixture_ids`` set): called the instant a listed
-        fixture is SUPPRESSED at the EARLY gate (~KO-55, or KO-70 for the PL) —
-        the primary trigger — and again at the LATE gate as an idempotent
-        backstop for a missed early job. A fixture that has since drifted back
-        above the bar is HONOURED (consumed, no send) by the predicate below,
-        so an early drop followed by a late recovery sends the drop notice once
-        and then the real call (which carries a recovery line) — a coherent
-        sequence, deliberately, not a race.
+      * EVENT-DRIVEN (``fixture_ids`` set): the PRIMARY trigger is PLAN time —
+        _schedule_kickoff_alerts_locked passes the gate-failing fixture ids the
+        instant they drop (a sub-threshold fixture gets no alert job, so a
+        fire-time hook never runs for it). The fire-time hook calls this too as
+        a SECONDARY catch (passed-at-plan, drifted-at-fire). A fixture that has
+        since drifted back above the bar is HONOURED (consumed, no send) by the
+        predicate below, so a drop then a later recovery sends the notice once
+        and then the real call (which carries a recovery line) — coherent, not
+        a race.
       * SWEEP (``fixture_ids`` None): the periodic RETRY safety-net — retries a
         send that failed and catches any listing whose alert jobs never fired,
         bounded to listings whose late-alert time (KO - lineup_confirm_lead) has
@@ -581,8 +582,11 @@ async def run_morning_drop_notices(
     async with _DROP_NOTICE_LOCK:
         if fixture_ids is not None:
             # Event-driven: reconcile exactly the fixture(s) whose late alert just
-            # got suppressed. Scoped by id, no kickoff-window clause (the suppression
-            # proves the late-alert lifecycle is over); already-notified -> no-op.
+            # is currently below the bar. Scoped by id, no kickoff-window clause:
+            # the caller (plan hook = primary, or fire hook) has judged it below
+            # the bar NOW; the honoured-consume predicate below still lets a
+            # recovered fixture be consumed rather than sent. Already-notified
+            # -> no-op (idempotent).
             from betbot.storage.repos import morning_listings_pending_by_ids
             pending = list(morning_listings_pending_by_ids(fixture_ids))
         else:
@@ -657,11 +661,12 @@ async def run_morning_drop_notices(
             # the fixture stays pending for the next tick's retry inside the bounded
             # window — better a retry than a "sent" that nobody received.
             if any_success or group_success:
-                mark_fn(listing.fixture_id)
-                # Stamp the SEND (not a consume) so the late-alert recovery
-                # line keys off "a notice actually went out", never off the
-                # shared drop_notified flag (which a consume also sets).
-                record_drop_notice_sent(listing.fixture_id, now)
+                # ONE session: set the deliver-once flag AND stamp
+                # drop_notice_sent_at atomically, so a crash can never leave
+                # drop_notified=True with sent_at NULL. The recovery line keys
+                # off sent_at (a real send), never the shared flag (a consume
+                # sets that too).
+                mark_morning_drop_notice_sent(listing.fixture_id, now)
                 log.info(
                     "morning_drop_notice_sent",
                     fixture_id=listing.fixture_id,

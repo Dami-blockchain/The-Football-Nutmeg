@@ -47,13 +47,37 @@ def _clearing():
     return _Pred(fixture_id=1, p_home=0.72, p_draw=0.18, p_away=0.10, kickoff=KO)
 
 
-def _mk_pred(ph, pd, pa):
+def _mk_pred(ph, pd, pa, fixture_id=99):
     from types import SimpleNamespace
 
     return SimpleNamespace(
-        home_team="Man City", away_team="Arsenal",
+        fixture_id=fixture_id, home_team="Man City", away_team="Arsenal",
         p_home=ph, p_draw=pd, p_away=pa, competition_code="PL",
     )
+
+
+# ----------------------------------------------------------------------
+# The pure selection helper the plan hook uses (unit-testable extraction)
+# ----------------------------------------------------------------------
+def test_suppressed_fixture_ids_selects_gate_failures(settings):
+    from betbot.main import suppressed_fixture_ids
+
+    object.__setattr__(settings, "high_conf_alerts_only", True)
+    object.__setattr__(settings, "high_conf_alert_min_p", 0.65)
+    preds = [
+        _mk_pred(0.72, 0.18, 0.10, fixture_id=1),  # passes
+        _mk_pred(0.60, 0.25, 0.15, fixture_id=2),  # fails: below bar
+        _mk_pred(0.20, 0.70, 0.10, fixture_id=3),  # fails: draw-topped
+    ]
+    assert suppressed_fixture_ids(settings, preds) == [2, 3]
+
+
+def test_suppressed_fixture_ids_empty_when_gate_off(settings):
+    from betbot.main import suppressed_fixture_ids
+
+    object.__setattr__(settings, "high_conf_alerts_only", False)
+    preds = [_mk_pred(0.40, 0.35, 0.25, fixture_id=1)]
+    assert suppressed_fixture_ids(settings, preds) == []
 
 
 def _drop_notified(fixture_id):
