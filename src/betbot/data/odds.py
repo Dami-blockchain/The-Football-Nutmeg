@@ -397,6 +397,15 @@ class OddsService:
                 log.debug("odds_rate_limited", provider_count=len(self._providers))
                 return sum(len(v) for v in self._index.values())
             self._last_request_at = self._clock()
+            # Coverage counters are lifetime running totals on the provider, so
+            # snapshot them here to report THIS refresh's delta (see the empty
+            # branch below — the per-refresh split is the actionable signal).
+            before_attempted = sum(
+                int(getattr(p, "attempted_fixtures", 0) or 0) for p in self._providers
+            )
+            before_skipped = sum(
+                int(getattr(p, "skipped_fixtures", 0) or 0) for p in self._providers
+            )
             rows: list[MatchOdds] = []
             any_success = False  # >=1 provider WAS reached (rows or empty list)
             for provider in self._providers:
@@ -470,20 +479,31 @@ class OddsService:
                 # first real card is picked up at the very next call, not up to
                 # a full TTL later.
                 #
-                # ``attempted_fixtures`` is the tell: 0 means the file carried no
-                # card for us at all (the incident), vs a real card we merely
-                # failed to name-resolve. (Note: the provider accumulates this
-                # counter across the process lifetime, so read it as a running
-                # total in the long-lived daemon, not a per-refresh count.)
-                attempted = sum(
+                # This log is the operator's one Saturday-morning instrument, so
+                # report THIS refresh's coverage, not the provider's lifetime
+                # totals (which stop meaning anything after the first card). Read
+                # the two numbers together:
+                #   attempted_this_refresh == 0  -> the file carried no in-scope
+                #       card for us at all (the 10 Sep incident): nothing to do,
+                #       retaining the last-good index is correct.
+                #   attempted == skipped  > 0    -> the file DID list in-scope
+                #       fixtures but every one failed name resolution: the index
+                #       is empty for a fixable reason. Go run audit_odds_aliases
+                #       and grow the alias table — this is the actionable case.
+                attempted_this_refresh = sum(
                     int(getattr(p, "attempted_fixtures", 0) or 0)
                     for p in self._providers
-                )
+                ) - before_attempted
+                skipped_this_refresh = sum(
+                    int(getattr(p, "skipped_fixtures", 0) or 0)
+                    for p in self._providers
+                ) - before_skipped
                 retained = sum(len(v) for v in self._index.values())
                 log.warning(
                     "odds_refresh_empty_cache_retained",
                     retained_rows=retained,
-                    attempted_fixtures=attempted,
+                    attempted_this_refresh=attempted_this_refresh,
+                    skipped_this_refresh=skipped_this_refresh,
                 )
                 return retained
             self._reindex(rows)

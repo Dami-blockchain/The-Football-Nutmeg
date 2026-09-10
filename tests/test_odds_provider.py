@@ -320,6 +320,32 @@ def test_reached_but_empty_keeps_prior_index_and_does_not_advance_ttl():
     assert svc._is_stale() is True, "an empty refresh must NOT advance the TTL"
 
 
+def test_empty_refresh_logs_this_refresh_coverage_not_lifetime_totals():
+    """The provider's coverage counters are lifetime running totals, so the
+    empty-cache log must report THIS refresh's delta: after a first prime that
+    saw an in-scope card (attempted lifetime >= 1), an empty refresh must log
+    ``attempted_this_refresh == 0`` — the operator's tell that the file carried
+    no card for us, distinct from a card that failed name resolution. Logging
+    the cumulative counter here would read >= 1 and mislead the go/no-go call."""
+    import structlog
+
+    now = [1000.0]
+    state = {"payload": FIXTURES_CSV}
+    provider = _switchable_provider(state)
+    svc = OddsService(_FastRetry(), providers=[provider], clock=lambda: now[0])
+    assert asyncio.run(svc.prime(["PD"])) >= 1
+    assert provider.attempted_fixtures >= 1, "the first card must bump the lifetime total"
+
+    now[0] += 20.0
+    state["payload"] = _EMPTY_FIXTURES
+    with structlog.testing.capture_logs() as logs:
+        asyncio.run(svc.prime(["PD"]))
+    evt = next(e for e in logs if e.get("event") == "odds_refresh_empty_cache_retained")
+    assert evt["attempted_this_refresh"] == 0, "no in-scope card was seen this refresh"
+    assert evt["skipped_this_refresh"] == 0
+    assert evt["retained_rows"] >= 1, "the last-good index is what we retained"
+
+
 def test_retry_backoff_respects_min_interval_after_a_failure():
     calls: list[str] = []
     now = [1000.0]
