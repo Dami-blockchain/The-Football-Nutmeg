@@ -149,9 +149,15 @@ class OddsProvider(Protocol):
         MUST NOT raise. Returns ``None`` when the source could not be REACHED
         (HTTP error, timeout, DNS) — distinct from ``[]`` which means the
         source WAS reached and legitimately lists no in-scope fixtures. The
-        shared service keeps its last-good cache on ``None`` and only replaces
-        it on a genuine (possibly empty) refresh; conflating the two is what
-        let a feed outage silently wipe a whole matchday's anchors (Defect A).
+        shared service keeps its last-good cache on BOTH: ``None`` (unreachable)
+        and ``[]`` (reached-but-empty) each retain the prior index and leave the
+        TTL un-advanced; only a NON-empty refresh replaces it. The reachability
+        split still matters — it is what makes a non-empty parse trustworthy —
+        but an empty parse no longer touches the index, because fixtures.csv is
+        a rolling ~3-day window that is routinely empty for our leagues between
+        rounds and during international breaks, and replacing on empty was
+        losing a matchday's anchors whenever the feed served an older/emptier
+        snapshot (the 10 Sep incident; the wider Defect A).
         """
         ...
 
@@ -428,12 +434,56 @@ class OddsService:
                 # the calendar rolls past the cached fixtures they simply stop
                 # matching and the anchor degrades to the safe ``no_quote``
                 # (unanchored) path — a stale index goes useless, never wrong.
-                # Do not add a cap without first defeating that date guard.
+                # Do not add a cap without first defeating that date guard. This
+                # applies verbatim to the reached-but-empty branch below, which
+                # retains the index for the same reason: the next non-empty
+                # in-scope parse replaces the WHOLE index via ``_reindex``, so a
+                # retained index is self-limiting either way.
                 retained = sum(len(v) for v in self._index.values())
                 log.warning(
                     "odds_refresh_failed_cache_retained",
                     providers=len(self._providers),
                     retained_rows=retained,
+                )
+                return retained
+            if not rows:
+                # REACHED but no in-scope fixtures. This is fixtures.csv's NORMAL
+                # state, not a defect: it is a rolling ~3-day window, not a weekly
+                # card, so "empty for our leagues" is expected between rounds and
+                # throughout every international break (four a season). RETAIN the
+                # last-good index and do NOT advance ``_loaded_at`` — replacing on
+                # empty loses a matchday's anchors whenever the feed regresses to
+                # an older/emptier snapshot (the 10 Sep incident: a recovered file
+                # of 19 rows, ALL out-of-scope divisions, zero top-5 fixtures).
+                #
+                # "Lag vs genuinely empty" is unanswerable from the file and does
+                # not need answering: ``quote`` date-guards to
+                # ``odds_max_date_slack_days``, so a retained non-empty index is
+                # INERT when nothing in scope falls inside that window — it goes
+                # useless, never wrong (see the staleness note above, which
+                # covers this branch too). ``_last_request_at`` (bumped above)
+                # throttles retries at the 60s min-interval, exactly as the
+                # unreachable branch does.
+                #
+                # A COLD start into an empty file lands here with an empty index:
+                # nothing to retain, but ``_loaded_at`` stays ``None`` so the
+                # first real card is picked up at the very next call, not up to
+                # a full TTL later.
+                #
+                # ``attempted_fixtures`` is the tell: 0 means the file carried no
+                # card for us at all (the incident), vs a real card we merely
+                # failed to name-resolve. (Note: the provider accumulates this
+                # counter across the process lifetime, so read it as a running
+                # total in the long-lived daemon, not a per-refresh count.)
+                attempted = sum(
+                    int(getattr(p, "attempted_fixtures", 0) or 0)
+                    for p in self._providers
+                )
+                retained = sum(len(v) for v in self._index.values())
+                log.warning(
+                    "odds_refresh_empty_cache_retained",
+                    retained_rows=retained,
+                    attempted_fixtures=attempted,
                 )
                 return retained
             self._reindex(rows)

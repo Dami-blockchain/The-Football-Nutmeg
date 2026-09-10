@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import date
+from pathlib import Path
 
 import pytest
 
@@ -295,20 +296,28 @@ def test_503_mid_session_keeps_prior_index_and_does_not_advance_ttl():
     assert svc._is_stale() is True
 
 
-def test_genuinely_empty_upstream_empties_cache_and_advances_ttl():
+def test_reached_but_empty_keeps_prior_index_and_does_not_advance_ttl():
+    """INVERTED (was ...empties_cache_and_advances_ttl). A reached-but-empty
+    file is fixtures.csv's NORMAL between-rounds / international-break state, not
+    a genuine "no more fixtures ever" signal: replacing the cache on it lost a
+    whole matchday's anchors whenever the feed regressed to an older/emptier
+    snapshot (the 10 Sep incident). It must now be treated like a 503 — retain
+    the last-good index and do NOT advance the TTL. ``quote``'s date guard makes
+    the retained index inert once nothing in scope is in range, so a stale index
+    goes useless, never wrong."""
     now = [1000.0]
     state = {"payload": FIXTURES_CSV}
     svc = OddsService(_FastRetry(), providers=[_switchable_provider(state)],
                       clock=lambda: now[0])
-    assert asyncio.run(svc.prime(["PD"])) >= 1
+    primed = asyncio.run(svc.prime(["PD"]))
+    assert primed >= 1 and _vallecano(svc) is not None
 
-    # A reached-but-empty file is a SUCCESSFUL refresh that legitimately lists
-    # no fixtures — it replaces the cache and advances the TTL, unlike a 503.
     now[0] += 20.0
     state["payload"] = _EMPTY_FIXTURES
-    assert asyncio.run(svc.prime(["PD"])) == 0
-    assert _vallecano(svc) is None, "an empty refresh clears the cache"
-    assert svc._is_stale() is False, "an empty refresh still advances the TTL"
+    retained = asyncio.run(svc.prime(["PD"]))
+    assert retained == primed, "a reached-but-empty refresh must NOT wipe the index"
+    assert _vallecano(svc) is not None, "the primed quote must still be served"
+    assert svc._is_stale() is True, "an empty refresh must NOT advance the TTL"
 
 
 def test_retry_backoff_respects_min_interval_after_a_failure():
@@ -370,3 +379,55 @@ def test_malformed_200_keeps_prior_index_like_a_503():
     assert retained == primed, "a malformed body must NOT wipe the index"
     assert _vallecano(svc) is not None
     assert svc._is_stale() is True, "TTL must not advance on a malformed body"
+
+
+def test_empty_then_nonempty_replaces_the_index():
+    """The retain-on-empty rule must NOT strand a stale card: the very next
+    NON-empty in-scope refresh replaces the whole index and advances the TTL."""
+    now = [1000.0]
+    state = {"payload": _EMPTY_FIXTURES}  # first refresh is reached-but-empty
+    svc = OddsService(_FastRetry(), providers=[_switchable_provider(state)],
+                      clock=lambda: now[0])
+    assert asyncio.run(svc.prime(["PD"])) == 0
+    assert _vallecano(svc) is None, "nothing to serve from an empty cold start"
+    assert svc._is_stale() is True, "a cold empty start must NOT advance the TTL"
+
+    now[0] += 20.0
+    state["payload"] = FIXTURES_CSV  # a real card arrives
+    assert asyncio.run(svc.prime(["PD"])) >= 1
+    assert _vallecano(svc) is not None, "the real card must replace the index"
+    assert svc._is_stale() is False, "a non-empty refresh advances the TTL"
+
+
+# The ACTUAL 10 Sep 2026 incident file: football-data.co.uk recovered after
+# four days down and served a structurally valid fixtures.csv (real header, 19
+# rows) that is VACUOUS for us — every division is out of scope (E1, E2, G1,
+# N1, P1, SC0), zero top-5 fixtures. Under the old empties-cache rule this wiped
+# a live matchday's anchors. This is the incident as data, not a stand-in.
+_LIVE_INCIDENT_FIXTURE = Path(__file__).parent / "fixtures" / "live_fixtures_20260910.csv"
+
+
+def test_real_10sep_out_of_scope_file_retains_the_cache():
+    live = _LIVE_INCIDENT_FIXTURE.read_text()
+    # Pin that this file exercises the reached-but-EMPTY branch, not the
+    # unreachable/malformed one: both retain the cache, so without this the test
+    # would pass even if the header guard rejected the file as None. It must
+    # pass the guard and parse to [] with zero in-scope fixtures attempted.
+    probe = _provider(payload=live).fetch(list(_Settings.leagues))
+    assert probe == [], "the incident file must parse to an empty in-scope list"
+
+    now = [1000.0]
+    state = {"payload": FIXTURES_CSV}
+    svc = OddsService(_FastRetry(), providers=[_switchable_provider(state)],
+                      clock=lambda: now[0])
+    primed = asyncio.run(svc.prime(["PD"]))
+    assert primed >= 1 and _vallecano(svc) is not None
+
+    # The recovered-but-vacuous file lands: reached, structurally valid, zero
+    # in-scope fixtures. The primed anchor MUST survive and the TTL must hold.
+    now[0] += 20.0
+    state["payload"] = live
+    retained = asyncio.run(svc.prime(["PD"]))
+    assert retained == primed, "the real incident file must NOT wipe the index"
+    assert _vallecano(svc) is not None, "the live matchday's anchor must survive"
+    assert svc._is_stale() is True, "a vacuous recovery must NOT advance the TTL"
