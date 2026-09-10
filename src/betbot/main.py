@@ -1204,22 +1204,15 @@ def run_daemon(
                         min_p=float(settings.high_conf_alert_min_p),
                         at="fire",
                     )
-                    # If this fixture was NAMED in the morning notice, tell that
-                    # audience it has dropped below the bar NOW instead of
-                    # silence. Fire on EITHER suppression:
-                    #   * EARLY (KO-55, or KO-70 for the PL) is the PRIMARY
-                    #     trigger — it buys the operator ~45 min over the late
-                    #     gate. The operator has accepted that a fixture can
-                    #     recover by the confirmed-XI rescore: the drop notice
-                    #     then the real call at ~KO-10 is a coherent sequence,
-                    #     and the late alert carries a recovery line.
-                    #   * LATE (KO-10) remains a BACKSTOP for a missed early job
-                    #     (daemon restarted through the early window): it is
-                    #     idempotent (drop_notified) so it is a pure no-op when
-                    #     the early notice already went out.
-                    # The periodic sweep is the final backstop if BOTH jobs
-                    # miss. run_morning_drop_notices re-checks the gate, so a
-                    # fixture that recovered by call time is consumed, not sent.
+                    # SECONDARY drop-notice trigger. The PRIMARY is the PLAN-time
+                    # hook (a sub-threshold fixture gets no job to fire, so it
+                    # never reaches here). This covers the narrower case: a
+                    # fixture that PASSED at plan (jobs scheduled) but drifts
+                    # below at this fire-time rescore. Fires on either tag; the
+                    # sweep is the final backstop. run_morning_drop_notices is
+                    # idempotent (drop_notified) and re-checks the gate, so a
+                    # fixture already noticed at plan time is a no-op here and a
+                    # recovered one is consumed, not sent.
                     try:
                         await run_morning_drop_notices(
                             settings, fixture_ids=[fixture_id]
@@ -1337,9 +1330,29 @@ def run_daemon(
             # Same gate function as the planner (single source of truth); with
             # the flag OFF every fixture passes, so suppressed is 0 and the line
             # is byte-identical to before.
-            suppressed = sum(
-                1 for p in preds if not high_conf_alert_passes(_s, p)[0]
-            )
+            suppressed_ids = [
+                p.fixture_id for p in preds if not high_conf_alert_passes(_s, p)[0]
+            ]
+            suppressed = len(suppressed_ids)
+            # PRIMARY drop-notice trigger: PLAN time is the true drop moment.
+            # A sub-threshold fixture yields NO alert job (plan_kickoff_alert_jobs
+            # skips it), so the fire-time hook never runs for it — the reason the
+            # relocated fire-time hook was dead in production (1,364 plan-time
+            # suppressions, 0 at fire). This planning pass runs at daemon start,
+            # daily at 05:00, AND hourly via the coverage watchdog, so a listed
+            # fixture is drop-noticed within the hour it drops rather than at the
+            # KO-10 sweep (which on 2026-09-09 fired 4 min AFTER kickoff).
+            # run_morning_drop_notices is idempotent (drop_notified) and honours
+            # a fixture that still clears the gate, so re-running it every pass
+            # with the current sub-threshold set sends each drop exactly once.
+            if suppressed_ids:
+                try:
+                    await run_morning_drop_notices(_s, fixture_ids=suppressed_ids)
+                except Exception as e:  # noqa: BLE001 — never crash scheduling
+                    get_logger(__name__).warning(
+                        "morning_drop_notice_plan_hook_failed",
+                        fixtures=suppressed_ids, error=str(e),
+                    )
             scheduled = 0
             for job_id, run_at in plan:
                 # job_id is predict_early_<fid> / predict_late_<fid>; recover the

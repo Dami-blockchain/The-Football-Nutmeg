@@ -51,7 +51,8 @@ from betbot.storage.repos import (
     increment_predictions_consumed,
     list_users,
     mark_morning_drop_notified,
-    morning_listing_drop_notified,
+    morning_listing_drop_notice_sent,
+    record_drop_notice_sent,
     morning_listings_pending_drop_notice,
     predictions_for_kickoff_range,
     prediction_for_fixture,
@@ -657,6 +658,10 @@ async def run_morning_drop_notices(
             # window — better a retry than a "sent" that nobody received.
             if any_success or group_success:
                 mark_fn(listing.fixture_id)
+                # Stamp the SEND (not a consume) so the late-alert recovery
+                # line keys off "a notice actually went out", never off the
+                # shared drop_notified flag (which a consume also sets).
+                record_drop_notice_sent(listing.fixture_id, now)
                 log.info(
                     "morning_drop_notice_sent",
                     fixture_id=listing.fixture_id,
@@ -1013,15 +1018,17 @@ async def send_prediction_alert(
                 pred, settings, market=None,
                 live_tally=tally, live_tally_sold=tally_sold,
             )
-            # Recovery acknowledgement: if this fixture drifted below the
-            # bar and got a drop notice at the EARLY gate, but has climbed
-            # back above by this LATE (confirmed-XI) fire, say so plainly so
-            # the earlier "no call" note and this call read coherently.
-            # drop_notified at the late fire == a notice was actually sent
-            # (see morning_listing_drop_notified); best-effort, never blocks.
+            # Recovery acknowledgement: if a drop notice was actually SENT for
+            # this fixture (it dropped below the bar earlier) but it has since
+            # climbed back above by this LATE (confirmed-XI) fire, say so
+            # plainly so the earlier "no call" note and this call read
+            # coherently. Keys off drop_notice_sent_at (a real send), NOT the
+            # drop_notified flag which a HONOURED/ever-revealed consume also
+            # sets — so a fixture merely consumed (no notice sent) never
+            # carries a spurious recovery line. Best-effort, never blocks.
             if alert_tag == "late":
                 try:
-                    if morning_listing_drop_notified(fixture_id):
+                    if morning_listing_drop_notice_sent(fixture_id):
                         high_conf_body = (
                             f"{high_conf_body}\n\n{HIGH_CONF_RECOVERY_NOTE}"
                         )

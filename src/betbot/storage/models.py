@@ -606,6 +606,14 @@ class MorningNoticeListing(Base):
     # broadcast in which AT LEAST ONE recipient actually received the drop
     # notice. Left False on a total send failure so the reconciliation retries.
     drop_notified: Mapped[bool] = mapped_column(default=False)
+    # When the drop notice was actually SENT. Unlike ``drop_notified`` (which
+    # also flips on a consume), this is set ONLY by the send branch of
+    # run_morning_drop_notices, so "a notice went out" is exactly
+    # ``drop_notice_sent_at is not None`` — what the late-alert recovery line
+    # keys off. Additive & nullable.
+    drop_notice_sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     listed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )

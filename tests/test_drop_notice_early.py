@@ -1,14 +1,16 @@
-"""Move the morning drop notice to the EARLY gate (KO-55, KO-70 PL).
+"""Drop notice at PLAN time (the true drop moment) + a recovery line that keys
+off a notice ACTUALLY SENT.
 
-The primary trigger is now the EARLY suppression; the late suppression is an
-idempotent backstop and the 15-min sweep the final one (all exercised in
-tests/test_morning_drop_notice.py, which must stay green). Covered HERE:
-  * the RECOVERY line on the LATE high-confidence alert when a fixture that got
-    an early drop notice has climbed back above the bar — and its absence on the
-    early alert and when no drop notice was sent;
-  * exactly one drop notice per fixture across an early send then a late recovery
-    (idempotent — no second notice);
-  * the safety net: if the early trigger never ran, the sweep still delivers once.
+FIX 1: the primary trigger is the PLAN-time suppression (a sub-threshold fixture
+gets no alert job, so a fire-time hook never runs for it). The fire-time hook is
+now the secondary catch (passed-at-plan, drifted-at-fire); the sweep is the final
+backstop. run_morning_drop_notices(fixture_ids=...) is the shared entry point the
+plan hook calls, exercised directly here.
+
+FIX 2: the LATE-alert recovery line keys off ``drop_notice_sent_at`` (set only on
+a real send), NOT ``drop_notified`` (also set by a HONOURED / ever-revealed
+consume) — so a fixture merely consumed never carries a spurious "this was below
+our bar in the earlier notice" line. Tested THROUGH the send path.
 """
 
 from __future__ import annotations
@@ -19,7 +21,11 @@ import pytest
 
 from betbot import daily_jobs
 from betbot.daily_jobs import HIGH_CONF_RECOVERY_NOTE, send_prediction_alert
-from betbot.storage.repos import mark_morning_drop_notified, record_morning_listing
+from betbot.storage.repos import (
+    morning_listing_drop_notice_sent,
+    record_morning_listing,
+    record_reveal,
+)
 
 from tests.test_daily_jobs import _Pred, _User, _ent, _lineup_fn_stub, _rescore_stub, _tg_settings
 from tests.test_high_conf_alert import _hc
@@ -36,143 +42,9 @@ def db(tmp_path):
 
 
 def _clearing():
-    # A triple that clears 0.65 and is not draw-topped -> high_conf_body built.
+    # Clears 0.65 and not draw-topped -> a high_conf_body is built -> late-alert
+    # recovery-line injection point is reached.
     return _Pred(fixture_id=1, p_home=0.72, p_draw=0.18, p_away=0.10, kickoff=KO)
-
-
-async def _run(settings, *, alert_tag, capture):
-    async def fake_send(_s, cid, txt):
-        capture.append((cid, txt))
-        return True
-
-    clearing = _clearing()
-    return await send_prediction_alert(
-        settings, 1, send_fn=fake_send, alert_tag=alert_tag,
-        prediction_fn=lambda fid: clearing,
-        lineup_fn=_lineup_fn_stub(),
-        rescore_fn=_rescore_stub(clearing),
-        entitlement_fn=lambda u, se, now=None: _ent("operator"),
-        users_fn=lambda: [_User(111)],
-    )
-
-
-def _list_and_drop(fixture_id):
-    record_morning_listing(fixture_id, "PL", "Man City", "Arsenal", KO, KO.date().isoformat())
-    mark_morning_drop_notified(fixture_id)  # simulate the early drop notice sent
-
-
-# ----------------------------------------------------------------------
-# Recovery line on the LATE alert
-# ----------------------------------------------------------------------
-async def test_late_alert_carries_recovery_line_when_drop_notified(db, tmp_path):
-    s = _hc(_tg_settings(tmp_path)).model_copy(update={"broadcast_chat_id": -1002})
-    _list_and_drop(1)  # got an early drop notice, has since recovered
-    sent: list[tuple[int, str]] = []
-
-    delivered = await _run(s, alert_tag="late", capture=sent)
-
-    assert delivered >= 1
-    bodies = [t for _, t in sent]
-    # Both the operator DM and the group broadcast carry the recovery line.
-    assert all(HIGH_CONF_RECOVERY_NOTE in b for b in bodies)
-    assert any(cid == -1002 for cid, _ in sent)  # group got it too
-
-
-async def test_late_alert_no_recovery_line_when_not_drop_notified(db, tmp_path):
-    s = _hc(_tg_settings(tmp_path))
-    # Listed but NOT drop-notified (never dropped) -> no recovery acknowledgement.
-    record_morning_listing(1, "PL", "Man City", "Arsenal", KO, KO.date().isoformat())
-    sent: list[tuple[int, str]] = []
-
-    await _run(s, alert_tag="late", capture=sent)
-
-    assert sent, "the alert should still fire"
-    assert all(HIGH_CONF_RECOVERY_NOTE not in t for _, t in sent)
-
-
-async def test_early_alert_never_carries_recovery_line(db, tmp_path):
-    # Recovery is a LATE-alert acknowledgement only; the early alert never has it
-    # (even in the pathological case where a listing were already drop-notified).
-    s = _hc(_tg_settings(tmp_path))
-    _list_and_drop(1)
-    sent: list[tuple[int, str]] = []
-
-    await _run(s, alert_tag="early", capture=sent)
-
-    assert sent
-    assert all(HIGH_CONF_RECOVERY_NOTE not in t for _, t in sent)
-
-
-# ----------------------------------------------------------------------
-# Exactly one drop notice: early send then a late recovery
-# ----------------------------------------------------------------------
-async def test_early_notice_then_recovery_sends_no_second_notice(db, settings):
-    # Listed, drops at the EARLY gate -> one notice; recovers by late -> the
-    # event hook fires again at the late backstop but finds it already notified.
-    from betbot.storage.repos import record_morning_listing as _rec
-
-    object.__setattr__(settings, "high_conf_alerts_only", True)
-    object.__setattr__(settings, "high_conf_alert_min_p", 0.65)
-    object.__setattr__(settings, "telegram_allowed_user_id", 999)
-    object.__setattr__(settings, "broadcast_chat_id", -1002)
-    now = datetime(2026, 9, 8, 18, 35, tzinfo=timezone.utc)  # ~KO-55
-    _rec(30, "PL", "Man City", "Arsenal", KO, KO.date().isoformat())
-
-    below = {30: _mk_pred(0.60, 0.25, 0.15)}
-    sent: list[int] = []
-
-    async def fake_send(s, cid, txt):
-        sent.append(cid)
-        return True
-
-    # EARLY suppression -> event hook (fixture_ids). Sends the one notice.
-    n1 = await daily_jobs.run_morning_drop_notices(
-        settings, send_fn=fake_send, now=now, fixture_ids=[30],
-        users_fn=lambda: [_User(111)], prediction_fn=lambda fid: below.get(fid),
-    )
-    assert n1 == 2 and set(sent) == {999, 111, -1002}
-
-    # LATE backstop fires the hook again (idempotent) -> no second notice.
-    sent.clear()
-    recovered = {30: _mk_pred(0.71, 0.19, 0.10)}
-    n2 = await daily_jobs.run_morning_drop_notices(
-        settings, send_fn=fake_send, now=now + timedelta(minutes=45), fixture_ids=[30],
-        users_fn=lambda: [_User(111)], prediction_fn=lambda fid: recovered.get(fid),
-    )
-    assert n2 == 0 and sent == []
-
-
-# ----------------------------------------------------------------------
-# Safety net: early trigger never ran -> the sweep still delivers once
-# ----------------------------------------------------------------------
-async def test_sweep_safety_net_delivers_when_early_never_ran(db, settings):
-    object.__setattr__(settings, "high_conf_alerts_only", True)
-    object.__setattr__(settings, "high_conf_alert_min_p", 0.65)
-    object.__setattr__(settings, "telegram_allowed_user_id", 999)
-    now = datetime(2026, 9, 8, 20, 0, tzinfo=timezone.utc)  # after late-alert time
-    from betbot.storage.repos import record_morning_listing as _rec
-    _rec(40, "PL", "Man City", "Arsenal", now - timedelta(minutes=1),
-         (now - timedelta(minutes=1)).date().isoformat())
-    below = {40: _mk_pred(0.60, 0.25, 0.15)}
-    sent: list[int] = []
-
-    async def fake_send(s, cid, txt):
-        sent.append(cid)
-        return True
-
-    # No event hook ever fired; the SWEEP (fixture_ids None) catches it.
-    n = await daily_jobs.run_morning_drop_notices(
-        settings, send_fn=fake_send, now=now,
-        users_fn=lambda: [_User(111)], prediction_fn=lambda fid: below.get(fid),
-    )
-    assert n == 2 and set(sent) == {999, 111}
-    # And exactly once: a second sweep is idempotent.
-    sent.clear()
-    n2 = await daily_jobs.run_morning_drop_notices(
-        settings, send_fn=fake_send, now=now + timedelta(minutes=15),
-        users_fn=lambda: [_User(111)], prediction_fn=lambda fid: below.get(fid),
-    )
-    assert n2 == 0 and sent == []
 
 
 def _mk_pred(ph, pd, pa):
@@ -182,3 +54,173 @@ def _mk_pred(ph, pd, pa):
         home_team="Man City", away_team="Arsenal",
         p_home=ph, p_draw=pd, p_away=pa, competition_code="PL",
     )
+
+
+def _drop_notified(fixture_id):
+    from betbot.storage.db import session_scope
+    from betbot.storage.models import MorningNoticeListing
+
+    with session_scope() as s:
+        row = (
+            s.query(MorningNoticeListing)
+            .filter(MorningNoticeListing.fixture_id == fixture_id)
+            .one_or_none()
+        )
+        return None if row is None else row.drop_notified
+
+
+async def _run_alert(settings, *, alert_tag, capture, fixture_id=1):
+    async def fake_send(_s, cid, txt):
+        capture.append((cid, txt))
+        return True
+
+    clearing = _clearing()
+    return await send_prediction_alert(
+        settings, fixture_id, send_fn=fake_send, alert_tag=alert_tag,
+        prediction_fn=lambda fid: clearing,
+        lineup_fn=_lineup_fn_stub(),
+        rescore_fn=_rescore_stub(clearing),
+        entitlement_fn=lambda u, se, now=None: _ent("operator"),
+        users_fn=lambda: [_User(111)],
+    )
+
+
+async def _send_real_drop_notice(settings, fixture_id, *, pred):
+    """Drive a REAL drop notice through the send path (stamps drop_notice_sent_at)
+    when ``pred`` is below the bar, or a HONOURED consume when it clears."""
+    record_morning_listing(fixture_id, "PL", "Man City", "Arsenal", KO, KO.date().isoformat())
+
+    async def sink(_s, cid, txt):
+        return True
+
+    return await daily_jobs.run_morning_drop_notices(
+        settings, fixture_ids=[fixture_id], send_fn=sink,
+        prediction_fn=lambda fid: pred, users_fn=lambda: [_User(111)],
+    )
+
+
+# ----------------------------------------------------------------------
+# FIX 2 — recovery line keys off a notice ACTUALLY SENT
+# ----------------------------------------------------------------------
+async def test_late_alert_carries_recovery_line_when_notice_sent(db, tmp_path):
+    s = _hc(_tg_settings(tmp_path)).model_copy(update={"broadcast_chat_id": -1002})
+    # A real drop notice went out (fixture dropped below the bar earlier)...
+    await _send_real_drop_notice(s, 1, pred=_mk_pred(0.60, 0.25, 0.15))
+    assert morning_listing_drop_notice_sent(1) is True
+
+    # ...and it has since recovered by the late fire -> alert carries the line.
+    sent: list[tuple[int, str]] = []
+    delivered = await _run_alert(s, alert_tag="late", capture=sent)
+    assert delivered >= 1
+    assert all(HIGH_CONF_RECOVERY_NOTE in t for _, t in sent)
+    assert any(cid == -1002 for cid, _ in sent)  # group copy carries it too
+
+
+async def test_no_recovery_line_when_listing_only_consumed(db, tmp_path):
+    # THE FIX 2 regression: gate still clears at reconcile time -> HONOURED
+    # consume sets drop_notified but sends NOTHING. The late alert must NOT
+    # claim a notice was sent.
+    s = _hc(_tg_settings(tmp_path))
+    await _send_real_drop_notice(s, 1, pred=_mk_pred(0.72, 0.18, 0.10))  # clears -> consume
+    assert _drop_notified(1) is True                     # flag set by consume
+    assert morning_listing_drop_notice_sent(1) is False  # but NO notice sent
+
+    sent: list[tuple[int, str]] = []
+    await _run_alert(s, alert_tag="late", capture=sent)
+    assert sent
+    assert all(HIGH_CONF_RECOVERY_NOTE not in t for _, t in sent)
+
+
+async def test_no_recovery_line_when_consumed_via_ever_revealed(db, tmp_path):
+    # ever_revealed consume: a user saw it via /predictions earlier -> the hook
+    # consumes (drop_notified True) without sending. No spurious recovery line.
+    s = _hc(_tg_settings(tmp_path))
+    record_reveal(111, 1, charged=False)
+    await _send_real_drop_notice(s, 1, pred=_mk_pred(0.60, 0.25, 0.15))  # below, but revealed
+    assert _drop_notified(1) is True
+    assert morning_listing_drop_notice_sent(1) is False
+
+    sent: list[tuple[int, str]] = []
+    await _run_alert(s, alert_tag="late", capture=sent)
+    assert all(HIGH_CONF_RECOVERY_NOTE not in t for _, t in sent)
+
+
+async def test_late_alert_no_recovery_line_when_never_listed(db, tmp_path):
+    s = _hc(_tg_settings(tmp_path))
+    sent: list[tuple[int, str]] = []
+    await _run_alert(s, alert_tag="late", capture=sent)
+    assert sent
+    assert all(HIGH_CONF_RECOVERY_NOTE not in t for _, t in sent)
+
+
+async def test_early_alert_never_carries_recovery_line(db, tmp_path):
+    # Recovery is a LATE-alert acknowledgement only.
+    s = _hc(_tg_settings(tmp_path))
+    await _send_real_drop_notice(s, 1, pred=_mk_pred(0.60, 0.25, 0.15))
+    assert morning_listing_drop_notice_sent(1) is True
+    sent: list[tuple[int, str]] = []
+    await _run_alert(s, alert_tag="early", capture=sent)
+    assert sent
+    assert all(HIGH_CONF_RECOVERY_NOTE not in t for _, t in sent)
+
+
+# ----------------------------------------------------------------------
+# FIX 1 — plan-time drop notice (the shared fixture_ids entry point) + coherence
+# ----------------------------------------------------------------------
+async def test_plan_time_hook_sends_one_notice_for_suppressed_fixtures(db, settings):
+    # What _schedule_kickoff_alerts_locked now calls after planning: the
+    # sub-threshold fixture ids go straight to run_morning_drop_notices.
+    object.__setattr__(settings, "high_conf_alerts_only", True)
+    object.__setattr__(settings, "high_conf_alert_min_p", 0.65)
+    object.__setattr__(settings, "telegram_allowed_user_id", 999)
+    object.__setattr__(settings, "broadcast_chat_id", -1002)
+    record_morning_listing(30, "PL", "Man City", "Arsenal", KO, KO.date().isoformat())
+    below = {30: _mk_pred(0.5949, 0.25, 0.1551)}  # today's Sporting-v-Gala drop
+    sent: list[int] = []
+
+    async def fake_send(s, cid, txt):
+        sent.append(cid)
+        return True
+
+    n1 = await daily_jobs.run_morning_drop_notices(
+        settings, send_fn=fake_send, fixture_ids=[30],
+        users_fn=lambda: [_User(111)], prediction_fn=lambda fid: below.get(fid),
+    )
+    assert n1 == 2 and set(sent) == {999, 111, -1002}
+    assert morning_listing_drop_notice_sent(30) is True
+
+    # Re-planning (hourly) with the same suppressed set is a no-op — one notice.
+    sent.clear()
+    n2 = await daily_jobs.run_morning_drop_notices(
+        settings, send_fn=fake_send, fixture_ids=[30],
+        users_fn=lambda: [_User(111)], prediction_fn=lambda fid: below.get(fid),
+    )
+    assert n2 == 0 and sent == []
+
+
+async def test_sweep_safety_net_delivers_when_plan_hook_never_ran(db, settings):
+    object.__setattr__(settings, "high_conf_alerts_only", True)
+    object.__setattr__(settings, "high_conf_alert_min_p", 0.65)
+    object.__setattr__(settings, "telegram_allowed_user_id", 999)
+    now = datetime(2026, 9, 8, 20, 0, tzinfo=timezone.utc)  # after late-alert time
+    record_morning_listing(40, "PL", "Man City", "Arsenal",
+                           now - timedelta(minutes=1),
+                           (now - timedelta(minutes=1)).date().isoformat())
+    below = {40: _mk_pred(0.60, 0.25, 0.15)}
+    sent: list[int] = []
+
+    async def fake_send(s, cid, txt):
+        sent.append(cid)
+        return True
+
+    n = await daily_jobs.run_morning_drop_notices(
+        settings, send_fn=fake_send, now=now,
+        users_fn=lambda: [_User(111)], prediction_fn=lambda fid: below.get(fid),
+    )
+    assert n == 2 and set(sent) == {999, 111}
+    sent.clear()
+    n2 = await daily_jobs.run_morning_drop_notices(
+        settings, send_fn=fake_send, now=now + timedelta(minutes=15),
+        users_fn=lambda: [_User(111)], prediction_fn=lambda fid: below.get(fid),
+    )
+    assert n2 == 0 and sent == []

@@ -2011,30 +2011,46 @@ def morning_listings_pending_drop_notice(
         return rows
 
 
-def morning_listing_drop_notified(fixture_id: int) -> bool:
-    """True iff a morning-listed fixture has already been through the drop path
-    (a real drop notice sent, or a deliberate consume).
+def morning_listing_drop_notice_sent(fixture_id: int) -> bool:
+    """True iff a drop notice was actually SENT for this morning-listed fixture.
 
-    Used by the LATE alert to acknowledge an earlier drop notice when a fixture
-    has recovered above the bar. At the late fire this is an exact proxy for "a
-    drop notice was SENT": the only writers before the late fire are the EARLY
-    suppression hook (gate failed -> DROPPED -> real send) and — never earlier
-    than the late fire — the sweep, which is bounded to kickoff <= now + late
-    lead, i.e. it cannot run for a fixture until the late-alert instant has
-    already passed. So a consume-without-send can only be recorded at/after the
-    late fire, never before it.
+    Reads ``drop_notice_sent_at`` (set ONLY by the send branch of
+    run_morning_drop_notices), NOT ``drop_notified`` — the latter also flips on
+    a HONOURED consume (gate re-passed, or the fixture was ever revealed) and on
+    a no-audience consume, none of which put a notice in front of a user. The
+    LATE-alert recovery line keys off THIS so it can never tell a user "this was
+    below our bar in the earlier notice" when no notice was ever sent.
     """
     with session_scope() as s:
         val = s.execute(
-            select(MorningNoticeListing.drop_notified)
+            select(MorningNoticeListing.drop_notice_sent_at)
             .where(MorningNoticeListing.fixture_id == fixture_id)
         ).scalar_one_or_none()
-        return bool(val)
+        return val is not None
+
+
+def record_drop_notice_sent(fixture_id: int, when: datetime | None = None) -> None:
+    """Stamp ``drop_notice_sent_at`` — the moment a drop notice actually went
+    out. Set only from the send branch, alongside the ``drop_notified``
+    deliver-once flag; a consume never calls this. Idempotent-safe: re-stamping
+    an already-sent listing just refreshes the timestamp.
+    """
+    when = when or datetime.now(timezone.utc)
+    with session_scope() as s:
+        row = s.execute(
+            select(MorningNoticeListing)
+            .where(MorningNoticeListing.fixture_id == fixture_id)
+        ).scalar_one_or_none()
+        if row is not None:
+            row.drop_notice_sent_at = when
 
 
 def mark_morning_drop_notified(fixture_id: int) -> None:
-    """Flag a morning-listed fixture as handled by the drop path so it is never
-    re-queued (a real send, or a deliberate consume)."""
+    """Flag a morning-listed fixture as HANDLED by the drop path (the
+    deliver-once / idempotency flag) so it is never re-queued. Set on EITHER a
+    real send OR a deliberate consume, so it does NOT by itself mean a notice
+    reached a user — that is ``drop_notice_sent_at`` (see
+    :func:`record_drop_notice_sent` / :func:`morning_listing_drop_notice_sent`)."""
     with session_scope() as s:
         row = s.execute(
             select(MorningNoticeListing)
