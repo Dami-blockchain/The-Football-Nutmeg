@@ -50,13 +50,18 @@ from betbot.storage.repos import (
     high_conf_band_tally_sold,
     increment_predictions_consumed,
     list_users,
+    mark_matchday_notice_ran,
     mark_morning_drop_notified,
     mark_morning_drop_notice_sent,
+    matchday_notice_ran,
     morning_listing_drop_notice_sent,
+    morning_listing_exists,
     morning_listings_pending_drop_notice,
     predictions_for_kickoff_range,
     prediction_for_fixture,
+    promotion_notice_sent,
     record_morning_listing,
+    record_promotion_notice_sent,
     record_rescore_drift,
     record_reveal,
     upsert_prediction,
@@ -404,6 +409,18 @@ async def run_matchday_notice(
         log.info("matchday_notice_no_fixtures", day=day.isoformat())
         return 0
 
+    # Positive "the morning notice has happened today" marker. The PROMOTION
+    # notice gates on this so it can never fire before the notice runs (when
+    # every qualifying fixture would trivially look like a promotion). Recorded
+    # regardless of the gate flag and BEFORE the send loop — it records that the
+    # notice RAN, not that any DM landed; an all-sub-threshold morning (zero
+    # listing rows) still legitimately "ran". Best-effort: must not break the
+    # broadcast.
+    try:
+        mark_matchday_notice_ran(day.isoformat())
+    except Exception as e:  # noqa: BLE001 — marker must not break the notice
+        log.warning("matchday_notice_ran_mark_failed", day=day.isoformat(), error=str(e))
+
     # Persist WHICH fixtures this notice NAMED (gate ON only — the sole regime
     # where the alert path can later SUPPRESS a listed fixture). The notice
     # evaluates the gate on the EARLY stored triple; upsert_prediction overwrites
@@ -680,6 +697,209 @@ async def run_morning_drop_notices(
                 )
         if consumed:
             log.info("morning_drop_notices_consumed_total", count=consumed)
+        return sent
+
+
+# ----------------------------------------------------------------------
+# "Risen above the bar" PROMOTION notice — the mirror of the drop notice
+# ----------------------------------------------------------------------
+# Serialises run_morning_promotion_notices across its two entry points (the
+# plan-time hook and the 15-min sweep) so a fixture can never be promotion-
+# noticed twice under concurrent overlap on the daemon's single loop.
+_PROMOTION_NOTICE_LOCK = asyncio.Lock()
+
+
+def render_morning_promotion_notice(pred) -> str:
+    """The short, plain heads-up for a fixture that was NOT on the morning
+    high-confidence list but has since RISEN above our confidence bar — so a
+    call IS now coming that the operator was never told to expect.
+
+    The mirror of :func:`render_morning_drop_notice`: same header, same voice,
+    home/away designation, and it closes on a BOLD call. There a call vanished
+    (NO BET); here a call has appeared (BET ON — the full prediction follows via
+    the normal pre-match alert). Carries NO probabilities/edge — the specific
+    pick is the paid reveal — routing the league through ``league_label`` so it
+    matches every other fixture-naming surface.
+    """
+    league = league_label(getattr(pred, "competition_code", None))
+    league_tag = f" · {league}" if league else ""
+    return (
+        "*⚽ High-confidence list — update*\n\n"
+        f"*{pred.home_team} (H) v {pred.away_team} (A)*{league_tag}\n\n"
+        "\U0001f195 This was NOT on this morning's high-confidence list, but a "
+        "fresh model run has since lifted it above our confidence bar — so "
+        "a call IS coming on it. Watch for the full prediction before kickoff.\n\n"
+        "*BET ON — full call incoming.*"
+    )
+
+
+async def run_morning_promotion_notices(
+    settings,
+    *,
+    send_fn: SendFn | None = None,
+    now: datetime | None = None,
+    fixture_ids: list[int] | None = None,
+    predictions_source: Callable[[datetime, datetime], Sequence[object]] | None = None,
+    prediction_fn=prediction_for_fixture,
+    users_fn=list_users,
+    ever_revealed_fn=None,
+    listed_fn=None,
+    ran_fn=None,
+    already_sent_fn=None,
+    record_fn=None,
+) -> int:
+    """Tell the morning notice's audience when a fixture that was NOT on the
+    morning high-confidence list has since climbed ABOVE the bar — the mirror of
+    ``run_morning_drop_notices`` and a pure FAILSAFE so a promotion can never be
+    missed.
+
+    With no afternoon scoring pass the stored triple of a below-bar fixture does
+    not move after the ~08:11 UTC scoring run, so this fires RARELY — possibly
+    never on many days. That is intended: it is a guarantee, not a feed.
+
+    TWO entry points, both landing here (mirroring the drop notice):
+      * EVENT-DRIVEN (``fixture_ids`` set): the PLAN hook passes the fixtures it
+        just scheduled alert jobs for (i.e. currently ABOVE the bar). Re-run
+        hourly by the coverage watchdog, so a promotion is noticed within the
+        hour it happens.
+      * SWEEP (``fixture_ids`` None): scans today's scored fixtures as the
+        periodic backstop for a plan pass that never ran.
+
+    A candidate is PROMOTION-NOTICED exactly once when ALL hold:
+      * the morning notice has RUN today (``ran_fn``) — else every qualifying
+        fixture would look like a promotion before anything was promised;
+      * it was NOT on the morning list (``listed_fn``) — a listed fixture that
+        dropped-then-recovered is owned by the drop / recovery-note path, never
+        here, so the two never both fire;
+      * it currently clears the alert gate on its stored triple;
+      * its kickoff is still in the future AND it was never revealed to a user
+        (``ever_revealed_fn``) — the promised call has not already gone out;
+      * no promotion notice has been sent for it yet (``already_sent_fn``).
+
+    FREE and READ-ONLY on the money path (no reveal, charge, or registration).
+    Idempotent: the ledger row is written ONLY after a confirmed delivery, so a
+    total send failure leaves it un-recorded for the next tick's retry. If a
+    promoted fixture later DEMOTES it simply stops qualifying here and — because
+    it was never on the morning list — the drop path ignores it too, so there is
+    no ping-pong: one "call is coming", then silence. Injected fns keep it
+    testable.
+    """
+    # Gate OFF: the alert path suppresses nothing and no morning listings are
+    # recorded, so "promotion vs. list" is meaningless. Short-circuit, touch no DB.
+    if not getattr(settings, "high_conf_alerts_only", False):
+        return 0
+
+    from betbot.main import high_conf_alert_passes
+    from betbot.notify import send_telegram_to
+
+    send = send_fn if send_fn is not None else send_telegram_to
+    ever_revealed_fn = ever_revealed_fn or fixture_was_ever_revealed
+    listed_fn = listed_fn or morning_listing_exists
+    ran_fn = ran_fn or matchday_notice_ran
+    already_sent_fn = already_sent_fn or promotion_notice_sent
+    record_fn = record_fn or record_promotion_notice_sent
+    now = now or datetime.now(timezone.utc)
+
+    start, end, day = nairobi_day_bounds(now)
+    notice_day = day.isoformat()
+    # HARD GATE: never fire before the morning notice has actually run today.
+    if not ran_fn(notice_day):
+        return 0
+
+    async with _PROMOTION_NOTICE_LOCK:
+        if fixture_ids is not None:
+            candidates = list(fixture_ids)
+        else:
+            _src = predictions_source or predictions_for_kickoff_range
+            candidates = [getattr(p, "fixture_id", None) for p in _src(start, end)]
+            candidates = [fid for fid in candidates if fid is not None]
+
+        recipients = notice_recipient_ids(settings, users_fn())
+        group_id = getattr(settings, "broadcast_chat_id", None)
+
+        sent = 0
+        for fid in candidates:
+            # Idempotent: already promotion-noticed -> no-op (also serialises the
+            # plan hook vs. the sweep under the lock: the second entrant re-reads
+            # this and finds the row the first just wrote).
+            if already_sent_fn(fid):
+                continue
+            # Was on the morning list -> the drop / recovery-note path owns it.
+            if listed_fn(fid):
+                continue
+            pred = prediction_fn(fid)
+            if pred is None:
+                continue
+            # Must clear the gate NOW on the stored triple (it rose above the bar).
+            if not high_conf_alert_passes(settings, pred)[0]:
+                continue
+            ko = pred.kickoff
+            if ko is not None and ko.tzinfo is None:
+                ko = ko.replace(tzinfo=timezone.utc)
+            # A call can only still be "coming" while kickoff is ahead.
+            if ko is None or ko <= now:
+                continue
+            # The promised call already went out at some fire -> nothing to pre-announce.
+            if ever_revealed_fn(fid):
+                continue
+
+            # No audience at all: the notice can never be delivered, so CONSUME it
+            # (record) rather than re-evaluate it forever — same discipline as the
+            # drop notice's no-audience branch.
+            if not recipients and not group_id:
+                record_fn(
+                    fid, getattr(pred, "competition_code", "") or "",
+                    pred.home_team, pred.away_team, ko, notice_day, now,
+                )
+                log.info("morning_promotion_notice_no_audience", fixture_id=fid)
+                continue
+
+            body = render_morning_promotion_notice(pred)
+            any_success = False
+            for uid in recipients:
+                try:
+                    if await send(settings, uid, body):
+                        sent += 1
+                        any_success = True
+                except Exception as e:  # noqa: BLE001 — one bad send must not drop the rest
+                    log.warning(
+                        "morning_promotion_notice_send_failed",
+                        telegram_user_id=uid, fixture_id=fid, error=str(e),
+                    )
+            group_success = False
+            if group_id:
+                try:
+                    if await send(settings, int(group_id), body):
+                        group_success = True
+                        log.info(
+                            "morning_promotion_notice_broadcast_sent",
+                            fixture_id=fid, chat_id=int(group_id),
+                        )
+                except Exception as e:  # noqa: BLE001 — group send must never break DMs
+                    log.warning(
+                        "morning_promotion_notice_broadcast_failed",
+                        fixture_id=fid, chat_id=int(group_id), error=str(e),
+                    )
+
+            # Record (deliver-once) ONLY once at least one recipient actually got
+            # it, so the ledger never lies. On a TOTAL send failure it is left
+            # un-recorded and retried on the next tick.
+            if any_success or group_success:
+                record_fn(
+                    fid, getattr(pred, "competition_code", "") or "",
+                    pred.home_team, pred.away_team, ko, notice_day, now,
+                )
+                log.info(
+                    "morning_promotion_notice_sent",
+                    fixture_id=fid,
+                    dm_recipients=len(recipients), group=bool(group_success),
+                )
+            else:
+                log.warning(
+                    "morning_promotion_notice_all_sends_failed",
+                    fixture_id=fid,
+                    note="left un-recorded for retry on the next tick",
+                )
         return sent
 
 

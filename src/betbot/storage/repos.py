@@ -16,9 +16,11 @@ from betbot.storage.models import (
     GasTopup,
     GlickoRating,
     KillSwitch,
+    MatchdayNoticeRun,
     ModelPrediction,
     MorningNoticeListing,
     PaperBet,
+    PromotionNoticeListing,
     PredictionOutcome,
     PredictionReveal,
     PredictionRow,
@@ -2060,6 +2062,127 @@ def mark_morning_drop_notified(fixture_id: int) -> None:
         ).scalar_one_or_none()
         if row is not None:
             row.drop_notified = True
+
+
+def morning_listing_exists(fixture_id: int) -> bool:
+    """True iff ``fixture_id`` was NAMED in a morning high-confidence notice.
+
+    ANY listing row counts (regardless of ``drop_notified``): the promotion
+    notice fires ONLY for fixtures that were never on the morning list, and the
+    drop / recovery path owns every fixture that was — so this is the guard that
+    keeps the two failsafes from ever both firing for one fixture.
+    """
+    with session_scope() as s:
+        exists = s.execute(
+            select(MorningNoticeListing.id)
+            .where(MorningNoticeListing.fixture_id == fixture_id)
+            .limit(1)
+        ).scalar_one_or_none()
+        return exists is not None
+
+
+# ----------------------------------------------------------------------
+# Matchday-notice "ran today" marker (gates the promotion notice)
+# ----------------------------------------------------------------------
+def mark_matchday_notice_ran(notice_day: str, when: datetime | None = None) -> bool:
+    """Record that the morning high-confidence notice RAN for ``notice_day``.
+
+    Idempotent: a re-run of the morning cron for the same day is a no-op. Returns
+    True iff a NEW marker row was inserted. Best-effort caller — a failure here
+    must never break the notice broadcast.
+    """
+    when = when or datetime.now(timezone.utc)
+    with session_scope() as s:
+        exists = s.execute(
+            select(MatchdayNoticeRun.id)
+            .where(MatchdayNoticeRun.notice_day == notice_day)
+            .limit(1)
+        ).scalar_one_or_none()
+        if exists is not None:
+            return False
+        s.add(MatchdayNoticeRun(notice_day=notice_day, ran_at=when))
+        try:
+            s.flush()
+        except IntegrityError:
+            s.rollback()
+            return False
+        return True
+
+
+def matchday_notice_ran(notice_day: str) -> bool:
+    """True iff the morning high-confidence notice has run for ``notice_day``.
+
+    The promotion notice gates on this: before the morning notice runs, nothing
+    has been promised, so every qualifying fixture would spuriously look like a
+    promotion.
+    """
+    with session_scope() as s:
+        exists = s.execute(
+            select(MatchdayNoticeRun.id)
+            .where(MatchdayNoticeRun.notice_day == notice_day)
+            .limit(1)
+        ).scalar_one_or_none()
+        return exists is not None
+
+
+# ----------------------------------------------------------------------
+# Promotion notice ledger (a fixture that rose above the bar after the notice)
+# ----------------------------------------------------------------------
+def promotion_notice_sent(fixture_id: int) -> bool:
+    """True iff a promotion notice has already gone out for ``fixture_id``.
+
+    Presence of a ``PromotionNoticeListing`` row IS the deliver-once flag — the
+    row is written only after a successful send, so this is exactly "the operator
+    was already told this fixture climbed above the bar".
+    """
+    with session_scope() as s:
+        exists = s.execute(
+            select(PromotionNoticeListing.id)
+            .where(PromotionNoticeListing.fixture_id == fixture_id)
+            .limit(1)
+        ).scalar_one_or_none()
+        return exists is not None
+
+
+def record_promotion_notice_sent(
+    fixture_id: int,
+    competition_code: str,
+    home_team: str,
+    away_team: str,
+    kickoff: datetime,
+    notice_day: str,
+    when: datetime | None = None,
+) -> bool:
+    """Ledger that a promotion notice WENT OUT for ``fixture_id``. Idempotent: a
+    second call (a racing sweep, a re-fire) is a no-op. Returns True iff a NEW
+    row was inserted. Written ONLY by the send branch after a confirmed delivery.
+    """
+    when = when or datetime.now(timezone.utc)
+    with session_scope() as s:
+        exists = s.execute(
+            select(PromotionNoticeListing.id)
+            .where(PromotionNoticeListing.fixture_id == fixture_id)
+            .limit(1)
+        ).scalar_one_or_none()
+        if exists is not None:
+            return False
+        s.add(
+            PromotionNoticeListing(
+                fixture_id=fixture_id,
+                competition_code=competition_code or "",
+                home_team=home_team or "Home",
+                away_team=away_team or "Away",
+                notice_day=notice_day,
+                kickoff=kickoff,
+                promo_notice_sent_at=when,
+            )
+        )
+        try:
+            s.flush()
+        except IntegrityError:
+            s.rollback()
+            return False
+        return True
 
 
 def outcomes_settled_since(

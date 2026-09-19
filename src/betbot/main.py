@@ -36,6 +36,7 @@ from betbot.daily_jobs import (
     register_daily_jobs,
     run_matchday_notice,
     run_morning_drop_notices,
+    run_morning_promotion_notices,
     run_result_alerts,
     run_score_reverification,
     send_prediction_alert,
@@ -486,6 +487,19 @@ def suppressed_fixture_ids(settings, preds) -> list[int]:
     """
     return [
         p.fixture_id for p in preds if not high_conf_alert_passes(settings, p)[0]
+    ]
+
+
+def passing_fixture_ids(settings, preds) -> list[int]:
+    """Fixture ids in ``preds`` that CLEAR the high-conviction alert gate.
+
+    The complement of :func:`suppressed_fixture_ids` — exactly the set
+    :func:`plan_kickoff_alert_jobs` schedules jobs for. Pulled out pure so the
+    PROMOTION-notice plan hook's candidate selection is unit-testable. With the
+    gate off every fixture passes.
+    """
+    return [
+        p.fixture_id for p in preds if high_conf_alert_passes(settings, p)[0]
     ]
 
 
@@ -1127,6 +1141,18 @@ def run_daemon(
         except Exception as e:  # noqa: BLE001 — never crash the daemon
             get_logger(__name__).warning("morning_drop_notices_failed", error=str(e))
 
+    async def _morning_promotion_notice_tick() -> None:
+        # Periodic backstop (mirror of _morning_drop_notice_tick): tell the
+        # morning notice's audience when a fixture that was NOT on the morning
+        # high-confidence list has since risen above the bar, so a call is now
+        # coming. Event-driven at PLAN time; this sweep catches a pass that never
+        # ran. FREE, read-only, idempotent (its own ledger), gated on the notice
+        # having run today so it can never false-fire before 09:00 UTC.
+        try:
+            await run_morning_promotion_notices(get_settings())
+        except Exception as e:  # noqa: BLE001 — never crash the daemon
+            get_logger(__name__).warning("morning_promotion_notices_failed", error=str(e))
+
     async def _alert_matches_upstream(
         settings, fixture_id: int, *, lead_minutes: int
     ) -> bool:
@@ -1388,6 +1414,23 @@ def run_daemon(
                         "morning_drop_notice_plan_hook_failed",
                         fixtures=suppressed_ids, error=str(e),
                     )
+            # MIRROR: PROMOTION-notice plan hook. The fixtures we just scheduled
+            # jobs for are the ones currently ABOVE the bar; run_morning_promotion
+            # _notices keeps only those that were NOT on the morning list and have
+            # not already been noticed, so a genuine promotion is flagged within
+            # the hour it happens. Idempotent (its own ledger) and gated on the
+            # morning notice having run, so re-running every pass is safe and a
+            # no-op before 09:00 UTC. Fired AFTER job registration so a slow send
+            # can never delay the money-path alert jobs.
+            passing_ids = passing_fixture_ids(_s, preds)
+            if passing_ids:
+                try:
+                    await run_morning_promotion_notices(_s, fixture_ids=passing_ids)
+                except Exception as e:  # noqa: BLE001 — never crash scheduling
+                    get_logger(__name__).warning(
+                        "morning_promotion_notice_plan_hook_failed",
+                        fixtures=passing_ids, error=str(e),
+                    )
             # Self-check: everything we just planned must actually be on the
             # scheduler. A pass that quietly schedules nothing is the failure
             # mode that hid this bug for days, so it is now loud.
@@ -1551,6 +1594,17 @@ def run_daemon(
             _morning_drop_notice_tick,
             trigger=IntervalTrigger(minutes=15, timezone=timezone.utc),
             id="morning_drop_notices",
+        )
+        # Periodic (every 15m) SWEEP backstop for the PROMOTION notice — the
+        # mirror of morning_drop_notices. Primary delivery is EVENT-DRIVEN at
+        # PLAN time (every scheduling pass); this catches a plan pass that never
+        # ran. Gated on the morning notice having run today, so a pass before
+        # 09:00 UTC is a no-op. Cheap, FREE, idempotent.
+        add_async_job(
+            scheduler,
+            _morning_promotion_notice_tick,
+            trigger=IntervalTrigger(minutes=15, timezone=timezone.utc),
+            id="morning_promotion_notices",
         )
         # Belt-and-braces: catch anything registered through a raw add_job
         # that bypassed add_async_job. Loud, but never fatal to the daemon.

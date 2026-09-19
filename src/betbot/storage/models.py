@@ -617,3 +617,76 @@ class MorningNoticeListing(Base):
     listed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )
+
+
+class MatchdayNoticeRun(Base):
+    """One row per matchday on which the morning high-confidence notice actually
+    RAN (``run_matchday_notice`` produced and dispatched a body).
+
+    Sole purpose: a positive, persisted "the morning notice has happened today"
+    marker for the PROMOTION notice to gate on. The promotion notice fires for a
+    fixture that was NOT on the morning list but has since climbed above the bar
+    — but before the morning notice runs, EVERY qualifying fixture trivially
+    looks like a promotion (nothing has been promised yet). The scheduling /
+    watchdog passes that drive the promotion hook run from 05:00 UTC, hours
+    before the 09:00 UTC notice, so a clock check is not enough and an
+    all-sub-threshold morning (which records ZERO listing rows) is
+    indistinguishable from "not run yet" without this marker.
+
+    Keyed by ``notice_day`` (the Nairobi ISO date), unique: the notice runs once
+    per matchday and re-runs are idempotent no-ops here.
+    """
+
+    __tablename__ = "matchday_notice_runs"
+    __table_args__ = (
+        UniqueConstraint("notice_day", name="uq_matchday_notice_runs_day"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    notice_day: Mapped[str] = mapped_column(String(10))  # Nairobi ISO date
+    ran_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+
+
+class PromotionNoticeListing(Base):
+    """One row per fixture for which a PROMOTION notice was actually SENT.
+
+    The mirror image of ``MorningNoticeListing``/the drop notice. The drop notice
+    reconciles fixtures that WERE named in the morning notice but have since
+    fallen below the bar. This table backs the opposite failsafe: a fixture that
+    was NOT on the morning high-confidence list but has since RISEN above the bar
+    — so a call is now coming that the operator was never told to expect.
+
+    A SEPARATE table (not a flagged row in ``morning_notice_listings``) on
+    purpose. A promoted fixture is by definition NOT a morning listing, and a row
+    in that table would be swept by the drop-notice queries
+    (``morning_listings_pending_drop_notice`` selects any ``drop_notified=False``
+    row by kickoff) — coupling the two failsafes and risking a spurious drop
+    notice. Keeping promotions in their own ledger leaves the drop path exactly
+    as it was.
+
+    Presence of a row == a promotion notice went out for that fixture. Inserted
+    ONLY after at least one recipient actually received it (mirroring the drop
+    notice's send-then-flag discipline), so a total send failure leaves no row
+    and the sweep retries. ``fixture_id`` is unique — one promotion notice per
+    fixture per day, and a fixture belongs to a single matchday.
+    """
+
+    __tablename__ = "promotion_notice_listings"
+    __table_args__ = (
+        UniqueConstraint(
+            "fixture_id", name="uq_promotion_notice_listings_fixture"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    fixture_id: Mapped[int] = mapped_column(Integer)
+    competition_code: Mapped[str] = mapped_column(String(8))
+    home_team: Mapped[str] = mapped_column(String(80))
+    away_team: Mapped[str] = mapped_column(String(80))
+    notice_day: Mapped[str] = mapped_column(String(10))  # matchday it promoted on
+    kickoff: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    promo_notice_sent_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
