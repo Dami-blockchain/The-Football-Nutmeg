@@ -142,6 +142,30 @@ async def test_matchday_notice_records_ran_marker(db, settings):
     assert matchday_notice_ran(day.isoformat()) is True
 
 
+async def test_matchday_notice_records_ran_marker_even_with_no_fixtures(db, settings):
+    """REQUIRED (Fable): the ran-marker must be stamped even when the day has NO
+    stored fixtures (render_matchday_notice returns None and the notice returns
+    early). Otherwise a failed/overrunning 08:00 scoring run followed by a
+    zero-row 09:00 notice leaves no marker, and fixtures scored later that day
+    that clear the bar get alerts while the promotion failsafe stays silent all
+    day. FAILS before the fix (marker was stamped after the early return)."""
+    _gate_on(settings)
+    now = datetime(2026, 9, 8, 6, 0, tzinfo=timezone.utc)
+    _start, _end, day = nairobi_day_bounds(now)
+
+    async def fake_send(s, cid, text):  # pragma: no cover - nothing to send
+        return True
+
+    assert matchday_notice_ran(day.isoformat()) is False
+    n = await run_matchday_notice(
+        settings, send_fn=fake_send, now=now,
+        fixtures_source=lambda a, b: [],   # no stored fixtures for the day
+        users_fn=lambda: [_User(999)],
+    )
+    assert n == 0  # nothing sent
+    assert matchday_notice_ran(day.isoformat()) is True  # but it RAN
+
+
 # ----------------------------------------------------------------------
 # Firing / gating
 # ----------------------------------------------------------------------

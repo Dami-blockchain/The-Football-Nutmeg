@@ -404,22 +404,26 @@ async def run_matchday_notice(
         else predictions_for_kickoff_range(start, end)
     )
 
-    body = render_matchday_notice(settings, fixtures, day)
-    if body is None:
-        log.info("matchday_notice_no_fixtures", day=day.isoformat())
-        return 0
-
     # Positive "the morning notice has happened today" marker. The PROMOTION
     # notice gates on this so it can never fire before the notice runs (when
-    # every qualifying fixture would trivially look like a promotion). Recorded
-    # regardless of the gate flag and BEFORE the send loop — it records that the
-    # notice RAN, not that any DM landed; an all-sub-threshold morning (zero
-    # listing rows) still legitimately "ran". Best-effort: must not break the
-    # broadcast.
+    # every qualifying fixture would trivially look like a promotion). Stamped
+    # BEFORE the zero-fixture early return AND before the send loop: the notice
+    # "ran" whether or not it had anything to say. If the 08:00 scoring run
+    # fails/overruns and the notice sees zero rows, fixtures scored later that
+    # day (a retry, or the scoring run a daemon restart triggers) can still clear
+    # 0.65 and alert — and without this marker the promotion failsafe would stay
+    # silent all day, the exact "does not fire when it should" hole. Recorded
+    # regardless of the gate flag; records that the notice RAN, not that any DM
+    # landed. Best-effort: must not break the broadcast.
     try:
         mark_matchday_notice_ran(day.isoformat())
     except Exception as e:  # noqa: BLE001 — marker must not break the notice
         log.warning("matchday_notice_ran_mark_failed", day=day.isoformat(), error=str(e))
+
+    body = render_matchday_notice(settings, fixtures, day)
+    if body is None:
+        log.info("matchday_notice_no_fixtures", day=day.isoformat())
+        return 0
 
     # Persist WHICH fixtures this notice NAMED (gate ON only — the sole regime
     # where the alert path can later SUPPRESS a listed fixture). The notice
@@ -753,9 +757,18 @@ async def run_morning_promotion_notices(
     ``run_morning_drop_notices`` and a pure FAILSAFE so a promotion can never be
     missed.
 
-    With no afternoon scoring pass the stored triple of a below-bar fixture does
-    not move after the ~08:11 UTC scoring run, so this fires RARELY — possibly
-    never on many days. That is intended: it is a guarantee, not a feed.
+    Fires RARELY — possibly never on many days — but ONLY because the morning
+    notice hour is set AFTER the daily scoring run (notice at 09:00 UTC /
+    ``BETBOT_MATCHDAY_ALERT_HOUR=12`` EAT; scoring at ~08:00 UTC). With no
+    afternoon scoring pass, a below-bar fixture's stored triple does not move
+    after that run, so almost nothing promotes post-notice. Do NOT "fix" a quiet
+    notice by moving the hour earlier: if the notice ran BEFORE the scoring run
+    it would read the previous day's triples and this would fire on most
+    mornings (as the mirror drop notice demonstrably did under the old 05:00 UTC
+    ordering). The rarity is a property of the schedule, not of the feature; it
+    is intended as a guarantee, not a feed. Note a daemon restart triggers a
+    scoring run at start, so a restart after the notice legitimately re-scores
+    the card and can produce promotions (or drops).
 
     TWO entry points, both landing here (mirroring the drop notice):
       * EVENT-DRIVEN (``fixture_ids`` set): the PLAN hook passes the fixtures it
