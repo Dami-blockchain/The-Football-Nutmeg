@@ -37,6 +37,21 @@ from betbot.timefmt import eat_time
 NON_ADVICE_CAVEAT = "_Model call, not betting advice — accuracy signal, not +EV._"
 
 
+def anchor_note(pred, settings) -> str | None:
+    """A short note for a shown triple that could NOT be market-anchored.
+
+    Returns ``None`` (append nothing) unless ``BETBOT_ANCHOR_LABEL_UNANCHORED``
+    is on AND the prediction carries no ``anchor_source`` -- i.e. the displayed
+    ``p_*`` triple is the RAW model, not shrunk toward a bookmaker line. Flag
+    default OFF -> byte-identical to today.
+    """
+    if settings is None or not getattr(settings, "anchor_label_unanchored", False):
+        return None
+    if getattr(pred, "anchor_source", None):
+        return None
+    return "ℹ️ _Model-only — no market line available to anchor this fixture._"
+
+
 def _kickoff_str(pred) -> str:
     """Kickoff as ``HH:MM EAT`` (Africa/Nairobi); empty if absent.
 
@@ -85,6 +100,9 @@ def format_prediction(
         model += f"   (xG {pred.home_xg:.2f}–{pred.away_xg:.2f})"
 
     parts = [header, winner, model, NON_ADVICE_CAVEAT]
+    _note = anchor_note(pred, settings)
+    if _note:
+        parts.insert(len(parts) - 1, _note)
     return "\n".join(parts)
 
 

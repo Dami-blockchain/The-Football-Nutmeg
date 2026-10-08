@@ -134,6 +134,7 @@ async def _score_once() -> int:
     date_to = (today + timedelta(days=2)).isoformat()
 
     paper_bets_logged = 0
+    coverage = {"scored": 0, "anchored": 0}
     router, _http_clients = _build_router(settings)
 
     async with FootballDataClient(
@@ -185,6 +186,7 @@ async def _score_once() -> int:
                         bets = await _score_and_log_one(
                             m, league, form_service, eng, router, settings,
                             odds_service=odds_service,
+                            coverage=coverage,
                         )
                         paper_bets_logged += bets
                     except FootballDataError as e:
@@ -205,12 +207,54 @@ async def _score_once() -> int:
             for client in _http_clients:
                 await client.close()
 
+    await _anchor_coverage_guard(settings, coverage)
     log.info(
         "scoring_run_done",
         paper_bets=paper_bets_logged,
+        scored=coverage["scored"],
+        anchored=coverage["anchored"],
         daily_exposure_usd=round(daily_paper_exposure_usd(), 2),
     )
     return paper_bets_logged
+
+
+async def _anchor_coverage_guard(settings, coverage: dict) -> None:
+    """Loudly alert the operator when a scoring run's anchored fraction is low.
+
+    This is the guard against a SILENT odds-anchor outage (feed down, feed
+    serving a 200 with no in-scope card, team names stop resolving): the run
+    still writes rows, so nothing else complains, but the rows are unanchored.
+
+    Never fires on a legitimately empty day (``scored == 0``) -- those are
+    normal between rounds / during international breaks. Never raises: a
+    watchdog must not be able to break the scoring run.
+    """
+    log = get_logger(__name__)
+    scored = int(coverage.get("scored", 0))
+    anchored = int(coverage.get("anchored", 0))
+    min_cov = float(getattr(settings, "odds_anchor_min_coverage", 0.0) or 0.0)
+    if scored <= 0 or min_cov <= 0.0:
+        return
+    frac = anchored / scored
+    if frac >= min_cov:
+        return
+    try:
+        await notify_operator(
+            settings,
+            (
+                "⚠️ Odds-anchor coverage LOW: "
+                f"{anchored}/{scored} ({frac:.0%}) of scored fixtures "
+                f"anchored this run (min {min_cov:.0%}). The free odds feed "
+                "(football-data.co.uk fixtures.csv) may be down, empty for our "
+                "leagues, or team names stopped resolving -- users are seeing "
+                "RAW model probabilities. Check the daemon log for "
+                "odds_refresh_* / odds_names_unresolved."
+            ),
+            kind="anchor_coverage_low",
+            dedupe_key=f"anchor_cov_{date.today().isoformat()}",
+        )
+    except Exception as e:  # noqa: BLE001 -- watchdog must never break the run
+        log.warning("anchor_coverage_guard_failed", error=str(e))
 
 
 async def _score_and_log_one(
@@ -222,6 +266,7 @@ async def _score_and_log_one(
     settings,
     *,
     odds_service=None,
+    coverage: dict | None = None,
 ) -> int:
     """Score one fixture and log a paper reco (recommendation record).
 
@@ -260,6 +305,13 @@ async def _score_and_log_one(
         odds_service=odds_service,
         engine=engine,
     )
+    # Anchoring-coverage tally for the end-of-run watchdog (see
+    # _anchor_coverage_guard). Counts every scored fixture and how many carried
+    # a market anchor. Purely observational.
+    if coverage is not None:
+        coverage["scored"] += 1
+        if getattr(prediction, "anchor_source", None):
+            coverage["anchored"] += 1
     log.info(
         "prediction",
         fixture_id=fixture_id,

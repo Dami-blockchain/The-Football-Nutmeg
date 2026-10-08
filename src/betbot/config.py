@@ -132,6 +132,22 @@ class Settings(BaseSettings):
     odds_max_date_slack_days: int = Field(
         default=3, alias="BETBOT_ODDS_DATE_SLACK_DAYS"
     )
+    # Anchoring-coverage watchdog: after a scoring run that wrote >0 rows, if
+    # the fraction anchored to a market falls below this, alert the operator
+    # once per day. Guards against a silent odds-feed outage / name-resolution
+    # break going unnoticed. 0 disables. A legitimately empty day (0 rows
+    # scored) NEVER fires -- the guard keys on the anchored FRACTION, not on a
+    # zero-row run.
+    odds_anchor_min_coverage: float = Field(
+        default=0.5, alias="BETBOT_ODDS_ANCHOR_MIN_COVERAGE"
+    )
+    # When True, prob-showing user messages append a short note on a fixture
+    # that could NOT be anchored to a market line (so the shown triple is the
+    # raw model). Default False -> byte-identical to today; flip forward only
+    # after the review gate.
+    anchor_label_unanchored: bool = Field(
+        default=False, alias="BETBOT_ANCHOR_LABEL_UNANCHORED"
+    )
     odds_team_alias_path: Path = Field(
         default=Path("./config/odds_team_aliases.yaml"),
         alias="BETBOT_ODDS_ALIAS_PATH",

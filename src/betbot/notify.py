@@ -21,7 +21,7 @@ pre-match alerts dead and said nothing.
 from __future__ import annotations
 
 from betbot.leagues import league_label
-from betbot.tips import NON_ADVICE_CAVEAT
+from betbot.tips import NON_ADVICE_CAVEAT, anchor_note
 
 import re
 import asyncio
@@ -276,13 +276,17 @@ def format_high_conf_alert(
         pick_line = f"*Model pick: {pick_team} ({pick_side}) to win* ({_top_p:.0%})"
 
     min_p = float(getattr(settings, "high_conf_alert_min_p", 0.65))
-    return "\n".join([
+    _lines = [
         header,
         pick_line,
         _model_triple_line(pred, top_pick, market_str),
         format_band_line(min_p, live_tally, sold=live_tally_sold),
-        NON_ADVICE_CAVEAT,
-    ])
+    ]
+    _note = anchor_note(pred, settings)
+    if _note:
+        _lines.append(_note)
+    _lines.append(NON_ADVICE_CAVEAT)
+    return "\n".join(_lines)
 
 
 # --------------------------------------------------------------------------
