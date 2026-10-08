@@ -253,14 +253,26 @@ def render_user_predictions(
     for p in visible:
         # Already paid for on a prior path/repeat — always free, never re-charged.
         if already_revealed_fn(user.telegram_user_id, p.fixture_id):
-            parts.append("\n" + format_prediction(p, edge_threshold=edge_threshold))
+            parts.append(
+                "\n" + format_prediction(
+                    p, edge_threshold=edge_threshold, settings=settings
+                )
+            )
             continue
 
         if free_reason:
-            parts.append("\n" + format_prediction(p, edge_threshold=edge_threshold))
+            parts.append(
+                "\n" + format_prediction(
+                    p, edge_threshold=edge_threshold, settings=settings
+                )
+            )
             reveals.append((p.fixture_id, False, _rendered_triple(p)))
         elif paid_revealed < credits:
-            parts.append("\n" + format_prediction(p, edge_threshold=edge_threshold))
+            parts.append(
+                "\n" + format_prediction(
+                    p, edge_threshold=edge_threshold, settings=settings
+                )
+            )
             reveals.append((p.fixture_id, True, _rendered_triple(p)))
             paid_revealed += 1
         else:
@@ -959,6 +971,7 @@ def render_user_lineup_prediction(
         return format_prediction_with_lineup(
             pred, lineup, edge_threshold=edge_threshold,
             adj_note=adj_note, absences=absences,
+            settings=settings,
         )
 
     triple = _rendered_triple(pred)

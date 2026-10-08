@@ -206,7 +206,11 @@ def build_prediction_context(user, settings, *, now: datetime | None = None) -> 
         )
         if entitled:
             lines.append("")
-            lines.append(format_prediction(p, edge_threshold=settings.edge_threshold))
+            lines.append(
+                format_prediction(
+                    p, edge_threshold=settings.edge_threshold, settings=settings
+                )
+            )
         else:
             _league = league_label(getattr(p, "competition_code", None))
             _tag = f" · {_league}" if _league else ""

@@ -4,9 +4,11 @@ Two guards against the SILENT odds-anchor failure mode (feed down / empty for
 our leagues / names stop resolving): the run still writes rows, so nothing
 complains, but every row is unanchored and users see RAW probabilities.
 
+* :func:`betbot.main._tally_anchor_coverage` counts only ANCHORABLE (big-5)
+  fixtures -- CL can never be anchored and must not drag the ratio down.
 * :func:`betbot.main._anchor_coverage_guard` alerts the operator when the
-  anchored FRACTION of a non-empty run falls below the configured floor, and
-  stays silent on a legitimately empty day.
+  anchored FRACTION of a non-empty run falls below the floor, and stays silent
+  on an empty day, a thin day, a disabled anchor, or a deliberate rollback.
 * :func:`betbot.tips.anchor_note` lets a user-facing prediction say so, but only
   when the flag is on and the fixture really is unanchored.
 """
@@ -14,32 +16,35 @@ complains, but every row is unanchored and users see RAW probabilities.
 from __future__ import annotations
 
 import asyncio
-import dataclasses
+from types import SimpleNamespace
 
 from betbot import main as main_mod
-from betbot.strategy.engine import Prediction
+from betbot.daily_jobs import render_user_predictions
+from betbot.entitlement import Entitlement
+from betbot.notify import format_high_conf_alert
 from betbot.tips import anchor_note, format_prediction
 
 
-class _Settings:
-    odds_anchor_min_coverage = 0.5
-    anchor_label_unanchored = False
-
-
-def _pred(anchor_source=None):
-    p = Prediction(
-        fixture_id=1,
-        competition_code="PL",
+def _pred(anchor_source=None, *, code="PL", fid=1):
+    return SimpleNamespace(
+        fixture_id=fid,
+        competition_code=code,
         home_team="Arsenal",
         away_team="Leeds",
         p_home=0.71,
         p_draw=0.18,
         p_away=0.11,
-        home_score=1500.0,
-        away_score=1500.0,
-        draw_score=0.0,
+        home_xg=1.6,
+        away_xg=0.7,
+        kickoff=None,
+        anchor_source=anchor_source,
     )
-    return dataclasses.replace(p, anchor_source=anchor_source)
+
+
+def _cov_settings(settings, **over):
+    base = {"odds_anchor_enabled": True, "odds_anchor_min_coverage": 0.5}
+    base.update(over)
+    return settings.model_copy(update=base)
 
 
 def _run_guard(settings, coverage, monkeypatch):
@@ -54,76 +59,151 @@ def _run_guard(settings, coverage, monkeypatch):
     return sent
 
 
+# ---------------- _tally_anchor_coverage (item 1: CL excluded) ----------------
+def test_tally_counts_only_anchorable_leagues():
+    cov = {"scored": 0, "anchored": 0}
+    for i in range(9):
+        main_mod._tally_anchor_coverage(cov, "CL", _pred(anchor_source=None, code="CL", fid=i))
+    main_mod._tally_anchor_coverage(cov, "PL", _pred(anchor_source="odds", code="PL", fid=99))
+    # Only the single PL fixture is counted; the 9 CL fixtures are ignored.
+    assert cov == {"scored": 1, "anchored": 1}
+
+
+def test_tally_cl_only_run_counts_nothing():
+    cov = {"scored": 0, "anchored": 0}
+    for i in range(3):
+        main_mod._tally_anchor_coverage(cov, "CL", _pred(anchor_source=None, code="CL", fid=i))
+    assert cov == {"scored": 0, "anchored": 0}
+
+
+def test_tally_none_coverage_is_noop():
+    main_mod._tally_anchor_coverage(None, "PL", _pred())  # must not raise
+
+
+def test_tally_unanchored_anchorable_counts_scored_not_anchored():
+    cov = {"scored": 0, "anchored": 0}
+    main_mod._tally_anchor_coverage(cov, "SA", _pred(anchor_source=None, code="SA"))
+    assert cov == {"scored": 1, "anchored": 0}
+
+
 # ---------------- guard ----------------
-def test_guard_fires_when_coverage_below_floor(monkeypatch):
-    sent = _run_guard(_Settings(), {"scored": 10, "anchored": 2}, monkeypatch)
+def test_guard_fires_when_coverage_below_floor(settings, monkeypatch):
+    sent = _run_guard(_cov_settings(settings), {"scored": 10, "anchored": 2}, monkeypatch)
     assert len(sent) == 1
     assert sent[0]["kind"] == "anchor_coverage_low"
     assert "2/10" in sent[0]["text"]
 
 
-def test_guard_silent_when_coverage_ok(monkeypatch):
-    sent = _run_guard(_Settings(), {"scored": 10, "anchored": 8}, monkeypatch)
+def test_guard_silent_when_coverage_ok(settings, monkeypatch):
+    sent = _run_guard(_cov_settings(settings), {"scored": 10, "anchored": 8}, monkeypatch)
     assert sent == []
 
 
-def test_guard_silent_on_empty_day(monkeypatch):
-    # 0 scored -> legitimately fixture-free day, never alert.
-    sent = _run_guard(_Settings(), {"scored": 0, "anchored": 0}, monkeypatch)
+def test_guard_silent_on_empty_day(settings, monkeypatch):
+    sent = _run_guard(_cov_settings(settings), {"scored": 0, "anchored": 0}, monkeypatch)
     assert sent == []
 
 
-def test_guard_disabled_when_floor_zero(monkeypatch):
-    class S(_Settings):
-        odds_anchor_min_coverage = 0.0
-
-    sent = _run_guard(S(), {"scored": 10, "anchored": 0}, monkeypatch)
+def test_guard_silent_on_thin_day(settings, monkeypatch):
+    # Item 5: fewer than 3 anchorable fixtures -> not meaningful, never page.
+    sent = _run_guard(_cov_settings(settings), {"scored": 2, "anchored": 0}, monkeypatch)
     assert sent == []
 
 
-def test_guard_fires_on_total_outage(monkeypatch):
-    # The live 10-08 shape: rows written, zero anchored.
-    sent = _run_guard(_Settings(), {"scored": 27, "anchored": 0}, monkeypatch)
+def test_guard_silent_when_floor_zero(settings, monkeypatch):
+    s = _cov_settings(settings, odds_anchor_min_coverage=0.0)
+    sent = _run_guard(s, {"scored": 10, "anchored": 0}, monkeypatch)
+    assert sent == []
+
+
+def test_guard_silent_when_anchoring_disabled(settings, monkeypatch):
+    # Item 3: a deliberate BETBOT_ODDS_ANCHOR=false rollback must not page daily.
+    s = _cov_settings(settings, odds_anchor_enabled=False)
+    sent = _run_guard(s, {"scored": 10, "anchored": 0}, monkeypatch)
+    assert sent == []
+
+
+def test_guard_fires_on_total_outage(settings, monkeypatch):
+    sent = _run_guard(_cov_settings(settings), {"scored": 27, "anchored": 0}, monkeypatch)
     assert len(sent) == 1
     assert "0/27" in sent[0]["text"]
 
 
-# ---------------- label ----------------
-def test_anchor_note_off_by_default():
-    assert anchor_note(_pred(anchor_source=None), _Settings()) is None
+def test_guard_never_raises_when_notify_raises(settings, monkeypatch):
+    async def _boom(s, text, **kwargs):
+        raise RuntimeError("telegram down")
+
+    monkeypatch.setattr(main_mod, "notify_operator", _boom)
+    # Must swallow the error -- a watchdog cannot break the scoring run.
+    asyncio.run(main_mod._anchor_coverage_guard(_cov_settings(settings), {"scored": 10, "anchored": 0}))
 
 
-def test_anchor_note_none_when_anchored_even_if_flag_on():
-    class S(_Settings):
-        anchor_label_unanchored = True
-
-    assert anchor_note(_pred(anchor_source="odds"), S()) is None
+# ---------------- anchor_note + format_prediction ----------------
+def test_anchor_note_off_by_default(settings):
+    assert anchor_note(_pred(anchor_source=None), settings) is None
 
 
-def test_anchor_note_shown_when_flag_on_and_unanchored():
-    class S(_Settings):
-        anchor_label_unanchored = True
+def test_anchor_note_none_when_anchored_even_if_flag_on(settings):
+    s = settings.model_copy(update={"anchor_label_unanchored": True})
+    assert anchor_note(_pred(anchor_source="odds"), s) is None
 
-    note = anchor_note(_pred(anchor_source=None), S())
+
+def test_anchor_note_shown_when_flag_on_and_unanchored(settings):
+    s = settings.model_copy(update={"anchor_label_unanchored": True})
+    note = anchor_note(_pred(anchor_source=None), s)
     assert note is not None and "Model-only" in note
 
 
-def test_format_prediction_no_note_by_default():
-    out = format_prediction(_pred(anchor_source=None), settings=_Settings())
-    assert "Model-only" not in out
+def test_format_prediction_no_note_by_default(settings):
+    assert "Model-only" not in format_prediction(_pred(anchor_source=None), settings=settings)
 
 
-def test_format_prediction_adds_note_when_flag_on_and_unanchored():
-    class S(_Settings):
-        anchor_label_unanchored = True
-
-    out = format_prediction(_pred(anchor_source=None), settings=S())
-    assert "Model-only" in out
+def test_format_prediction_adds_note_when_flag_on_and_unanchored(settings):
+    s = settings.model_copy(update={"anchor_label_unanchored": True})
+    assert "Model-only" in format_prediction(_pred(anchor_source=None), settings=s)
 
 
-def test_format_prediction_no_note_when_anchored():
-    class S(_Settings):
-        anchor_label_unanchored = True
+def test_format_prediction_no_note_when_anchored(settings):
+    s = settings.model_copy(update={"anchor_label_unanchored": True})
+    assert "Model-only" not in format_prediction(_pred(anchor_source="odds"), settings=s)
 
-    out = format_prediction(_pred(anchor_source="odds"), settings=S())
-    assert "Model-only" not in out
+
+# ---------------- format_high_conf_alert label (item 6) ----------------
+def test_high_conf_alert_label_on_unanchored(settings):
+    s = settings.model_copy(update={"anchor_label_unanchored": True})
+    assert "Model-only" in format_high_conf_alert(_pred(anchor_source=None), s)
+
+
+def test_high_conf_alert_no_label_by_default(settings):
+    assert "Model-only" not in format_high_conf_alert(_pred(anchor_source=None), settings)
+
+
+def test_high_conf_alert_no_label_when_anchored(settings):
+    s = settings.model_copy(update={"anchor_label_unanchored": True})
+    assert "Model-only" not in format_high_conf_alert(_pred(anchor_source="odds"), s)
+
+
+# ---------------- render_user_predictions (item 2) ----------------
+def _ent(reason, *, trial=0, credits=0):
+    allowed = reason in ("operator", "trial", "credit")
+    return Entitlement(allowed=allowed, reason=reason,
+                       trial_days_left=trial, credits_remaining=credits)
+
+
+def test_render_user_predictions_labels_unanchored_when_flag_on(settings):
+    s = settings.model_copy(update={"anchor_label_unanchored": True})
+    text, _ = render_user_predictions(
+        SimpleNamespace(telegram_user_id=111), [_pred(anchor_source=None)], s,
+        entitlement_fn=lambda u, se, now=None: _ent("operator"),
+        already_revealed_fn=lambda uid, fid: False,
+    )
+    assert "Model-only" in text
+
+
+def test_render_user_predictions_no_label_by_default(settings):
+    text, _ = render_user_predictions(
+        SimpleNamespace(telegram_user_id=111), [_pred(anchor_source=None)], settings,
+        entitlement_fn=lambda u, se, now=None: _ent("operator"),
+        already_revealed_fn=lambda uid, fid: False,
+    )
+    assert "Model-only" not in text

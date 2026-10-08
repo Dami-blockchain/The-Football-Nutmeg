@@ -343,6 +343,11 @@ COOLDOWN_SECONDS: dict[str, float] = {
     # "..._fallback" is pure awareness that .co.uk is down and FD.org is
     # covering; weekly so it is not a nag while the outage lasts.
     "club_refresh_fallback": 7 * 24 * 3600.0,
+    # Anchoring-coverage watchdog: the scoring run wrote rows but few/none were
+    # market-anchored. The daily scoring run plus a per-day dedupe_key already
+    # cap this to one/day; the 24h floor reinforces that against ad-hoc
+    # run-once calls so a stuck feed pages once a day, not per rescore.
+    "anchor_coverage_low": 24 * 3600.0,
 }
 
 #: ``(kind, dedupe_key) -> monotonic timestamp of the last SUCCESSFUL send``.

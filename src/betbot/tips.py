@@ -44,6 +44,10 @@ def anchor_note(pred, settings) -> str | None:
     is on AND the prediction carries no ``anchor_source`` -- i.e. the displayed
     ``p_*`` triple is the RAW model, not shrunk toward a bookmaker line. Flag
     default OFF -> byte-identical to today.
+
+    RESULT alerts (:func:`format_result`) are deliberately NOT labelled: the
+    outcome row carries no ``anchor_source`` and the match is already decided,
+    so the note would be noise there.
     """
     if settings is None or not getattr(settings, "anchor_label_unanchored", False):
         return None

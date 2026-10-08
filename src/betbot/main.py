@@ -25,7 +25,7 @@ from betbot.config import get_settings
 from betbot.clubelo_alerts import ClubEloAlerter, run_clubelo_alert
 from betbot.data.football_data import FootballDataClient, FootballDataError
 from betbot.data.form import FormService, _parse_kickoff, _parse_team
-from betbot.data.odds import shared_odds_service
+from betbot.data.odds import LEAGUE_TO_DIV, shared_odds_service
 from betbot.exchanges.matcher import TeamAliasResolver
 from betbot.exchanges.polymarket import PolymarketAdapter
 from betbot.exchanges.polymarket_gamma import GammaClient
@@ -218,6 +218,21 @@ async def _score_once() -> int:
     return paper_bets_logged
 
 
+def _tally_anchor_coverage(coverage, league: str, prediction) -> None:
+    """Record one scored fixture in the anchoring-coverage tally, but ONLY for
+    leagues the free odds feed actually covers (``LEAGUE_TO_DIV``: the big-5).
+
+    CL -- and anything else -- can NEVER be anchored (the feed has no such
+    division), so counting those fixtures would guarantee a false "low
+    coverage" page on a CL-heavy matchday. No-op when ``coverage`` is None.
+    """
+    if coverage is None or league not in LEAGUE_TO_DIV:
+        return
+    coverage["scored"] += 1
+    if getattr(prediction, "anchor_source", None):
+        coverage["anchored"] += 1
+
+
 async def _anchor_coverage_guard(settings, coverage: dict) -> None:
     """Loudly alert the operator when a scoring run's anchored fraction is low.
 
@@ -230,10 +245,16 @@ async def _anchor_coverage_guard(settings, coverage: dict) -> None:
     watchdog must not be able to break the scoring run.
     """
     log = get_logger(__name__)
+    # Anchoring OFF entirely -> a 0% ratio is expected, not a fault; otherwise a
+    # deliberate BETBOT_ODDS_ANCHOR=false rollback would page every day.
+    if not getattr(settings, "odds_anchor_enabled", False):
+        return
     scored = int(coverage.get("scored", 0))
     anchored = int(coverage.get("anchored", 0))
     min_cov = float(getattr(settings, "odds_anchor_min_coverage", 0.0) or 0.0)
-    if scored <= 0 or min_cov <= 0.0:
+    # Need a few ANCHORABLE fixtures before a low ratio means anything (1-2 on a
+    # thin day should not page); scored==0 is a legitimately empty day.
+    if scored < 3 or min_cov <= 0.0:
         return
     frac = anchored / scored
     if frac >= min_cov:
@@ -306,12 +327,8 @@ async def _score_and_log_one(
         engine=engine,
     )
     # Anchoring-coverage tally for the end-of-run watchdog (see
-    # _anchor_coverage_guard). Counts every scored fixture and how many carried
-    # a market anchor. Purely observational.
-    if coverage is not None:
-        coverage["scored"] += 1
-        if getattr(prediction, "anchor_source", None):
-            coverage["anchored"] += 1
+    # _anchor_coverage_guard). Observational only.
+    _tally_anchor_coverage(coverage, league, prediction)
     log.info(
         "prediction",
         fixture_id=fixture_id,
