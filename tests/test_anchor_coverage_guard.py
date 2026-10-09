@@ -220,6 +220,32 @@ def test_format_result_silent_without_settings():
     assert "Model-only" not in body and "Market-anchored" not in body
 
 
+def _outcome_row(anchor):
+    return SimpleNamespace(
+        predicted_pick="HOME", correct=True, actual_outcome="HOME",
+        home_goals=2, away_goals=0,
+        predicted_home=0.7, predicted_draw=0.2, predicted_away=0.1,
+        anchor_source=anchor,
+    )
+
+
+def test_format_result_shown_anchor_overrides_outcome(settings):
+    # The outcome row's FINAL state says anchored, but the call was SOLD
+    # unanchored -> shown_anchor=None must win (badge model-only).
+    from betbot.tips import format_result
+    body = format_result(_outcome_row("odds"), "A", "B",
+                         settings=settings, shown_anchor=None)
+    assert "Model-only" in body and "Market-anchored" not in body
+
+
+def test_format_result_show_badge_false_omits(settings):
+    # Anchor state could not be established -> omit the badge entirely.
+    from betbot.tips import format_result
+    body = format_result(_outcome_row("odds"), "A", "B",
+                         settings=settings, show_badge=False)
+    assert "Model-only" not in body and "Market-anchored" not in body
+
+
 # ---------------- render_user_predictions ----------------
 def _ent(reason, *, trial=0, credits=0):
     allowed = reason in ("operator", "trial", "credit")

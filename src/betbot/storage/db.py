@@ -50,6 +50,14 @@ _ADDITIVE_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("prediction_reveals", "p_home", "FLOAT"),
     ("prediction_reveals", "p_draw", "FLOAT"),
     ("prediction_reveals", "p_away", "FLOAT"),
+    # Market-anchor provenance of the SOLD triple above (the triple actually on
+    # screen at reveal time) — "odds"/"market" or NULL for model-only. Distinct
+    # from prediction_outcomes.anchor_source, which is the FINAL post-rescore
+    # state and can differ from what was sold when an early alert shipped before
+    # the kickoff-60 rescore anchored the fixture. Additive & nullable: rows
+    # written before this column (pre-2026-10-09) carry NULL and are recovered
+    # on read by matching the sold triple to its predictions row.
+    ("prediction_reveals", "anchor_source", "VARCHAR(8)"),
     # Market-anchor provenance + the pre-anchor raw triple (Defect B). Additive
     # & nullable so a deployed predictions/outcomes table gains them cleanly.
     ("predictions", "anchor_source", "VARCHAR(8)"),

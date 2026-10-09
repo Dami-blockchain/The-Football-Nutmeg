@@ -653,6 +653,148 @@ def _sold_triples_by_fixture() -> dict[int, tuple[float, float, float]]:
     return out
 
 
+#: Float tolerance for matching a stored sold triple back to a predictions row.
+#: Both are written from the same in-memory ``p_*`` floats, so an exact match is
+#: expected; the tolerance only guards against round-trip representation drift.
+_TRIPLE_MATCH_TOL = 1e-6
+
+
+def _triples_close(a, b) -> bool:
+    if a is None or b is None or None in a or None in b:
+        return False
+    return all(abs(float(x) - float(y)) < _TRIPLE_MATCH_TOL for x, y in zip(a, b))
+
+
+def _resolve_shown_anchor(
+    fixture_id: int, triple: tuple[float, float, float] | None
+) -> tuple[str | None, bool]:
+    """Recover the anchor state of the triple ACTUALLY SHOWN for a fixture.
+
+    ``prediction_outcomes.anchor_source`` is the FINAL (post-rescore) state, but
+    a fixture can be sold on an EARLY alert before the kickoff-60 rescore
+    anchors it — so the sold triple may be the raw model while the outcome row
+    reads ``odds`` (verified live on 564681 / 564687). This resolves the state
+    of the SOLD triple by matching it back to its ``predictions`` row:
+
+    * sold ≈ a row's stored ``p_*`` -> that row's ``anchor_source`` (``odds`` /
+      ``market`` = anchored; ``None`` = the row shipped raw -> model-only),
+    * else sold ≈ a row's pre-anchor ``raw_p_*`` -> model-only (it was shown
+      before that row was anchored),
+
+    both returned with ``known=True``. No match -> ``(None, False)`` (unknown;
+    the caller omits the badge rather than guess). ``triple is None`` ->
+    ``(None, False)``.
+    """
+    if triple is None:
+        return (None, False)
+    with session_scope() as s:
+        rows = list(
+            s.execute(
+                select(
+                    PredictionRow.p_home,
+                    PredictionRow.p_draw,
+                    PredictionRow.p_away,
+                    PredictionRow.raw_p_home,
+                    PredictionRow.raw_p_draw,
+                    PredictionRow.raw_p_away,
+                    PredictionRow.anchor_source,
+                ).where(PredictionRow.fixture_id == fixture_id)
+            ).all()
+        )
+    # A stored-triple match is authoritative (it carries the row's own
+    # anchor_source); only fall back to a raw-triple match if none is found.
+    for ph, pd, pa, rh, rd, ra, anc in rows:
+        if _triples_close(triple, (ph, pd, pa)):
+            return (anc, True)
+    for ph, pd, pa, rh, rd, ra, anc in rows:
+        if _triples_close(triple, (rh, rd, ra)):
+            return (None, True)
+    return (None, False)
+
+
+def sold_call(
+    fixture_id: int,
+) -> tuple[tuple[float, float, float] | None, str | None, bool]:
+    """``(sold_triple, shown_anchor_source, anchor_known)`` for a fixture.
+
+    The sold triple is the earliest non-NULL reveal triple (as
+    :func:`sold_triple`). The anchor is taken from the reveal row's own
+    ``anchor_source`` when stored (forward rows, resolved at commit time), else
+    recovered via :func:`_resolve_shown_anchor`. ``anchor_known`` is False only
+    when neither path can place the sold triple — the caller then omits the
+    badge rather than quote the possibly-wrong final outcome state.
+    """
+    with session_scope() as s:
+        row = s.execute(
+            select(
+                PredictionReveal.p_home,
+                PredictionReveal.p_draw,
+                PredictionReveal.p_away,
+                PredictionReveal.anchor_source,
+            )
+            .where(PredictionReveal.fixture_id == fixture_id)
+            .where(PredictionReveal.p_home.is_not(None))
+            .where(PredictionReveal.p_draw.is_not(None))
+            .where(PredictionReveal.p_away.is_not(None))
+            .order_by(PredictionReveal.revealed_at.asc(), PredictionReveal.id.asc())
+            .limit(1)
+        ).first()
+    if row is None:
+        return (None, None, False)
+    triple = (float(row[0]), float(row[1]), float(row[2]))
+    stored = row[3]
+    if stored is not None:
+        return (triple, stored, True)
+    anchor, known = _resolve_shown_anchor(fixture_id, triple)
+    return (triple, anchor, known)
+
+
+def _sold_calls_by_fixture() -> dict[int, tuple[tuple[float, float, float], str | None]]:
+    """``{fixture_id: (sold_triple, stored_anchor_source)}`` — one batch read.
+
+    Same canonical "earliest non-NULL reveal" as :func:`_sold_triples_by_fixture`
+    but also carries the reveal row's stored ``anchor_source`` (``None`` on a
+    pre-column row, which the caller recovers via :func:`_resolve_shown_anchor`).
+    """
+    with session_scope() as s:
+        rows = list(
+            s.execute(
+                select(
+                    PredictionReveal.fixture_id,
+                    PredictionReveal.p_home,
+                    PredictionReveal.p_draw,
+                    PredictionReveal.p_away,
+                    PredictionReveal.anchor_source,
+                    PredictionReveal.revealed_at,
+                    PredictionReveal.id,
+                )
+                .where(PredictionReveal.p_home.is_not(None))
+                .where(PredictionReveal.p_draw.is_not(None))
+                .where(PredictionReveal.p_away.is_not(None))
+            ).all()
+        )
+    best: dict[int, tuple] = {}
+    out: dict[int, tuple[tuple[float, float, float], str | None]] = {}
+    for fid, ph, pd, pa, anc, revealed_at, rid in rows:
+        key = (revealed_at, rid)
+        cur = best.get(fid)
+        if cur is None or key < cur:
+            best[fid] = key
+            out[fid] = ((float(ph), float(pd), float(pa)), anc)
+    return out
+
+
+def _fixtures_with_any_reveal() -> set[int]:
+    """Every fixture_id that appears in the reveal ledger (triple or not)."""
+    with session_scope() as s:
+        return {
+            fid
+            for (fid,) in s.execute(
+                select(PredictionReveal.fixture_id).distinct()
+            ).all()
+        }
+
+
 def high_conf_band_tally_sold(min_p: float, *, days: int = 366) -> tuple[int, int]:
     """``(hits, n)`` for high-conf calls measured over what was ACTUALLY SOLD.
 
@@ -729,25 +871,28 @@ def high_conf_record_all(
     ``bug_poisoned_excluded`` rather than silently included or discarded. Pass
     ``start=None`` to include everything.
 
-    Returns a dict::
+    The anchored/unanchored SPLIT attributes anchoring to WHAT WAS SOLD, not the
+    fixture's final ``prediction_outcomes.anchor_source`` (which can disagree
+    when an early alert shipped before the kickoff-60 rescore): the sold triple's
+    anchor is read from the reveal row when stored, else recovered via
+    :func:`_resolve_shown_anchor`. A sold call whose anchor cannot be placed is
+    counted in the overall total but left out of both split buckets
+    (``anchor_unknown``). Stored-fallback calls (no sold triple) count ONLY when
+    the fixture has at least one reveal row, and are judged on the last
+    pre-kickoff (stored) triple; their number is reported as ``pre_ledger``.
 
-        {
-          "n", "hits", "hit_rate",                # overall
-          "anchored":   {"n", "hits", "hit_rate"},
-          "unanchored": {"n", "hits", "hit_rate"},
-          "bug_poisoned_excluded": int,           # dropped by `start`
-          "start": date | None,
-          "calls": [                              # newest kickoff first
-             {"kickoff", "home", "away", "pick", "conf",
-              "correct", "anchored", "basis"}, ...
-          ],
-        }
+    Returns a dict with ``n``/``hits``/``hit_rate`` (overall), ``anchored`` and
+    ``unanchored`` ``{n, hits, hit_rate}`` sub-tallies, ``anchor_unknown``,
+    ``pre_ledger``, ``bug_poisoned_excluded`` (dropped by ``start``), ``start``,
+    and ``calls`` (newest kickoff first; each ``{kickoff, home, away, pick,
+    conf, correct, anchored (True/False/None), basis}``).
 
     HIT-RATE only — never edge/ROI/CLV. The caller presents it honestly and
     flags a small sample.
     """
     rows = {r.fixture_id: r for r in prediction_outcomes_since(days)}
-    sold = _sold_triples_by_fixture()
+    sold = _sold_calls_by_fixture()
+    revealed = _fixtures_with_any_reveal()
 
     # Team names: outcome rows carry none, so map fixture_id -> (home, away)
     # from the predictions table in one read (a fixture can have several
@@ -768,11 +913,21 @@ def high_conf_record_all(
     bug_poisoned = 0
     for fid, row in rows.items():
         if fid in sold:
-            ph, pd, pa = sold[fid]
+            (ph, pd, pa), stored_anchor = sold[fid]
             basis = "sold"
+            if stored_anchor is not None:
+                anchored, known = bool(stored_anchor), True
+            else:
+                a, known = _resolve_shown_anchor(fid, (ph, pd, pa))
+                anchored = bool(a) if known else None
         else:
+            # No sold triple: judge on the stored (last pre-kickoff) triple, but
+            # only for a fixture that actually reached someone (>=1 reveal row).
+            if fid not in revealed:
+                continue
             ph, pd, pa = row.predicted_home, row.predicted_draw, row.predicted_away
             basis = "stored"
+            anchored, known = bool(row.anchor_source), True
         top_pick, top_p = max(
             (("HOME", ph), ("DRAW", pd), ("AWAY", pa)), key=lambda kv: kv[1]
         )
@@ -796,7 +951,7 @@ def high_conf_record_all(
                 # row.correct, which grades the post-rescore pick and would
                 # credit a call that flipped between sale and settlement).
                 "correct": top_pick == row.actual_outcome,
-                "anchored": bool(row.anchor_source),
+                "anchored": None if anchored is None else bool(anchored),
                 "basis": basis,
             }
         )
@@ -808,11 +963,13 @@ def high_conf_record_all(
         hits = sum(1 for c in subset if c["correct"])
         return {"n": n, "hits": hits, "hit_rate": (hits / n) if n else 0.0}
 
-    anchored = [c for c in calls if c["anchored"]]
-    unanchored = [c for c in calls if not c["anchored"]]
+    anchored = [c for c in calls if c["anchored"] is True]
+    unanchored = [c for c in calls if c["anchored"] is False]
     out = _tally(calls)
     out["anchored"] = _tally(anchored)
     out["unanchored"] = _tally(unanchored)
+    out["anchor_unknown"] = sum(1 for c in calls if c["anchored"] is None)
+    out["pre_ledger"] = sum(1 for c in calls if c["basis"] == "stored")
     out["bug_poisoned_excluded"] = bug_poisoned
     out["start"] = start
     out["calls"] = calls
@@ -1696,6 +1853,7 @@ def record_reveal(
     p_home: float | None = None,
     p_draw: float | None = None,
     p_away: float | None = None,
+    anchor_source: str | None = None,
 ) -> bool:
     """Record that this fixture was revealed to this user. Idempotent.
 
@@ -1709,6 +1867,11 @@ def record_reveal(
     idempotency semantics are unchanged, so an existing row is never updated:
     FIRST REVEAL WINS, and that is the sold triple. They default to ``None`` so
     legacy call sites keep working and old rows stay NULL.
+
+    ``anchor_source`` is the market-anchor state of that sold triple at reveal
+    time ("odds"/"market" or ``None`` for model-only), stored alongside so the
+    result alert and the all-time record attribute anchoring to WHAT WAS SOLD
+    rather than the fixture's final post-rescore state.
     """
     try:
         with session_scope() as s:
@@ -1720,6 +1883,7 @@ def record_reveal(
                     p_home=p_home,
                     p_draw=p_draw,
                     p_away=p_away,
+                    anchor_source=anchor_source,
                 )
             )
         return True

@@ -36,6 +36,12 @@ from betbot.timefmt import eat_time
 #: betting advice. Kept in one place so both formatters render identical copy.
 NON_ADVICE_CAVEAT = "_Model call, not betting advice — accuracy signal, not +EV._"
 
+#: Sentinel: ``format_result(shown_anchor=...)`` default meaning "badge off the
+#: outcome row's own anchor_source". A caller that knows the SOLD triple's
+#: anchor state (which can differ from the final post-rescore state) passes it
+#: explicitly instead.
+_USE_OUTCOME_ANCHOR = object()
+
 
 def anchor_badge(anchor_source, settings) -> str | None:
     """One-line market-provenance badge for a shown probability triple.
@@ -192,6 +198,8 @@ def format_result(
     competition_code: str | None = None,
     sold_triple: tuple[float, float, float] | None = None,
     settings=None,
+    shown_anchor=_USE_OUTCOME_ANCHOR,
+    show_badge: bool = True,
 ) -> str:
     """End-of-match RESULT ALERT body for one settled fixture.
 
@@ -243,14 +251,23 @@ def format_result(
         lines.append(
             f"As shown to you: H {sh:.0%} / D {sd:.0%} / A {sa:.0%}"
         )
-    # Market-provenance badge, matching the prediction surfaces. The outcome row
-    # carries ``anchor_source`` verbatim from the prediction it settled (copied
-    # in settlement.py), so the result alert can honestly state whether the call
-    # the user saw was market-anchored. ``settings is None`` -> no badge (legacy
-    # callers / unit tests unchanged); live callers pass settings so it shows.
-    badge = anchor_badge(getattr(outcome_row, "anchor_source", None), settings)
-    if badge:
-        lines.append(badge)
+    # Market-provenance badge, matching the prediction surfaces. The badge must
+    # describe WHAT WAS SOLD, which can differ from the fixture's final
+    # post-rescore ``anchor_source`` when an early alert shipped before the
+    # kickoff-60 rescore anchored it. Callers that know the sold triple's anchor
+    # state pass it via ``shown_anchor`` (and ``show_badge=False`` to omit the
+    # badge when that state cannot be established); the default sentinel falls
+    # back to the outcome row's own anchor_source. ``settings is None`` -> no
+    # badge (legacy callers / unit tests unchanged).
+    if show_badge:
+        anchor = (
+            getattr(outcome_row, "anchor_source", None)
+            if shown_anchor is _USE_OUTCOME_ANCHOR
+            else shown_anchor
+        )
+        badge = anchor_badge(anchor, settings)
+        if badge:
+            lines.append(badge)
     return "\n".join(lines)
 
 

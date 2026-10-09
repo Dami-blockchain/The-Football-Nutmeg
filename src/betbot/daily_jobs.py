@@ -295,13 +295,26 @@ def commit_reveals(user, reveals: list[Reveal]) -> None:
     triple. The sold triple lands on the ledger row only when the row is
     brand-new — first reveal wins.
     """
+    from betbot.storage.repos import _resolve_shown_anchor
+
     for rev in reveals:
         fid, charged = rev[0], rev[1]
         triple = rev[2] if len(rev) > 2 else None
         p_home, p_draw, p_away = triple if triple else (None, None, None)
+        # Resolve the anchor state of the SOLD triple (what is on screen now),
+        # not the fixture's final post-rescore state, and store it with the
+        # reveal so the attribution survives a later rescore. Best-effort: a
+        # lookup miss just stores NULL (read-time recovery still covers it).
+        anchor_source = None
+        if triple is not None:
+            try:
+                anchor_source = _resolve_shown_anchor(fid, triple)[0]
+            except Exception:  # noqa: BLE001 — never block a reveal on this
+                anchor_source = None
         inserted = record_reveal(
             user.telegram_user_id, fid, charged,
             p_home=p_home, p_draw=p_draw, p_away=p_away,
+            anchor_source=anchor_source,
         )
         if inserted and charged:
             increment_predictions_consumed(user.telegram_user_id)
@@ -1448,7 +1461,7 @@ async def run_result_alerts(
         fixture_was_ever_revealed,
         mark_result_notified,
         outcomes_pending_result_alert,
-        sold_triple,
+        sold_call,
     )
     from betbot.tips import format_result
 
@@ -1534,11 +1547,27 @@ async def run_result_alerts(
         # Quote the triple ACTUALLY SOLD when we have it (None for legacy/never-
         # revealed fixtures), so the result echoes what the user paid for rather
         # than the post-rescore triple on the outcome row.
+        # Badge off WHAT WAS SOLD, not the final post-rescore state: an early
+        # alert can ship an unanchored triple that a later rescore then anchors,
+        # so the outcome row's anchor_source would mislabel the call the user
+        # saw. ``sold_call`` returns the sold triple + its resolved anchor state
+        # (stored on the reveal, else recovered by matching the predictions
+        # row). When nothing was sold, only the outcome triple is shown, so the
+        # outcome row's own anchor is correct (sentinel default). When sold but
+        # the anchor can't be placed, omit the badge rather than guess.
+        s_triple, s_anchor, s_known = sold_call(row.fixture_id)
+        if s_triple is None:
+            fr_kwargs = {}  # no sold triple -> badge off the outcome row
+        elif s_known:
+            fr_kwargs = {"shown_anchor": s_anchor}
+        else:
+            fr_kwargs = {"show_badge": False}
         body = "*⚽ Result*\n\n" + format_result(
             row, home, away,
             competition_code=getattr(row, "competition_code", None),
-            sold_triple=sold_triple(row.fixture_id),
+            sold_triple=s_triple,
             settings=settings,
+            **fr_kwargs,
         )
 
         # Group broadcast (BROADCAST-ONLY): the SAME result body ALSO goes to

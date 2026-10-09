@@ -346,6 +346,7 @@ def _render_high_conf_record_body() -> str:
     """
     from betbot.config import get_settings
     from betbot.storage.repos import high_conf_record_all
+    from betbot.strategy.confidence import wilson_interval
 
     min_p = float(getattr(get_settings(), "high_conf_alert_min_p", 0.65))
     rec = high_conf_record_all(min_p)
@@ -362,12 +363,18 @@ def _render_high_conf_record_body() -> str:
             return f"{tag}: none"
         return f"{tag}: {d['hits']}/{d['n']} ({d['hit_rate']:.0%})"
 
+    # 95% Wilson CI on the overall rate — the honesty signal at n too large for
+    # the "small sample" note but still well short of significance.
+    lo, hi = wilson_interval(rec["hits"], n)
     header = (
-        f"*High-confidence record — all time* (p>={min_p:g})\n\n"
-        f"*Overall*: {rec['hits']}/{n} ({rec['hit_rate']:.0%})\n"
+        f"*High-confidence record — all time* (p≥{min_p:g})\n\n"
+        f"*Overall*: {rec['hits']}/{n} ({rec['hit_rate']:.0%}), "
+        f"95% CI {lo:.0%}–{hi:.0%}\n"
         f"{_split('📊 Market-anchored', rec['anchored'])}  ·  "
         f"{_split('⚠️ Model-only', rec['unanchored'])}\n"
     )
+    if rec["anchor_unknown"]:
+        header += f"_({rec['anchor_unknown']} unclassified anchoring)_\n"
     if n < 30:
         header += "_Small sample so far — treat as provisional._\n"
 
@@ -378,7 +385,7 @@ def _render_high_conf_record_body() -> str:
         ko = c["kickoff"]
         day = ko.strftime("%d %b") if ko is not None else "—"
         tick = "✅" if c["correct"] else "❌"
-        badge = "📊" if c["anchored"] else "⚠️"
+        badge = {True: "📊", False: "⚠️"}.get(c["anchored"], "❔")
         pick_team = c["home"] if c["pick"] == "HOME" else c["away"]
         side = "H" if c["pick"] == "HOME" else "A"
         lines.append(
@@ -391,6 +398,11 @@ def _render_high_conf_record_body() -> str:
         lines.append(
             f"_(excluded {rec['bug_poisoned_excluded']} pre-"
             f"{rec['start']:%Y-%m-%d} bug-era call(s))_"
+        )
+    if rec["pre_ledger"]:
+        lines.append(
+            f"_({rec['pre_ledger']} call(s) pre-date the sold ledger "
+            "(pre-2026-09-06) and are judged on the last pre-kickoff triple.)_"
         )
     lines.append(
         "\n_Accuracy, not proof of profit or betting edge. "

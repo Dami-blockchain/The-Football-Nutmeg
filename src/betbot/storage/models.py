@@ -368,6 +368,14 @@ class PredictionReveal(Base):
     p_home: Mapped[float | None] = mapped_column(Float, nullable=True)
     p_draw: Mapped[float | None] = mapped_column(Float, nullable=True)
     p_away: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Market-anchor provenance of the SOLD triple above ("odds"/"market" or NULL
+    # for model-only), captured at reveal time. This is what the fixture was
+    # ACTUALLY anchored to WHEN SOLD, which can differ from the final
+    # ``prediction_outcomes.anchor_source`` if an early alert shipped before the
+    # kickoff-60 rescore anchored it. Additive & nullable: pre-2026-10-09 rows
+    # carry NULL and are recovered on read by matching the sold triple back to
+    # its predictions row.
+    anchor_source: Mapped[str | None] = mapped_column(String(8), nullable=True)
 
 
 class ModelPrediction(Base):
