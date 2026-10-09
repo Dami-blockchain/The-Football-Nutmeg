@@ -1538,6 +1538,7 @@ async def run_result_alerts(
             row, home, away,
             competition_code=getattr(row, "competition_code", None),
             sold_triple=sold_triple(row.fixture_id),
+            settings=settings,
         )
 
         # Group broadcast (BROADCAST-ONLY): the SAME result body ALSO goes to

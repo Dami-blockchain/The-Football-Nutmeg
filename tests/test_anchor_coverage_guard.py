@@ -9,8 +9,10 @@ complains, but every row is unanchored and users see RAW probabilities.
 * :func:`betbot.main._anchor_coverage_guard` alerts the operator when the
   anchored FRACTION of a non-empty run falls below the floor, and stays silent
   on an empty day, a thin day, a disabled anchor, or a deliberate rollback.
-* :func:`betbot.tips.anchor_note` lets a user-facing prediction say so, but only
-  when the flag is on and the fixture really is unanchored.
+* :func:`betbot.tips.anchor_note` lets a user-facing prediction say so: it now
+  marks BOTH states (anchored / model-only) and is ON by default
+  (``BETBOT_ANCHOR_BADGE``), so the badge tests below assert the default-ON
+  behaviour and the one-env rollback.
 """
 
 from __future__ import annotations
@@ -138,71 +140,106 @@ def test_guard_never_raises_when_notify_raises(settings, monkeypatch):
     asyncio.run(main_mod._anchor_coverage_guard(_cov_settings(settings), {"scored": 10, "anchored": 0}))
 
 
-# ---------------- anchor_note + format_prediction ----------------
-def test_anchor_note_off_by_default(settings):
-    assert anchor_note(_pred(anchor_source=None), settings) is None
-
-
-def test_anchor_note_none_when_anchored_even_if_flag_on(settings):
-    s = settings.model_copy(update={"anchor_label_unanchored": True})
-    assert anchor_note(_pred(anchor_source="odds"), s) is None
-
-
-def test_anchor_note_shown_when_flag_on_and_unanchored(settings):
-    s = settings.model_copy(update={"anchor_label_unanchored": True})
-    note = anchor_note(_pred(anchor_source=None), s)
+# ---------------- anchor_note badge (default ON, BOTH states) ----------------
+# The flag was repurposed 2026-10-09: BETBOT_ANCHOR_BADGE (default True) now
+# marks BOTH states on every prediction-carrying message — "📊 Market-anchored"
+# when a market line was used, "⚠️ Model-only" when none was. Off -> silent.
+def test_anchor_note_marks_unanchored_by_default(settings):
+    note = anchor_note(_pred(anchor_source=None), settings)
     assert note is not None and "Model-only" in note
 
 
-def test_format_prediction_no_note_by_default(settings):
-    assert "Model-only" not in format_prediction(_pred(anchor_source=None), settings=settings)
+def test_anchor_note_marks_anchored_by_default(settings):
+    note = anchor_note(_pred(anchor_source="odds"), settings)
+    assert note is not None and "Market-anchored" in note
 
 
-def test_format_prediction_adds_note_when_flag_on_and_unanchored(settings):
-    s = settings.model_copy(update={"anchor_label_unanchored": True})
-    assert "Model-only" in format_prediction(_pred(anchor_source=None), settings=s)
+def test_anchor_note_silent_when_badge_off(settings):
+    s = settings.model_copy(update={"anchor_badge": False})
+    assert anchor_note(_pred(anchor_source=None), s) is None
+    assert anchor_note(_pred(anchor_source="odds"), s) is None
 
 
-def test_format_prediction_no_note_when_anchored(settings):
-    s = settings.model_copy(update={"anchor_label_unanchored": True})
-    assert "Model-only" not in format_prediction(_pred(anchor_source="odds"), settings=s)
+def test_anchor_note_none_without_settings():
+    assert anchor_note(_pred(anchor_source=None), None) is None
 
 
-# ---------------- format_high_conf_alert label (item 6) ----------------
-def test_high_conf_alert_label_on_unanchored(settings):
-    s = settings.model_copy(update={"anchor_label_unanchored": True})
-    assert "Model-only" in format_high_conf_alert(_pred(anchor_source=None), s)
+def test_format_prediction_badges_unanchored_by_default(settings):
+    assert "Model-only" in format_prediction(_pred(anchor_source=None), settings=settings)
 
 
-def test_high_conf_alert_no_label_by_default(settings):
-    assert "Model-only" not in format_high_conf_alert(_pred(anchor_source=None), settings)
+def test_format_prediction_badges_anchored_by_default(settings):
+    assert "Market-anchored" in format_prediction(_pred(anchor_source="odds"), settings=settings)
 
 
-def test_high_conf_alert_no_label_when_anchored(settings):
-    s = settings.model_copy(update={"anchor_label_unanchored": True})
-    assert "Model-only" not in format_high_conf_alert(_pred(anchor_source="odds"), s)
+def test_format_prediction_silent_when_badge_off(settings):
+    s = settings.model_copy(update={"anchor_badge": False})
+    out = format_prediction(_pred(anchor_source="odds"), settings=s)
+    assert "Market-anchored" not in out and "Model-only" not in out
 
 
-# ---------------- render_user_predictions (item 2) ----------------
+# ---------------- format_high_conf_alert badge ----------------
+def test_high_conf_alert_badges_unanchored_by_default(settings):
+    assert "Model-only" in format_high_conf_alert(_pred(anchor_source=None), settings)
+
+
+def test_high_conf_alert_badges_anchored_by_default(settings):
+    assert "Market-anchored" in format_high_conf_alert(_pred(anchor_source="odds"), settings)
+
+
+def test_high_conf_alert_silent_when_badge_off(settings):
+    s = settings.model_copy(update={"anchor_badge": False})
+    out = format_high_conf_alert(_pred(anchor_source=None), s)
+    assert "Model-only" not in out and "Market-anchored" not in out
+
+
+# ---------------- format_result badge ----------------
+def test_format_result_badges_when_settings_passed(settings):
+    from betbot.tips import format_result
+    row = SimpleNamespace(
+        predicted_pick="HOME", correct=True, actual_outcome="HOME",
+        home_goals=2, away_goals=0,
+        predicted_home=0.7, predicted_draw=0.2, predicted_away=0.1,
+        anchor_source="odds",
+    )
+    body = format_result(row, "Arsenal", "Leeds", settings=settings)
+    assert "Market-anchored" in body
+    row.anchor_source = None
+    assert "Model-only" in format_result(row, "Arsenal", "Leeds", settings=settings)
+
+
+def test_format_result_silent_without_settings():
+    from betbot.tips import format_result
+    row = SimpleNamespace(
+        predicted_pick="HOME", correct=True, actual_outcome="HOME",
+        home_goals=2, away_goals=0,
+        predicted_home=0.7, predicted_draw=0.2, predicted_away=0.1,
+        anchor_source=None,
+    )
+    body = format_result(row, "Arsenal", "Leeds")
+    assert "Model-only" not in body and "Market-anchored" not in body
+
+
+# ---------------- render_user_predictions ----------------
 def _ent(reason, *, trial=0, credits=0):
     allowed = reason in ("operator", "trial", "credit")
     return Entitlement(allowed=allowed, reason=reason,
                        trial_days_left=trial, credits_remaining=credits)
 
 
-def test_render_user_predictions_labels_unanchored_when_flag_on(settings):
-    s = settings.model_copy(update={"anchor_label_unanchored": True})
+def test_render_user_predictions_badges_by_default(settings):
     text, _ = render_user_predictions(
-        SimpleNamespace(telegram_user_id=111), [_pred(anchor_source=None)], s,
+        SimpleNamespace(telegram_user_id=111), [_pred(anchor_source=None)], settings,
         entitlement_fn=lambda u, se, now=None: _ent("operator"),
         already_revealed_fn=lambda uid, fid: False,
     )
     assert "Model-only" in text
 
 
-def test_render_user_predictions_no_label_by_default(settings):
+def test_render_user_predictions_silent_when_badge_off(settings):
+    s = settings.model_copy(update={"anchor_badge": False})
     text, _ = render_user_predictions(
-        SimpleNamespace(telegram_user_id=111), [_pred(anchor_source=None)], settings,
+        SimpleNamespace(telegram_user_id=111), [_pred(anchor_source=None)], s,
         entitlement_fn=lambda u, se, now=None: _ent("operator"),
         already_revealed_fn=lambda uid, fid: False,
     )

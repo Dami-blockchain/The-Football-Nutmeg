@@ -141,12 +141,14 @@ class Settings(BaseSettings):
     odds_anchor_min_coverage: float = Field(
         default=0.5, alias="BETBOT_ODDS_ANCHOR_MIN_COVERAGE"
     )
-    # When True, prob-showing user messages append a short note on a fixture
-    # that could NOT be anchored to a market line (so the shown triple is the
-    # raw model). Default False -> byte-identical to today; flip forward only
-    # after the review gate.
-    anchor_label_unanchored: bool = Field(
-        default=False, alias="BETBOT_ANCHOR_LABEL_UNANCHORED"
+    # When True (default), every probability-showing user message carries a
+    # one-line badge stating whether the shown triple was market-anchored
+    # ("Market-anchored") or is the raw model because no market line was
+    # available ("Model-only"). The operator asked for BOTH states marked
+    # explicitly (2026-10-09), so this is ON by default; set
+    # BETBOT_ANCHOR_BADGE=false to roll the whole badge back with one env line.
+    anchor_badge: bool = Field(
+        default=True, alias="BETBOT_ANCHOR_BADGE"
     )
     odds_team_alias_path: Path = Field(
         default=Path("./config/odds_team_aliases.yaml"),

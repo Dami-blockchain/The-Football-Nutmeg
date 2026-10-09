@@ -693,6 +693,132 @@ def high_conf_band_tally_sold(min_p: float, *, days: int = 366) -> tuple[int, in
     return hits, n
 
 
+#: Start date for the ALL-TIME high-confidence record (``/record all``).
+#: Predictions before 2026-08-17 come from the 0/0/100-AWAY bug era and are
+#: poisoned, so the all-time view starts here by default — the SAME epoch the
+#: rolling record already uses (``BETBOT_ACCURACY_LEDGER_EPOCH``). A fixture is
+#: placed by its KICKOFF (not settled_at) because that is what the bug-era
+#: boundary is about. Kept as ONE constant so the boundary is auditable and
+#: a future "include everything" switch is a one-line change.
+HIGH_CONF_RECORD_START: date = date(2026, 8, 17)
+
+
+def high_conf_record_all(
+    min_p: float,
+    *,
+    start: date | None = HIGH_CONF_RECORD_START,
+    days: int = 3660,
+) -> dict:
+    """All-time record of every HIGH-CONFIDENCE call (``/record all``).
+
+    "High-confidence" is decided EXACTLY as the live alert decides it, not
+    reinvented: a fixture counts when its AS-SHOWN top-pick probability is
+    ``>= min_p`` and the top pick is NOT the draw (mirrors
+    :func:`betbot.main.high_conf_alert_passes`). The AS-SHOWN triple is the one
+    ACTUALLY SOLD (from the reveal ledger, :func:`_sold_triples_by_fixture`)
+    when present, else the stored post-rescore triple — the same sold-preferred,
+    stored-fallback basis the live tally uses, applied per fixture so each call
+    is judged at ALERT/SALE time (a later rescore drifting below the bar does
+    not retroactively drop a call that was shown as high-conf).
+
+    Scope is the SAME club-only / current-season / non-degenerate / ledger-epoch
+    filter as the rolling record, via :func:`prediction_outcomes_since`
+    (World Cup & internationals excluded). On top of that, ``start`` drops calls
+    whose KICKOFF predates it — the bug-era guard (default
+    :data:`HIGH_CONF_RECORD_START`); the count dropped is reported as
+    ``bug_poisoned_excluded`` rather than silently included or discarded. Pass
+    ``start=None`` to include everything.
+
+    Returns a dict::
+
+        {
+          "n", "hits", "hit_rate",                # overall
+          "anchored":   {"n", "hits", "hit_rate"},
+          "unanchored": {"n", "hits", "hit_rate"},
+          "bug_poisoned_excluded": int,           # dropped by `start`
+          "start": date | None,
+          "calls": [                              # newest kickoff first
+             {"kickoff", "home", "away", "pick", "conf",
+              "correct", "anchored", "basis"}, ...
+          ],
+        }
+
+    HIT-RATE only — never edge/ROI/CLV. The caller presents it honestly and
+    flags a small sample.
+    """
+    rows = {r.fixture_id: r for r in prediction_outcomes_since(days)}
+    sold = _sold_triples_by_fixture()
+
+    # Team names: outcome rows carry none, so map fixture_id -> (home, away)
+    # from the predictions table in one read (a fixture can have several
+    # prediction rows across rescores — any one carries the same teams).
+    names: dict[int, tuple[str, str]] = {}
+    if rows:
+        with session_scope() as s:
+            for fid, home, away in s.execute(
+                select(
+                    PredictionRow.fixture_id,
+                    PredictionRow.home_team,
+                    PredictionRow.away_team,
+                ).where(PredictionRow.fixture_id.in_(list(rows)))
+            ).all():
+                names.setdefault(fid, (home, away))
+
+    calls: list[dict] = []
+    bug_poisoned = 0
+    for fid, row in rows.items():
+        if fid in sold:
+            ph, pd, pa = sold[fid]
+            basis = "sold"
+        else:
+            ph, pd, pa = row.predicted_home, row.predicted_draw, row.predicted_away
+            basis = "stored"
+        top_pick, top_p = max(
+            (("HOME", ph), ("DRAW", pd), ("AWAY", pa)), key=lambda kv: kv[1]
+        )
+        if top_p < min_p or top_pick == "DRAW":
+            continue
+        ko = row.kickoff
+        if ko is not None and ko.tzinfo is None:
+            ko = ko.replace(tzinfo=timezone.utc)
+        if start is not None and (ko is None or ko.date() < start):
+            bug_poisoned += 1
+            continue
+        home, away = names.get(fid, ("Home", "Away"))
+        calls.append(
+            {
+                "kickoff": ko,
+                "home": home,
+                "away": away,
+                "pick": top_pick,
+                "conf": top_p,
+                # Score the AS-SHOWN pick against the actual result (never
+                # row.correct, which grades the post-rescore pick and would
+                # credit a call that flipped between sale and settlement).
+                "correct": top_pick == row.actual_outcome,
+                "anchored": bool(row.anchor_source),
+                "basis": basis,
+            }
+        )
+
+    calls.sort(key=lambda c: (c["kickoff"] is None, c["kickoff"]), reverse=True)
+
+    def _tally(subset: list[dict]) -> dict:
+        n = len(subset)
+        hits = sum(1 for c in subset if c["correct"])
+        return {"n": n, "hits": hits, "hit_rate": (hits / n) if n else 0.0}
+
+    anchored = [c for c in calls if c["anchored"]]
+    unanchored = [c for c in calls if not c["anchored"]]
+    out = _tally(calls)
+    out["anchored"] = _tally(anchored)
+    out["unanchored"] = _tally(unanchored)
+    out["bug_poisoned_excluded"] = bug_poisoned
+    out["start"] = start
+    out["calls"] = calls
+    return out
+
+
 def outcome_result_notified(fixture_id: int) -> bool:
     """True once the RESULT ALERT has been broadcast for this fixture."""
     with session_scope() as s:

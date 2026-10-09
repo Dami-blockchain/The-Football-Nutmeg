@@ -183,7 +183,7 @@ def build_onboarding_guide(user, settings) -> str:
         "/title – who's winning La Liga? (or /title PL, /title CL)\n"
         "/balance – your balance + credits\n"
         "/status – trial / credits status\n"
-        "/record – how accurate I've been\n"
+        "/record – how accurate I've been (add 'all' for every high-conf call)\n"
         "/guide – show this guide again\n"
         "/help – show this guide\n\n"
         "⚠️ *Not financial advice.* Prediction markets / betting can "
@@ -328,21 +328,105 @@ def _render_record_body() -> str:
     return body
 
 
+#: Max per-call lines in the all-time high-conf list before we cap and say so
+#: (keeps the message well under Telegram's 4096-char limit).
+_HC_RECORD_MAX_ROWS = 25
+
+
+def _render_high_conf_record_body() -> str:
+    """All-time record of EVERY high-confidence call (``/record all``).
+
+    Free, pure-read aggregate: overall hit rate, an anchored-vs-unanchored
+    split, and a per-call list (newest first, capped). "High-confidence" is
+    decided exactly as the live alert decides it (sold-preferred as-shown
+    triple, >=0.65, not the draw) via
+    :func:`betbot.storage.repos.high_conf_record_all`; club-only / current
+    season / bug-era excluded is enforced inside the repo helper. Accuracy —
+    NOT a profit/edge claim.
+    """
+    from betbot.config import get_settings
+    from betbot.storage.repos import high_conf_record_all
+
+    min_p = float(getattr(get_settings(), "high_conf_alert_min_p", 0.65))
+    rec = high_conf_record_all(min_p)
+    n = rec["n"]
+    if n == 0:
+        return (
+            "*High-confidence record — all time*\n\n"
+            "No settled high-confidence calls yet. Once high-confidence "
+            "fixtures finish I'll show how many were right."
+        )
+
+    def _split(tag: str, d: dict) -> str:
+        if not d["n"]:
+            return f"{tag}: none"
+        return f"{tag}: {d['hits']}/{d['n']} ({d['hit_rate']:.0%})"
+
+    header = (
+        f"*High-confidence record — all time* (p>={min_p:g})\n\n"
+        f"*Overall*: {rec['hits']}/{n} ({rec['hit_rate']:.0%})\n"
+        f"{_split('📊 Market-anchored', rec['anchored'])}  ·  "
+        f"{_split('⚠️ Model-only', rec['unanchored'])}\n"
+    )
+    if n < 30:
+        header += "_Small sample so far — treat as provisional._\n"
+
+    calls = rec["calls"]
+    shown = calls[:_HC_RECORD_MAX_ROWS]
+    lines = [header, "—"]
+    for c in shown:
+        ko = c["kickoff"]
+        day = ko.strftime("%d %b") if ko is not None else "—"
+        tick = "✅" if c["correct"] else "❌"
+        badge = "📊" if c["anchored"] else "⚠️"
+        pick_team = c["home"] if c["pick"] == "HOME" else c["away"]
+        side = "H" if c["pick"] == "HOME" else "A"
+        lines.append(
+            f"{tick} {day}: {c['home']} (H) v {c['away']} (A) — "
+            f"{pick_team} ({side}) {c['conf']:.0%} {badge}"
+        )
+    if len(calls) > len(shown):
+        lines.append(f"\n_Showing latest {len(shown)} of {len(calls)}._")
+    if rec["bug_poisoned_excluded"]:
+        lines.append(
+            f"_(excluded {rec['bug_poisoned_excluded']} pre-"
+            f"{rec['start']:%Y-%m-%d} bug-era call(s))_"
+        )
+    lines.append(
+        "\n_Accuracy, not proof of profit or betting edge. "
+        "📊 = anchored to a market line, ⚠️ = model-only (no market odds)._"
+    )
+    return "\n".join(lines)
+
+
+def _wants_all(ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+    """True when the user typed ``/record all`` (any case)."""
+    args = getattr(ctx, "args", None) or []
+    return bool(args) and args[0].strip().lower() == "all"
+
+
 @_authed
 async def record_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        _render_record_body(), parse_mode=ParseMode.MARKDOWN
+    body = (
+        _render_high_conf_record_body()
+        if _wants_all(ctx)
+        else _render_record_body()
     )
+    await update.message.reply_text(body, parse_mode=ParseMode.MARKDOWN)
 
 
 async def record_group_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """/record in an approved group: the SAME public aggregate as the DM, with
-    no auth, no register, no reveal, no charge. Debounced per chat."""
+    no auth, no register, no reveal, no charge. Debounced per chat. ``/record
+    all`` returns the all-time high-confidence record."""
     if _reject_group(update):
         return
-    await update.message.reply_text(
-        _render_record_body(), parse_mode=ParseMode.MARKDOWN
+    body = (
+        _render_high_conf_record_body()
+        if _wants_all(ctx)
+        else _render_record_body()
     )
+    await update.message.reply_text(body, parse_mode=ParseMode.MARKDOWN)
 
 
 def _format_title_race(result: dict, code: str) -> str:

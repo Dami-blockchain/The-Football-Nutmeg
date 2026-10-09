@@ -37,23 +37,37 @@ from betbot.timefmt import eat_time
 NON_ADVICE_CAVEAT = "_Model call, not betting advice — accuracy signal, not +EV._"
 
 
-def anchor_note(pred, settings) -> str | None:
-    """A short note for a shown triple that could NOT be market-anchored.
+def anchor_badge(anchor_source, settings) -> str | None:
+    """One-line market-provenance badge for a shown probability triple.
 
-    Returns ``None`` (append nothing) unless ``BETBOT_ANCHOR_LABEL_UNANCHORED``
-    is on AND the prediction carries no ``anchor_source`` -- i.e. the displayed
-    ``p_*`` triple is the RAW model, not shrunk toward a bookmaker line. Flag
-    default OFF -> byte-identical to today.
+    The operator asked (2026-10-09) that EVERY prediction-carrying message state
+    plainly whether the shown ``p_*`` triple was anchored to a market line or is
+    the raw model. Returns:
 
-    RESULT alerts (:func:`format_result`) are deliberately NOT labelled: the
-    outcome row carries no ``anchor_source`` and the match is already decided,
-    so the note would be noise there.
+    * ``"📊 _Market-anchored_"`` when ``anchor_source`` is set (the triple was
+      shrunk toward a bookmaker / exchange line), or
+    * ``"⚠️ _Model-only — no market odds for this fixture_"`` when it is NULL
+      (no market line was available, so the shown triple is the raw model).
+
+    Gated by ``BETBOT_ANCHOR_BADGE`` (default ON). ``settings is None`` or the
+    flag off -> ``None`` (append nothing), so callers that pass no settings
+    (and the one env rollback) are byte-identical to the pre-badge output.
     """
-    if settings is None or not getattr(settings, "anchor_label_unanchored", False):
+    if settings is None or not getattr(settings, "anchor_badge", True):
         return None
-    if getattr(pred, "anchor_source", None):
-        return None
-    return "ℹ️ _Model-only — no market line available to anchor this fixture._"
+    if anchor_source:
+        return "📊 _Market-anchored_"
+    return "⚠️ _Model-only — no market odds for this fixture_"
+
+
+def anchor_note(pred, settings) -> str | None:
+    """Back-compat shim: the badge for a prediction row's ``anchor_source``.
+
+    Kept so existing call sites (``format_prediction``,
+    ``format_high_conf_alert``) need no change; delegates to
+    :func:`anchor_badge`.
+    """
+    return anchor_badge(getattr(pred, "anchor_source", None), settings)
 
 
 def _kickoff_str(pred) -> str:
@@ -177,6 +191,7 @@ def format_result(
     *,
     competition_code: str | None = None,
     sold_triple: tuple[float, float, float] | None = None,
+    settings=None,
 ) -> str:
     """End-of-match RESULT ALERT body for one settled fixture.
 
@@ -228,6 +243,14 @@ def format_result(
         lines.append(
             f"As shown to you: H {sh:.0%} / D {sd:.0%} / A {sa:.0%}"
         )
+    # Market-provenance badge, matching the prediction surfaces. The outcome row
+    # carries ``anchor_source`` verbatim from the prediction it settled (copied
+    # in settlement.py), so the result alert can honestly state whether the call
+    # the user saw was market-anchored. ``settings is None`` -> no badge (legacy
+    # callers / unit tests unchanged); live callers pass settings so it shows.
+    badge = anchor_badge(getattr(outcome_row, "anchor_source", None), settings)
+    if badge:
+        lines.append(badge)
     return "\n".join(lines)
 
 
