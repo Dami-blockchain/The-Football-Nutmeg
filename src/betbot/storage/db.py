@@ -65,6 +65,10 @@ _ADDITIVE_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("predictions", "raw_p_draw", "FLOAT"),
     ("predictions", "raw_p_away", "FLOAT"),
     ("prediction_outcomes", "anchor_source", "VARCHAR(8)"),
+    # Competition stage for CL fixtures (NULL for domestic + legacy rows),
+    # so the knockout record accrues separately from the league phase.
+    ("predictions", "stage", "VARCHAR(16)"),
+    ("prediction_outcomes", "stage", "VARCHAR(16)"),
     # Score re-verification (Defect: provisional-then-corrected provider
     # scores). ``source_last_updated`` is football-data.org's lastUpdated at
     # the moment we read the score (the field that made 575324 diagnosable);

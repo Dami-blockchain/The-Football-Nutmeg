@@ -82,6 +82,14 @@ class PredictionRow(Base):
     raw_p_draw: Mapped[float | None] = mapped_column(Float, nullable=True)
     raw_p_away: Mapped[float | None] = mapped_column(Float, nullable=True)
 
+    # Competition stage, recorded ONLY for the Champions League so the live
+    # knockout hit rate accrues separately from the 8-game league phase.
+    # Values are football-data.org's raw ``stage`` enum (LEAGUE_STAGE,
+    # PLAYOFFS, LAST_16, QUARTER_FINALS, SEMI_FINALS, FINAL). Additive &
+    # nullable: domestic fixtures and every row written before this column
+    # carry NULL, and every reader must treat a missing value explicitly.
+    stage: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )
@@ -462,6 +470,11 @@ class PredictionOutcome(Base):
     # feed-outage gap). Additive & nullable — legacy rows carry NULLs. Lets the
     # anchored-vs-unanchored validation split the ledger without re-deriving it.
     anchor_source: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    # Competition stage for CL fixtures (football-data.org ``stage`` enum),
+    # carried over from the prediction row so the knockout record splits from
+    # the league phase without re-deriving it. NULL for domestic leagues and
+    # legacy rows. Additive & nullable.
+    stage: Mapped[str | None] = mapped_column(String(16), nullable=True)
     actual_outcome: Mapped[str] = mapped_column(String(4))  # HOME / DRAW / AWAY
     correct: Mapped[bool] = mapped_column(default=False)
 

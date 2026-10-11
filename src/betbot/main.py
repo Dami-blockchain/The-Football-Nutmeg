@@ -23,7 +23,11 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from betbot.config import get_settings
 from betbot.clubelo_alerts import ClubEloAlerter, run_clubelo_alert
-from betbot.data.football_data import FootballDataClient, FootballDataError
+from betbot.data.football_data import (
+    FootballDataClient,
+    FootballDataError,
+    extract_stage,
+)
 from betbot.data.form import FormService, _parse_kickoff, _parse_team
 from betbot.data.odds import LEAGUE_TO_DIV, shared_odds_service
 from betbot.exchanges.matcher import TeamAliasResolver
@@ -345,7 +349,10 @@ async def _score_and_log_one(
         away_form=fixture_form.away_form.weighted_points,
     )
 
-    pred_id = upsert_prediction(prediction, kickoff=kickoff)
+    # Competition stage (CL only) so the knockout record splits from the
+    # league phase; None for domestic leagues and when the payload omits it.
+    stage = extract_stage(match, league)
+    pred_id = upsert_prediction(prediction, kickoff=kickoff, stage=stage)
 
     # Passive dual-log (model_predictions): record the pure-Glicko challenger
     # vs the RAW pre-calibration ensemble for this CLUB fixture. Re-arms the

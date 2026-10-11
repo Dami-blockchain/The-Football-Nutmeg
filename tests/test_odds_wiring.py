@@ -107,9 +107,9 @@ def _capture(monkeypatch) -> list:
     seen: list = []
     real = main_mod.upsert_prediction
 
-    def spy(prediction, *, kickoff):
+    def spy(prediction, *, kickoff, stage=None):
         seen.append(prediction)
-        return real(prediction, kickoff=kickoff)
+        return real(prediction, kickoff=kickoff, stage=stage)
 
     monkeypatch.setattr(main_mod, "upsert_prediction", spy)
     return seen
