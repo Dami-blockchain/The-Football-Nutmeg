@@ -1,0 +1,54 @@
+# Self-built-Elo -> ClubElo name bridge (FALLBACK_SCOPE.md §5a).
+#
+# Keys are the CANONICAL ClubElo Club names (as they appear in
+# data/clubelo_scrape_latest.csv — the candidate pool the build-time bridge
+# resolves against). Values are the alternative spellings the FREE self-built
+# sources use (schochastics "Name (Country)" idents, football-data.co.uk short
+# names, openfootball long names) that a fuzzy-only matcher gets WRONG.
+#
+# Loaded ALONGSIDE config/team_aliases.yaml into one TeamAliasResolver by the
+# build/seed scripts, so resolution is: exact alias FIRST, then exact-
+# normalised, then fuzzy >=0.70, and ambiguous >=0.90 multi-hits are REFUSED
+# (left unresolved -> that club drops to naive) rather than mis-mapped.
+#
+# Keep conservative: a bad alias silently prices a CL side off the wrong club.
+# Hand-corrected from the residual misses the Task A anchor bridge exposed.
+
+aliases:
+  # --- the concrete failures §5a calls out ---
+  "Paris SG": ["Paris Saint-Germain", "Paris Saint-Germain FC", "PSG", "Paris SG"]
+  "Man City": ["Manchester City", "Manchester City FC", "Man City"]
+  "Man United": ["Manchester United", "Manchester United FC", "Man Utd", "Man United"]
+  "Inter": ["Internazionale", "Internazionale Milano", "Inter Milan", "FC Internazionale Milano"]
+  "Milan": ["AC Milan", "Milan AC", "Associazione Calcio Milan"]
+  "Karabakh Agdam": ["Qarabag Agdam", "Qarabag", "Qarabağ", "Qarabag FK", "FK Qarabag"]
+  "Bodoe Glimt": ["Bodo/Glimt", "Bodo Glimt", "FK Bodo/Glimt", "Bodø/Glimt"]
+
+  # --- frequent CL clubs whose conventions differ across the free sources ---
+  "Bayern": ["Bayern Munich", "FC Bayern München", "Bayern Munchen", "FC Bayern"]
+  "Dortmund": ["Borussia Dortmund", "BVB", "Bor. Dortmund"]
+  "Gladbach": ["Borussia Mönchengladbach", "Borussia Monchengladbach", "M'gladbach"]
+  "Leverkusen": ["Bayer Leverkusen", "Bayer 04 Leverkusen"]
+  "Atletico": ["Atletico Madrid", "Atlético de Madrid", "Atletico de Madrid", "Ath Madrid"]
+  "Betis": ["Real Betis", "Real Betis Balompié", "Betis Sevilla"]
+  "Sociedad": ["Real Sociedad", "Real Sociedad de Futbol", "La Real"]
+  "Ath Bilbao": ["Athletic Bilbao", "Athletic Club", "Athletic Club Bilbao"]
+  "Sevilla": ["Sevilla FC", "Sevilla CF"]
+  "Sporting": ["Sporting CP", "Sporting Lisbon", "Sporting Clube de Portugal"]
+  "Porto": ["FC Porto", "Futebol Clube do Porto"]
+  "Benfica": ["SL Benfica", "Sport Lisboa e Benfica"]
+  "Braga": ["SC Braga", "Sporting Braga", "Sporting Clube de Braga"]
+  "Shakhtar": ["Shakhtar Donetsk", "FC Shakhtar Donetsk", "Sh. Donetsk"]
+  "Dynamo Kyiv": ["Dynamo Kiev", "FC Dynamo Kyiv", "Dinamo Kiev"]
+  "Red Star": ["Crvena Zvezda", "FK Crvena Zvezda", "Red Star Belgrade"]
+  "Salzburg": ["RB Salzburg", "Red Bull Salzburg", "FC Salzburg"]
+  "Slavia Prague": ["Slavia Praha", "SK Slavia Praha", "Slavia Praha Prague"]
+  "Sparta Prague": ["Sparta Praha", "AC Sparta Praha"]
+  "Club Brugge": ["Club Brugge KV", "Brugge", "FC Bruges"]
+  "PSV": ["PSV Eindhoven", "PSV FC"]
+  "Feyenoord": ["Feyenoord Rotterdam"]
+  "Celtic": ["Celtic FC", "Celtic Glasgow"]
+  "Galatasaray": ["Galatasaray SK", "Galatasaray Istanbul"]
+  "Copenhagen": ["FC Copenhagen", "FC Kobenhavn", "FC København"]
+  "Olympiakos": ["Olympiacos", "Olympiacos Piraeus", "Olympiakos Piraeus"]
+  "Young Boys": ["BSC Young Boys", "Young Boys Bern"]
