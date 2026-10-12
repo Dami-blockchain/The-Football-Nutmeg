@@ -115,16 +115,16 @@ def _save_state(state: EloState) -> None:
     }))
 
 
-def _merged_aliases() -> dict[str, list[str]]:
-    aliases: dict[str, list[str]] = {}
-    for p in ("config/team_aliases.yaml", "config/selfbuilt_elo_aliases.yaml"):
-        fp = Path(p)
-        if fp.exists():
-            data = yaml.safe_load(fp.read_text()) or {}
-            for canon, alts in (data.get("aliases") or {}).items():
-                aliases.setdefault(canon, [])
-                aliases[canon].extend(alts or [])
-    return aliases
+def _selfbuilt_aliases() -> dict[str, list[str]]:
+    # ONLY the self-built table (ClubElo-key canonicals). team_aliases.yaml is
+    # the engine's football-data.org->market table — a different canonical
+    # space — and merging it collides with these ClubElo keys (e.g. "Paris SG"
+    # is a canonical here but an alt of "Paris Saint-Germain FC" there), which
+    # AliasFolder now rejects. The engine serve path still uses team_aliases via
+    # its own resolver; only this build-time bridge uses the self-built table.
+    fp = Path("config/selfbuilt_elo_aliases.yaml")
+    data = yaml.safe_load(fp.read_text()) if fp.exists() else {}
+    return (data or {}).get("aliases") or {}
 
 
 async def _fetch_cl(seasons: list[int], today: date) -> tuple[list, dict[str, str]]:
@@ -168,7 +168,7 @@ def main() -> int:
         log.error("selfbuilt_build_no_state", hint="seed first")
         return 1
 
-    aliases = _merged_aliases()
+    aliases = _selfbuilt_aliases()
     state_idents = list(state.ratings.keys())
     before_idents = set(state.ratings)
     cutoff = state.last_date   # the seed authoritatively covers up to here

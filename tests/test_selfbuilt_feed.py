@@ -45,15 +45,10 @@ _FD_CSV = (
 
 
 def _aliases() -> dict[str, list[str]]:
-    out: dict[str, list[str]] = {}
-    for p in ("config/team_aliases.yaml", "config/selfbuilt_elo_aliases.yaml"):
-        fp = _REPO / p
-        if fp.exists():
-            data = yaml.safe_load(fp.read_text()) or {}
-            for canon, alts in (data.get("aliases") or {}).items():
-                out.setdefault(canon, [])
-                out[canon].extend(alts or [])
-    return out
+    # ONLY the self-built ClubElo-key table (team_aliases.yaml is a different
+    # canonical space and AliasFolder now rejects the cross-table collisions).
+    data = yaml.safe_load((_REPO / "config/selfbuilt_elo_aliases.yaml").read_text())
+    return (data or {}).get("aliases") or {}
 
 
 # ---- 200-not-payload guard -------------------------------------------
@@ -342,23 +337,50 @@ def test_cl_and_domestic_names_fold_zero_new_idents():
 
 
 def test_no_alias_canonical_collision_within_country():
-    # No alias may fold two DIFFERENT same-country ClubElo keys to one canonical,
-    # and known-distinct same-country seed clubs must stay distinct.
-    import csv as _csv
-    from betbot.data.selfbuilt_feed import AliasFolder
+    # (1) Among the REAL seed idents, any same-country pair that folds to one
+    # canonical must be the SAME club — i.e. one's token set ⊆ the other's.
+    # Catches e.g. a mistaken Frankfurt += ["Bayern München"] (eintracht,
+    # frankfurt vs bayern,munchen are not subsets).
+    from betbot.data.selfbuilt_feed import AliasFolder, _ftokens, _translit, strip_country
     folder = AliasFolder(_aliases())
-    rows = list(_csv.DictReader(
-        (_REPO / "tests/data/clubelo_scrape_sample.csv").open()))
-    by_ctry: dict = {}
-    for r in rows:
-        by_ctry.setdefault(r["Country"], {}).setdefault(folder.canon_norm(r["Club"]), []).append(r["Club"])
-    collisions = {c: fold for c, folds in by_ctry.items()
-                  for fold, clubs in folds.items() if len(clubs) > 1}
-    assert collisions == {}, f"alias canonical collisions: {collisions}"
-    # Known-distinct clubs must not collapse onto one another.
+    seed = json.loads((_REPO / "tests/data/seed_idents_sample.json").read_text())
+    by: dict = {}
+    for ident, _g in seed:
+        c = strip_country(ident)[1]
+        by.setdefault(c, {}).setdefault(folder.canon_norm(ident), []).append(ident)
+    for _c, folds in by.items():
+        for _canon, idents in folds.items():
+            if len(idents) < 2:
+                continue
+            tok = [_ftokens(i) for i in idents]
+            for i in range(len(tok)):
+                for j in range(i + 1, len(tok)):
+                    assert tok[i] <= tok[j] or tok[j] <= tok[i], \
+                        f"different clubs fold together: {idents}"
+    # (2) No alt's _translit may equal a DIFFERENT canonical key's _translit.
+    aliases = _aliases()
+    canon_translits = {c: _translit(c) for c in aliases}
+    canon_by_translit = {t: c for c, t in canon_translits.items()}
+    for canon, alts in aliases.items():
+        for alt in alts:
+            at = _translit(alt)
+            owner = canon_by_translit.get(at)
+            assert owner in (None, canon), \
+                f"alt {alt!r} of {canon!r} collides with canonical {owner!r}"
+    # (3) Known-distinct clubs must stay distinct.
     for a, b in [("Sporting CP", "Sporting Braga"), ("Inter", "Milan"),
-                 ("AEK Athens", "Olympiakos Piraeus"), ("Hellas Verona", "Chievo Verona")]:
+                 ("AEK Athens", "Olympiakos Piraeus"), ("Hellas Verona", "Chievo Verona"),
+                 ("KSK Beveren", "Waasland Beveren")]:
         assert folder.canon_norm(a) != folder.canon_norm(b), f"{a} == {b}"
+
+
+def test_aliasfolder_raises_on_conflicting_alt():
+    from betbot.data.selfbuilt_feed import AliasFolder
+    # "Shared Alt" folds to two different canonicals -> must raise, not last-wins.
+    with pytest.raises(ValueError, match="fold conflict"):
+        AliasFolder({"Club A": ["Shared Alt"], "Club B": ["Shared Alt"]})
+    # The shipped table must itself be conflict-free (no raise).
+    AliasFolder(_aliases())
 
 
 # ---- snapshot round-trip --------------------------------------------

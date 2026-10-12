@@ -20,11 +20,19 @@ with the LIVE 51/312 constants (option (a)). The build constants here
 
 Name bridge (FALLBACK_SCOPE.md §5a, as corrected by the Fable review): the
 schochastics idents are ``"Name (Country)"`` and ClubElo uses a 3-letter
-``Country`` code, so matching is restricted to the SAME country, the
-``(Country)`` suffix is stripped before normalising, a single shared token can
-never score a match (``>= 2`` shared tokens or an exact normalised equality is
-required), and a collision (two idents contesting one ClubElo key) is left
-UNRESOLVED unless an alias pins it — never "most games wins".
+``Country`` code, so matching is restricted to the SAME country and the
+``(Country)`` suffix is stripped before normalising.
+
+Two matchers with deliberately different collision policies:
+
+* ``bridge_to_clubelo`` (self-built ident -> ClubElo key): a single shared token
+  can never score a match (``>= 2`` shared tokens or an exact equality), and a
+  collision (two idents contesting one ClubElo key) is left UNRESOLVED unless an
+  alias pins it — never "most games wins".
+* ``align_to_state`` (feed name -> seed ident): unique token-SUBSET plus an
+  exact alias-fold pass, and when SEVERAL seed spellings share one canonical
+  (the SAME club) it keeps the MOST-GAMES ident so a club's history consolidates
+  rather than splitting. Only the bridge refuses a same-canonical collision.
 """
 
 from __future__ import annotations
@@ -305,9 +313,20 @@ class AliasFolder:
         self._fold: dict[str, str] = {}
         for canon, alts in (alias_map or {}).items():
             cn = _translit(canon)
-            self._fold[cn] = cn
+            self._set(cn, cn)
             for alt in alts or []:
-                self._fold[_translit(strip_country(alt)[0])] = cn
+                self._set(_translit(strip_country(alt)[0]), cn)
+
+    def _set(self, key: str, canon: str) -> None:
+        prev = self._fold.get(key)
+        if prev is not None and prev != canon:
+            # A folded form already maps to a DIFFERENT canonical — a silent
+            # last-wins would merge two distinct clubs. Fail loud so the table
+            # is fixed (conflicts must be same-club only).
+            raise ValueError(
+                f"alias fold conflict: {key!r} -> {prev!r} and {canon!r}"
+            )
+        self._fold[key] = canon
 
     def canon_norm(self, name: str) -> str:
         base = _translit(name)

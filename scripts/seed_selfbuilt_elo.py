@@ -68,16 +68,11 @@ def _export_eu_results() -> None:
     """)
 
 
-def _merged_aliases() -> dict[str, list[str]]:
-    aliases: dict[str, list[str]] = {}
-    for p in ("config/team_aliases.yaml", "config/selfbuilt_elo_aliases.yaml"):
-        fp = Path(p)
-        if fp.exists():
-            data = yaml.safe_load(fp.read_text()) or {}
-            for canon, alts in (data.get("aliases") or {}).items():
-                aliases.setdefault(canon, [])
-                aliases[canon].extend(alts or [])
-    return aliases
+def _selfbuilt_aliases() -> dict[str, list[str]]:
+    # ONLY the self-built ClubElo-key table (see build_selfbuilt_elo.py).
+    fp = Path("config/selfbuilt_elo_aliases.yaml")
+    data = yaml.safe_load(fp.read_text()) if fp.exists() else {}
+    return (data or {}).get("aliases") or {}
 
 
 def main() -> int:
@@ -121,7 +116,7 @@ def main() -> int:
     settings = get_settings()
     ce_rows = load_clubelo_rows(Path(settings.cl_snapshot_path))
     country_of = {club: code for club, code in ce_rows}
-    aliases = _merged_aliases()
+    aliases = _selfbuilt_aliases()
     snap, unresolved = bridge_to_clubelo(
         state.ratings, state.games, ce_rows, aliases,
     )
