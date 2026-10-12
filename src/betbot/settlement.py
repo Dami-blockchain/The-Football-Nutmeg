@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from betbot.data.football_data import FootballDataClient
+from betbot.data.football_data import FootballDataClient, extract_stage
 from betbot.logging import get_logger
 from betbot.notify import notify_operator
 from betbot.storage.repos import (
@@ -292,6 +292,8 @@ class SettlementWatcher:
                     kickoff=ko,
                     anchor_source=pred.anchor_source,
                     source_last_updated=match.get("lastUpdated"),
+                    stage=extract_stage(match, pred.competition_code)
+                    or getattr(pred, "stage", None),
                 )
             except Exception as e:  # noqa: BLE001 — one bad row mustn't stop the rest
                 log.warning(

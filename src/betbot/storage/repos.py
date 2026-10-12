@@ -37,7 +37,7 @@ log = get_logger(__name__)
 
 
 def upsert_prediction(
-    prediction: Prediction, *, kickoff: datetime
+    prediction: Prediction, *, kickoff: datetime, stage: str | None = None
 ) -> int:
     """Insert a prediction row (or update if (fixture_id, run_date) exists).
 
@@ -83,6 +83,12 @@ def upsert_prediction(
             existing.away_xg = prediction.away_xg
             existing.anchor_source = anchor_source
             existing.raw_p_home, existing.raw_p_draw, existing.raw_p_away = raw
+            # Preserve-on-None: the kickoff-60 rescore re-upserts the same
+            # (fixture_id, run_date) row WITHOUT the match payload, so it
+            # passes stage=None. Only overwrite when a value is supplied, so
+            # the stage logged at the daily run is never clobbered to NULL.
+            if stage is not None:
+                existing.stage = stage
             s.flush()
             return existing.id
         row = PredictionRow(
@@ -104,6 +110,7 @@ def upsert_prediction(
             raw_p_home=raw[0],
             raw_p_draw=raw[1],
             raw_p_away=raw[2],
+            stage=stage,
         )
         s.add(row)
         s.flush()
@@ -295,6 +302,7 @@ def record_prediction_outcome(
     kickoff: datetime | None = None,
     anchor_source: str | None = None,
     source_last_updated: str | None = None,
+    stage: str | None = None,
 ) -> bool:
     """INSERT-OR-IGNORE one scored prediction. Returns True iff NEWLY inserted.
 
@@ -335,6 +343,7 @@ def record_prediction_outcome(
                     settled_at=settled_at,
                     anchor_source=anchor_source,
                     source_last_updated=source_last_updated,
+                    stage=stage,
                     score_verify_count=0,
                 )
             )
@@ -954,6 +963,10 @@ def high_conf_record_all(
                 "correct": top_pick == row.actual_outcome,
                 "anchored": None if anchored is None else bool(anchored),
                 "basis": basis,
+                # CL competition stage (None for domestic / legacy rows) so the
+                # /record all list can flag knockout calls; rendered via
+                # tips.stage_label, which shows nothing when None/unknown.
+                "stage": getattr(row, "stage", None),
             }
         )
 

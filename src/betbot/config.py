@@ -150,6 +150,15 @@ class Settings(BaseSettings):
     anchor_badge: bool = Field(
         default=True, alias="BETBOT_ANCHOR_BADGE"
     )
+    # When True (default), every CL (Champions League) prediction-carrying
+    # message shows the competition stage ("League phase" / a named knockout
+    # round) so the operator is conscious knockout calls run weaker (~67% vs
+    # ~76% at 0.65). Domestic leagues and unknown/NULL stages show NOTHING.
+    # Follows the BETBOT_ANCHOR_BADGE pattern; set BETBOT_STAGE_BADGE=false to
+    # roll it back with one env line.
+    stage_badge: bool = Field(
+        default=True, alias="BETBOT_STAGE_BADGE"
+    )
     odds_team_alias_path: Path = Field(
         default=Path("./config/odds_team_aliases.yaml"),
         alias="BETBOT_ODDS_ALIAS_PATH",

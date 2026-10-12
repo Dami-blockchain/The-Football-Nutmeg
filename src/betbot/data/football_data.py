@@ -202,3 +202,30 @@ class FootballDataClient:
             if "404" in str(e):
                 return None
             raise
+
+
+# --- competition stage extraction (CL knockout vs league-phase split) ------
+# football-data.org match payloads carry a top-level ``stage`` enum. For the
+# Champions League (2024/25+ format) that is one of LEAGUE_STAGE, PLAYOFFS,
+# LAST_16, QUARTER_FINALS, SEMI_FINALS, FINAL. We log it so the live knockout
+# hit rate accrues separately from the 8-game league phase.
+def extract_stage(
+    match: dict[str, Any] | None, competition_code: str | None
+) -> str | None:
+    """Return the CL competition stage from a match payload, else ``None``.
+
+    Recorded ONLY for the Champions League (``competition_code == "CL"``):
+    domestic leagues are always ``REGULAR_SEASON`` and stay NULL by design.
+    Missing / blank / non-CL -> ``None``, so a payload without the ``stage``
+    key never breaks ``predict`` or storage. Value is upper-cased and clamped
+    to the column width (16) defensively.
+    """
+    if not isinstance(match, dict):
+        return None
+    if (competition_code or "").strip().upper() != "CL":
+        return None
+    raw = match.get("stage")
+    if raw is None:
+        return None
+    cleaned = str(raw).strip().upper()
+    return cleaned[:16] or None

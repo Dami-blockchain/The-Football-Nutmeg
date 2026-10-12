@@ -347,8 +347,10 @@ def _render_high_conf_record_body() -> str:
     from betbot.config import get_settings
     from betbot.storage.repos import high_conf_record_all
     from betbot.strategy.confidence import wilson_interval
+    from betbot.tips import stage_label
 
-    min_p = float(getattr(get_settings(), "high_conf_alert_min_p", 0.65))
+    settings_obj = get_settings()
+    min_p = float(getattr(settings_obj, "high_conf_alert_min_p", 0.65))
     rec = high_conf_record_all(min_p)
     n = rec["n"]
     if n == 0:
@@ -388,9 +390,11 @@ def _render_high_conf_record_body() -> str:
         badge = {True: "📊", False: "⚠️"}.get(c["anchored"], "❔")
         pick_team = c["home"] if c["pick"] == "HOME" else c["away"]
         side = "H" if c["pick"] == "HOME" else "A"
+        _stage = stage_label(c.get("stage"), settings_obj)
+        stage_tag = f" · {_stage}" if _stage else ""
         lines.append(
             f"{tick} {day}: {c['home']} (H) v {c['away']} (A) — "
-            f"{pick_team} ({side}) {c['conf']:.0%} {badge}"
+            f"{pick_team} ({side}) {c['conf']:.0%} {badge}{stage_tag}"
         )
     if len(calls) > len(shown):
         lines.append(f"\n_Showing latest {len(shown)} of {len(calls)}._")

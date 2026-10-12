@@ -21,7 +21,7 @@ pre-match alerts dead and said nothing.
 from __future__ import annotations
 
 from betbot.leagues import league_label
-from betbot.tips import NON_ADVICE_CAVEAT, anchor_note
+from betbot.tips import NON_ADVICE_CAVEAT, anchor_note, stage_label
 
 import re
 import asyncio
@@ -255,6 +255,9 @@ def format_high_conf_alert(
     header = f"\U0001f3af *HIGH-CONFIDENCE ALERT* — {home} (HOME) v {away} (AWAY)"
     if league:
         header += f", {league}"
+    _stage = stage_label(getattr(pred, "stage", None), settings)
+    if _stage:
+        header += f", {_stage}"
     if ko:
         header += f", KO {ko} EAT"
 
