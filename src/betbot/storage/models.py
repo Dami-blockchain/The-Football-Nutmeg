@@ -744,6 +744,11 @@ class ClRatingShadow(Base):
     favourite: Mapped[str] = mapped_column(String(4))   # HOME | DRAW | AWAY
 
     snapshot_age_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # ENGINE-LEVEL state for this scoring run, NOT a per-source/per-row fact:
+    # it is the engine's `fallback_engaged` (True iff the site scrape was stale
+    # and the flag was ON, so CL was priced off a degraded source). It is copied
+    # onto BOTH source rows of a fixture identically — read it as "the fallback
+    # was engaged when these shadow rows were logged", not "this source was used".
     fallback_engaged: Mapped[bool] = mapped_column(Boolean, default=False)
 
     created_at: Mapped[datetime] = mapped_column(

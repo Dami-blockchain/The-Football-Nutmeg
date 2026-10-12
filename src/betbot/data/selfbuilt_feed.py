@@ -1,20 +1,30 @@
 """Free-data feed + Elo builder for the self-built CL fallback snapshot.
 
-Pure, stdlib-only, importable + unit-tested. The operator-run scripts
+Pure, stdlib + rapidfuzz, importable + unit-tested. The operator-run scripts
 (``scripts/seed_selfbuilt_elo.py``, ``scripts/build_selfbuilt_elo.py``) are
 thin orchestrators over this module; the load-bearing, FREE-only-critical parts
 — the 200-not-payload fetch guard, the football-data.co.uk parser, the Elo
-update and the ClubElo name bridge — live here so they are tested.
+update and the COUNTRY-RESTRICTED ClubElo name bridge — live here so they are
+tested.
 
 NEVER pay: every source is free and keyless —
-``football-data.co.uk/mmz4281/{season}/{div}.csv`` (same source odds.py uses)
-and ``openfootball/europe`` (weekly-fresh UEFA results). No API key, no
-subscription.
+``football-data.co.uk/mmz4281/{season}/{div}.csv`` for the domestic divisions,
+and football-data.org (free tier, via ``FootballDataClient``) for Champions
+League finished matches. Europa League / Conference League finished results are
+NOT on a free feed, so the cross-league linkage is CL-only (documented).
 
 Elo spec (matches the validated prototype, api.clubelo-like BUILD scale): the
 SNAPSHOT stores RAW ratings on this scale (SD ~147); the engine prices them
 with the LIVE 51/312 constants (option (a)). The build constants here
-(K/HA/DIVISOR) are NOT the serve constants and must not be confused with them.
+(K/HA/DIVISOR) are NOT the serve constants.
+
+Name bridge (FALLBACK_SCOPE.md §5a, as corrected by the Fable review): the
+schochastics idents are ``"Name (Country)"`` and ClubElo uses a 3-letter
+``Country`` code, so matching is restricted to the SAME country, the
+``(Country)`` suffix is stripped before normalising, a single shared token can
+never score a match (``>= 2`` shared tokens or an exact normalised equality is
+required), and a collision (two idents contesting one ClubElo key) is left
+UNRESOLVED unless an alias pins it — never "most games wins".
 """
 
 from __future__ import annotations
@@ -23,13 +33,20 @@ import csv
 import io
 import re
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
+
+from rapidfuzz import fuzz
+
+from betbot.exchanges.matcher import normalize
 
 # ---- Elo BUILD constants (NOT the serve 51/312; see module docstring) -------
 ELO_K = 20.0
 ELO_HA = 65.0
 ELO_DIVISOR = 400.0
 ELO_INIT = 1500.0
+
+#: Fuzzy acceptance (token_set_ratio, 0-100) when >= 2 tokens are shared.
+FUZZY_THRESHOLD = 80.0
 
 
 class FeedError(Exception):
@@ -50,9 +67,7 @@ def validate_csv_body(
 
     Rejects (raises :class:`FeedError`) when the body is HTML / a CDN shield
     page, when the declared content-type is HTML, when the header is missing a
-    required column, or when fewer than ``min_rows`` data rows parse. This is
-    the hazard memory flags for football-data.co.uk (HTTP 200 whose body is not
-    the CSV). On success returns the rows as dicts.
+    required column, or when fewer than ``min_rows`` data rows parse.
     """
     if content_type and "html" in content_type.lower():
         raise FeedError(f"content-type is HTML, not CSV: {content_type!r}")
@@ -80,7 +95,7 @@ class Result:
     away: str
     gh: int
     ga: int
-    competition: str  # "DOM" (domestic) or "UEFA CL" etc.
+    competition: str  # "DOM" or "UEFA CL"
 
 
 def _parse_fd_date(raw: str) -> date | None:
@@ -88,7 +103,6 @@ def _parse_fd_date(raw: str) -> date | None:
     raw = (raw or "").strip()
     for fmt in ("%d/%m/%Y", "%d/%m/%y"):
         try:
-            from datetime import datetime
             return datetime.strptime(raw, fmt).date()
         except ValueError:
             continue
@@ -101,8 +115,8 @@ def parse_football_data_co_uk(
     """Parse one mmz4281 division CSV into domestic results.
 
     Required columns: Date, HomeTeam, AwayTeam, FTHG, FTAG. Rows with an
-    unparseable date or non-integer score are skipped (never crash the build),
-    and the whole body is 200-not-payload-guarded first.
+    unparseable date or non-integer score are skipped, and the whole body is
+    200-not-payload-guarded first.
     """
     rows = validate_csv_body(
         body, content_type=content_type,
@@ -127,66 +141,7 @@ def parse_football_data_co_uk(
 
 
 # ----------------------------------------------------------------------
-# openfootball/europe tolerant .txt parser (UEFA cross-league results)
-# ----------------------------------------------------------------------
-_SCORE_RE = re.compile(r"^(?P<home>.+?)\s{2,}(?P<gh>\d+)\s*[-:]\s*(?P<ga>\d+)\s+(?P<away>.+?)\s*$")
-_DATE_RE = re.compile(r"\b(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})\b")
-_DOW_DATE_RE = re.compile(
-    r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(?P<mon>[A-Z][a-z]{2})/(?P<d>\d{1,2})"
-)
-_MONTHS = {m: i for i, m in enumerate(
-    ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], start=1)}
-
-
-def parse_openfootball_txt(
-    text: str, *, competition: str = "UEFA CL", default_year: int | None = None,
-) -> list[Result]:
-    """Best-effort parse of an openfootball match .txt into UEFA results.
-
-    openfootball files carry date headers (either ``2026-09-16`` or
-    ``Tue Sep/16``) followed by score lines ``Home   3-1  Away``. Lines that do
-    not match are ignored. A ``Sep/16`` header needs a year: ``default_year``
-    (the file's season) supplies it. Tolerant by design — a format drift
-    degrades to "fewer rows", never a crash.
-    """
-    results: list[Result] = []
-    cur: date | None = None
-    for line in text.splitlines():
-        s = line.rstrip()
-        if not s.strip():
-            continue
-        m = _DATE_RE.search(s)
-        if m:
-            try:
-                cur = date(int(m["y"]), int(m["m"]), int(m["d"]))
-            except ValueError:
-                pass
-            continue
-        m = _DOW_DATE_RE.search(s)
-        if m and default_year is not None:
-            mon = _MONTHS.get(m["mon"])
-            if mon:
-                try:
-                    cur = date(default_year, mon, int(m["d"]))
-                except ValueError:
-                    pass
-            continue
-        m = _SCORE_RE.match(s)
-        if m and cur is not None:
-            home = m["home"].strip().lstrip("@").strip()
-            away = m["away"].strip()
-            # Drop trailing annotations like "(5-4 pen.)" already excluded by \s{2,}.
-            try:
-                results.append(Result(cur, home, away,
-                                      int(m["gh"]), int(m["ga"]), competition))
-            except ValueError:
-                continue
-    return results
-
-
-# ----------------------------------------------------------------------
-# Elo update (streaming, no look-ahead when fed date-ordered results)
+# Elo update (streaming, no look-ahead; seen-set dedupe across sources/runs)
 # ----------------------------------------------------------------------
 def gmult(goal_diff: int) -> float:
     gd = abs(goal_diff)
@@ -201,15 +156,21 @@ def expected_home(rh: float, ra: float) -> float:
     return 1.0 / (1.0 + 10.0 ** (-((rh + ELO_HA) - ra) / ELO_DIVISOR))
 
 
+def _match_key(r: Result) -> str:
+    return f"{r.match_date.isoformat()}|{r.home}|{r.away}"
+
+
 @dataclass
 class EloState:
     """Mutable rating store. ``last_date`` is the newest result incorporated
-    (the snapshot's ``From`` date). ``games`` gates the bridge (ignore clubs
-    with too few games)."""
+    (the snapshot's ``From`` date) and advances ONLY on an applied row.
+    ``seen`` is the (date|home|away) dedupe set that makes a daily re-fetch of
+    overlapping windows — and multiple sources — idempotent."""
 
     ratings: dict[str, float] = field(default_factory=dict)
     games: dict[str, int] = field(default_factory=dict)
     last_date: date | None = None
+    seen: set[str] = field(default_factory=set)
 
     def rating(self, team: str) -> float:
         return self.ratings.get(team, ELO_INIT)
@@ -223,31 +184,258 @@ class EloState:
         self.ratings[r.away] = ra - delta
         self.games[r.home] = self.games.get(r.home, 0) + 1
         self.games[r.away] = self.games.get(r.away, 0) + 1
+        self.seen.add(_match_key(r))
         if self.last_date is None or r.match_date > self.last_date:
             self.last_date = r.match_date
 
 
-def align_to_state(
-    results: list[Result], existing_keys: list[str], resolver, *, threshold: float = 70.0,
-) -> list[Result]:
-    """Rewrite each result's team names onto an EXISTING state key when the
-    resolver resolves them, so the daily incremental (football-data.co.uk short
-    names + openfootball long names) does not FRAGMENT a club already carried
-    under the seed's ident. Unresolved names keep their raw spelling and become
-    new keys (bridged — or dropped — at snapshot time). Resolution uses the same
-    TeamAliasResolver + ambiguity rejection as everywhere else.
+def update_elo(state: EloState, results: list[Result]) -> int:
+    """Apply ALL results (any sources) in GLOBAL date order, skipping any whose
+    (date, home, away) is already in ``state.seen``. Returns rows applied.
 
-    A tiny per-call cache avoids re-resolving the same name across a season CSV.
+    This is the F1 fix: the caller gathers EVERY source first and calls this
+    ONCE, so no source's rows are dropped by another's cutoff, and ``From``
+    never advances falsely (it moves only on an applied row).
     """
-    if not existing_keys:
+    applied = 0
+    for r in sorted(results, key=lambda x: (x.match_date, x.home, x.away)):
+        if _match_key(r) in state.seen:
+            continue
+        state.apply(r)
+        applied += 1
+    return applied
+
+
+# ----------------------------------------------------------------------
+# Country-restricted name bridge (§5a, Fable-corrected)
+# ----------------------------------------------------------------------
+#: ClubElo 3-letter Country code -> schochastics full-country name (normalised
+#: form). Several ClubElo spellings map to one country (BHZ/BIH, LAT/LVA,
+#: LIT/LTU, MNE/MNT, ROM/ROU, SLK/SVK, FAR/FRO).
+CODE2COUNTRY: dict[str, str] = {
+    "ALB": "albania", "AND": "andorra", "ARM": "armenia", "AUT": "austria",
+    "AZE": "azerbaijan", "BEL": "belgium", "BHZ": "bosnia herzegovina",
+    "BIH": "bosnia herzegovina", "BLR": "belarus", "BUL": "bulgaria",
+    "CRO": "croatia", "CYP": "cyprus", "CZE": "czech republic", "DEN": "denmark",
+    "ENG": "england", "ESP": "spain", "EST": "estonia", "FAR": "faroe islands",
+    "FRO": "faroe islands", "FIN": "finland", "FRA": "france", "GEO": "georgia",
+    "GER": "germany", "GIB": "gibraltar", "GRE": "greece", "HUN": "hungary",
+    "IRL": "ireland republic", "ISL": "iceland", "ISR": "israel", "ITA": "italy",
+    "KAZ": "kazakhstan", "KOS": "kosovo", "LAT": "latvia", "LVA": "latvia",
+    "LIT": "lithuania", "LTU": "lithuania", "LUX": "luxembourg",
+    "MAC": "macedonia fyr", "MLT": "malta", "MNE": "montenegro",
+    "MNT": "montenegro", "MOL": "moldova", "NED": "netherlands",
+    "NIR": "northern ireland", "NOR": "norway", "POL": "poland",
+    "POR": "portugal", "ROM": "romania", "ROU": "romania", "RUS": "russia",
+    "SCO": "scotland", "SLK": "slovakia", "SVK": "slovakia", "SMR": "san marino",
+    "SRB": "serbia", "SUI": "switzerland", "SVN": "slovenia", "SWE": "sweden",
+    "TUR": "turkey", "UKR": "ukraine", "WAL": "wales",
+}
+
+#: football-data.co.uk division -> schochastics full-country name (normalised).
+DIVISION_COUNTRY: dict[str, str] = {
+    "E0": "england", "E1": "england", "SP1": "spain", "SP2": "spain",
+    "D1": "germany", "D2": "germany", "I1": "italy", "I2": "italy",
+    "F1": "france", "F2": "france", "N1": "netherlands", "P1": "portugal",
+    "B1": "belgium", "T1": "turkey", "SC0": "scotland", "G1": "greece",
+}
+
+_COUNTRY_SUFFIX = re.compile(r"\s*\(([^)]*)\)\s*$")
+
+
+def ctry_norm(s: str) -> str:
+    """Normalise a country string: diacritic-free lowercase alnum words."""
+    return normalize(s) if s else ""
+
+
+def strip_country(ident: str) -> tuple[str, str]:
+    """``"Qarabağ (Azerbaijan)"`` -> ``("Qarabağ", "azerbaijan")``.
+
+    Returns the name without the trailing ``(Country)`` and the normalised
+    country (``""`` when there is no suffix).
+    """
+    m = _COUNTRY_SUFFIX.search(ident)
+    if not m:
+        return ident, ""
+    return ident[: m.start()].strip(), ctry_norm(m.group(1))
+
+
+class AliasFolder:
+    """Fold a name to a canonical normalised form through the alias table.
+
+    ``alias_map`` is ``{canonical ClubElo club: [self-built spellings]}``. Both
+    the canonical and each alt fold to ``normalize(canonical)``. A name with no
+    alias just folds to its own ``normalize`` (after the ``(Country)`` suffix is
+    stripped). This is what lets "Manchester City" and the ClubElo key
+    "Man City" meet on one token set.
+    """
+
+    def __init__(self, alias_map: dict[str, list[str]] | None = None) -> None:
+        self._fold: dict[str, str] = {}
+        for canon, alts in (alias_map or {}).items():
+            cn = normalize(canon)
+            self._fold[cn] = cn
+            for alt in alts or []:
+                self._fold[normalize(strip_country(alt)[0])] = cn
+
+    def canon_norm(self, name: str) -> str:
+        base = normalize(strip_country(name)[0])
+        return self._fold.get(base, base)
+
+
+def _name_score(a: str, b: str) -> float | None:
+    """Match score (0-1) between two already alias-folded normalised names.
+
+    * exact equality -> 1.0 (any token count, so single-word clubs like
+      "arsenal" resolve);
+    * else require ``>= 2`` SHARED tokens (a single shared token — "sheffield",
+      "manchester" — never scores a match) and token_set_ratio >=
+      FUZZY_THRESHOLD, scaled to 0-1;
+    * else ``None``.
+    """
+    if a == b and a:
+        return 1.0
+    ta, tb = set(a.split()), set(b.split())
+    if len(ta & tb) < 2:
+        return None
+    score = fuzz.token_set_ratio(a, b)
+    return score / 100.0 if score >= FUZZY_THRESHOLD else None
+
+
+def bridge_to_clubelo(
+    ratings: dict[str, float],
+    games: dict[str, int],
+    clubelo_rows: list[tuple[str, str]],
+    alias_map: dict[str, list[str]] | None = None,
+    *,
+    min_games: int = 15,
+) -> tuple[dict[str, float], list[str]]:
+    """Map self-built ``"Name (Country)"`` idents -> ClubElo canonical keys.
+
+    ``clubelo_rows`` is ``[(club, country_code)]``. Matching is COUNTRY-
+    RESTRICTED (via :data:`CODE2COUNTRY`), alias-aware and collision-safe:
+
+    * idents with ``< min_games`` are ignored;
+    * within each country a greedy MAX assignment pairs each ClubElo club with
+      at most one ident and each ident with at most one club (the global best
+      remaining pair first), so a shared surname can never attach one ident to
+      two clubs — a contested key is simply left unresolved unless an alias
+      made the two names fold equal;
+    * returns ``({clubelo_key: elo}, unresolved_clubelo_clubs)``.
+    """
+    folder = AliasFolder(alias_map)
+    # Index eligible idents by normalised country.
+    idents_by_ctry: dict[str, list[tuple[str, str]]] = {}
+    for ident, elo in ratings.items():
+        if games.get(ident, 0) < min_games:
+            continue
+        _name, ctry = strip_country(ident)
+        idents_by_ctry.setdefault(ctry, []).append((ident, folder.canon_norm(ident)))
+    clubs_by_ctry: dict[str, list[tuple[str, str]]] = {}
+    for club, code in clubelo_rows:
+        ctry = CODE2COUNTRY.get((code or "").strip().upper())
+        if ctry is None:
+            continue
+        clubs_by_ctry.setdefault(ctry, []).append((club, folder.canon_norm(club)))
+
+    snap: dict[str, float] = {}
+    unresolved: list[str] = []
+    for ctry, clubs in clubs_by_ctry.items():
+        idents = idents_by_ctry.get(ctry, [])
+        # Score every (club, ident) pair in this country.
+        pairs: list[tuple[float, str, str]] = []
+        for club, club_cn in clubs:
+            for ident, ident_cn in idents:
+                sc = _name_score(club_cn, ident_cn)
+                if sc is not None:
+                    pairs.append((sc, club, ident))
+        pairs.sort(key=lambda p: (-p[0], p[1], p[2]))
+        used_clubs: set[str] = set()
+        used_idents: set[str] = set()
+        for sc, club, ident in pairs:
+            if club in used_clubs or ident in used_idents:
+                continue
+            snap[club] = ratings[ident]
+            used_clubs.add(club)
+            used_idents.add(ident)
+        unresolved.extend(club for club, _ in clubs if club not in used_clubs)
+    return snap, unresolved
+
+
+def align_to_state(
+    results: list[Result],
+    state_idents: list[str],
+    country: str,
+    alias_map: dict[str, list[str]] | None = None,
+) -> list[Result]:
+    """Rewrite domestic results' team names onto the EXISTING ``"(Country)"``
+    state idents of the SAME country, so the daily football-data.co.uk feed
+    does not FRAGMENT a club already carried from the seed.
+
+    ``country`` is the normalised country of this division (see
+    :data:`DIVISION_COUNTRY`). Matching is alias-folded + the same exact /
+    >=2-token rule as the bridge, restricted to same-country idents. An
+    unresolved name keeps its raw spelling (it will be bridged — or dropped — at
+    snapshot time).
+    """
+    ctry = ctry_norm(country)
+    cands = [i for i in state_idents if strip_country(i)[1] == ctry]
+    if not cands:
         return results
+    folder = AliasFolder(alias_map)
+    cand_cn = [(i, folder.canon_norm(i)) for i in cands]
     cache: dict[str, str] = {}
 
     def canon(name: str) -> str:
         if name in cache:
             return cache[name]
-        hit = resolver.match(name, existing_keys, threshold=threshold)
-        cache[name] = hit or name
+        q = folder.canon_norm(name)
+        best, best_sc = name, 0.0
+        for ident, icn in cand_cn:
+            sc = _name_score(q, icn)
+            if sc is not None and sc > best_sc:
+                best, best_sc = ident, sc
+        cache[name] = best
+        return best
+
+    return [
+        Result(r.match_date, canon(r.home), canon(r.away), r.gh, r.ga, r.competition)
+        for r in results
+    ]
+
+
+def align_any_country(
+    results: list[Result],
+    state_idents: list[str],
+    alias_map: dict[str, list[str]] | None = None,
+) -> list[Result]:
+    """Country-BLIND alignment for Champions League rows (football-data.org
+    names carry no country), onto the existing state idents.
+
+    Uses the same alias-folded, exact-/>=2-token rule, but requires a UNIQUE
+    best across ALL idents: a tie (two idents equally good) is REFUSED and the
+    name kept raw, so a cross-country surname clash never mis-links an elite
+    club. CL involves ~36 long-form names that mostly fold exactly onto their
+    domestic idents; the alias table covers the short ones.
+    """
+    folder = AliasFolder(alias_map)
+    cand_cn = [(i, folder.canon_norm(i)) for i in state_idents]
+    cache: dict[str, str] = {}
+
+    def canon(name: str) -> str:
+        if name in cache:
+            return cache[name]
+        q = folder.canon_norm(name)
+        best, best_sc, tie = name, 0.0, False
+        for ident, icn in cand_cn:
+            sc = _name_score(q, icn)
+            if sc is None:
+                continue
+            if sc > best_sc:
+                best, best_sc, tie = ident, sc, False
+            elif sc == best_sc and ident != best:
+                tie = True
+        cache[name] = name if tie else best
         return cache[name]
 
     return [
@@ -256,74 +444,53 @@ def align_to_state(
     ]
 
 
-def update_elo(state: EloState, results: list[Result]) -> int:
-    """Apply results IN DATE ORDER (no look-ahead). Returns rows applied.
-
-    Only results strictly AFTER ``state.last_date`` are applied, so a daily run
-    that re-fetches an overlapping window never double-counts a match.
-    """
-    applied = 0
-    cutoff = state.last_date
-    for r in sorted(results, key=lambda x: (x.match_date, x.home, x.away)):
-        if cutoff is not None and r.match_date <= cutoff:
+def parse_fdorg_matches(
+    matches: list[dict], *, competition: str = "UEFA CL",
+) -> list[Result]:
+    """football-data.org match dicts (FINISHED only) -> Results. Tolerant: a
+    match missing a score/date/team is skipped, never a crash."""
+    out: list[Result] = []
+    for m in matches:
+        if (m.get("status") or "") != "FINISHED":
             continue
-        state.apply(r)
-        applied += 1
-    return applied
-
-
-# ----------------------------------------------------------------------
-# ClubElo name bridge (§5a) — uses TeamAliasResolver, never an ad-hoc matcher
-# ----------------------------------------------------------------------
-def bridge_to_clubelo(
-    ratings: dict[str, float],
-    games: dict[str, int],
-    clubelo_keys: list[str],
-    resolver,
-    *,
-    min_games: int = 15,
-    threshold: float = 70.0,
-) -> tuple[dict[str, float], list[str]]:
-    """Map self-built team names -> ClubElo canonical keys.
-
-    Resolution is delegated to the SAME ``TeamAliasResolver`` the rest of
-    betbot uses: exact alias table first, then exact-normalised, then fuzzy
-    (``threshold`` = 70 per §5a), and it REFUSES ambiguous top-ties (returns
-    None) rather than mis-mapping. An unresolved club is logged in the returned
-    list and DROPPED (never priced off a wrong rating) — same contract as the
-    engine's unresolved-team guard.
-
-    Returns ``({clubelo_key: elo}, unresolved_names)``. On a key collision
-    (two self-built names mapping to one ClubElo key) the better-rated-games
-    entry wins deterministically.
-    """
-    snap: dict[str, float] = {}
-    best_games: dict[str, int] = {}
-    unresolved: list[str] = []
-    for name, elo in ratings.items():
-        if games.get(name, 0) < min_games:
+        try:
+            d = date.fromisoformat((m["utcDate"] or "")[:10])
+            ft = (m.get("score") or {}).get("fullTime") or {}
+            gh, ga = int(ft["home"]), int(ft["away"])
+            h = (m["homeTeam"] or {}).get("name") or ""
+            a = (m["awayTeam"] or {}).get("name") or ""
+        except (KeyError, ValueError, TypeError):
             continue
-        key = resolver.match(name, clubelo_keys, threshold=threshold)
-        if key is None:
-            unresolved.append(name)
+        if not h or not a:
             continue
-        g = games.get(name, 0)
-        if key not in snap or g > best_games.get(key, -1):
-            snap[key] = elo
-            best_games[key] = g
-    return snap, unresolved
+        out.append(Result(d, h.strip(), a.strip(), gh, ga, competition))
+    return out
+
+
+def load_clubelo_rows(path) -> list[tuple[str, str]]:
+    """Read a ClubElo CSV -> ``[(Club, Country_code)]`` for the bridge."""
+    rows: list[tuple[str, str]] = []
+    try:
+        with open(path, newline="") as fh:
+            for r in csv.DictReader(fh):
+                club = (r.get("Club") or "").strip()
+                if club:
+                    rows.append((club, (r.get("Country") or "").strip()))
+    except OSError:
+        return []
+    return rows
 
 
 # ----------------------------------------------------------------------
 # Snapshot writer (ClubElo CSV schema so the engine loads it unchanged)
 # ----------------------------------------------------------------------
 def write_clubelo_snapshot(
-    path, snap: dict[str, float], *, from_date: date, country_of: dict[str, str] | None = None,
+    path, snap: dict[str, float], *, from_date: date,
+    country_of: dict[str, str] | None = None,
 ) -> None:
     """Write the self-built snapshot in ClubElo schema (Rank,Club,Country,
     Level,Elo,From,To). ``From`` is the newest result incorporated so the
-    engine's own freshness guard reads it. ``To`` is left equal to ``From``
-    (the engine measures age off ``From``)."""
+    engine's freshness guard reads it; ``To`` equals ``From``."""
     country_of = country_of or {}
     ordered = sorted(snap.items(), key=lambda kv: -kv[1])
     iso = from_date.isoformat()

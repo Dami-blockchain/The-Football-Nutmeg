@@ -538,8 +538,9 @@ class Settings(BaseSettings):
     # uses this snapshot ONLY when the site scrape is stale/missing AND the flag
     # below is ON; it is NEVER a replacement (favourite differs ~1/5 vs real
     # ClubElo). Written daily by scripts/build_selfbuilt_elo.py from FREE data
-    # (football-data.co.uk + openfootball/europe), in the ClubElo CSV schema
-    # with Club/Country bridged to ClubElo canonical keys. DERIVED (None) from
+    # (football-data.co.uk domestic CSVs + football-data.org free-tier CL), in
+    # the ClubElo CSV schema, Club/Country bridged to ClubElo canonical keys.
+    # DERIVED (None) from
     # clubelo_latest_path's directory in _derive_cl_paths.
     cl_selfbuilt_snapshot_path: Path | None = Field(
         default=None, alias="BETBOT_CL_SELFBUILT_SNAPSHOT_PATH",

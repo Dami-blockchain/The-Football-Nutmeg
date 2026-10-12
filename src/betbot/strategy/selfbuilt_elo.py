@@ -19,8 +19,9 @@ Design (FALLBACK_SCOPE.md rev 2):
   reject a build whose Elo SD falls outside ``[SD_MIN, SD_MAX]`` (catches a
   corrupted / partial build).
 * The self-built snapshot has its OWN staleness contract
-  (``SELFBUILT_STALE_AFTER_DAYS``, kept in the 14-21 band because
-  openfootball/europe is only ~weekly and a 10-day threshold would cry wolf).
+  (``SELFBUILT_STALE_AFTER_DAYS``, kept in the 14-21 band because the free CL
+  feed is per-matchday — roughly weekly in the league phase, with longer gaps
+  between matchdays — so a 10-day threshold would cry wolf on a healthy feed).
 * ``decide_active`` encodes the flag gate + the both-stale rule and never
   presents a doubly-stale rating as if fresh.
 """
@@ -32,10 +33,16 @@ from dataclasses import dataclass, field
 from datetime import date
 
 #: Self-built snapshot staleness threshold (days), measured off its own ``From``
-#: date. Kept in the scope's 14-21 band (NOT 10): the live feed
-#: (openfootball/europe) refreshes only ~weekly and has shown ~10-day gaps
-#: between auto-updates, so a 10-day threshold would trip on a healthy feed.
+#: date. Kept in the scope's 14-21 band (NOT 10): the free CL feed is
+#: per-matchday (~weekly in the league phase, longer gaps between rounds), so a
+#: 10-day threshold would trip on a healthy feed.
 SELFBUILT_STALE_AFTER_DAYS = 17
+
+#: Hard upper bound (days): a served rating older than this by its own ``From``
+#: is too stale to trust at all, so the engine drops to the naive form engine
+#: rather than price off it (§7 optional upper bound). Comfortably above both
+#: staleness thresholds so it only catches a genuinely abandoned feed.
+HARD_NAIVE_AFTER_DAYS = 90
 
 #: Per-build Elo-SD sanity band (option (a), §4). A healthy self-built snapshot
 #: measured SD ~147; a corrupted / partial build collapses or explodes the
@@ -209,6 +216,12 @@ def decide_active(
             reason="both_unusable_naive",
         )
     winner = usable[0] if len(usable) == 1 else _fresher(site, selfbuilt)
+    # Hard upper bound: even the fresher snapshot can be too old to trust.
+    if winner.age_days is not None and winner.age_days > HARD_NAIVE_AFTER_DAYS:
+        return FallbackDecision(
+            source="naive", clubs={}, engaged=True,
+            reason=f"both_stale_over_{HARD_NAIVE_AFTER_DAYS}d_naive",
+        )
     source = "self_built" if winner is selfbuilt else "site_scrape"
     return FallbackDecision(
         source=source, clubs=winner.clubs, engaged=True,

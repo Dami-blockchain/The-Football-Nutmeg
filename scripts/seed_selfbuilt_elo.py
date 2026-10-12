@@ -19,11 +19,15 @@ already present, duckdb is not imported.
 from __future__ import annotations
 
 import csv
+import json
+import os
 import sys
 from datetime import date
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+REPO_ROOT = Path(__file__).resolve().parents[1]
+os.chdir(REPO_ROOT)
+sys.path.insert(0, str(REPO_ROOT / "src"))
 
 import yaml  # noqa: E402
 
@@ -32,11 +36,10 @@ from betbot.data.selfbuilt_feed import (  # noqa: E402
     EloState,
     Result,
     bridge_to_clubelo,
+    load_clubelo_rows,
     write_clubelo_snapshot,
 )
-from betbot.exchanges.matcher import TeamAliasResolver  # noqa: E402
 from betbot.logging import get_logger  # noqa: E402
-from betbot.strategy.cl_engine import _load_snapshot  # noqa: E402
 
 log = get_logger("seed_selfbuilt_elo")
 
@@ -64,7 +67,7 @@ def _export_eu_results() -> None:
     """)
 
 
-def _merged_resolver() -> TeamAliasResolver:
+def _merged_aliases() -> dict[str, list[str]]:
     aliases: dict[str, list[str]] = {}
     for p in ("config/team_aliases.yaml", "config/selfbuilt_elo_aliases.yaml"):
         fp = Path(p)
@@ -73,7 +76,7 @@ def _merged_resolver() -> TeamAliasResolver:
             for canon, alts in (data.get("aliases") or {}).items():
                 aliases.setdefault(canon, [])
                 aliases[canon].extend(alts or [])
-    return TeamAliasResolver(aliases=aliases)
+    return aliases
 
 
 def main() -> int:
@@ -86,9 +89,10 @@ def main() -> int:
         _export_eu_results()
 
     state = EloState()
-    country_of: dict[str, str] = {}
     applied = 0
     # The CSV is already date-ordered, so stream it straight in (no look-ahead).
+    # apply() records each (date|home|away) in state.seen, so the daily build
+    # will not re-apply any seeded match.
     with EU_RESULTS.open(newline="") as fh:
         for r in csv.DictReader(fh):
             try:
@@ -101,30 +105,27 @@ def main() -> int:
                 continue
             state.apply(Result(d, home, away, gh, ga, r.get("competition", "")))
             applied += 1
-            if r.get("home_country"):
-                country_of.setdefault(home, r["home_country"])
-            if r.get("away_country"):
-                country_of.setdefault(away, r["away_country"])
 
     if not state.ratings or state.last_date is None:
         log.error("seed_empty")
         return 1
 
     settings = get_settings()
-    ce_clubs, _ = _load_snapshot(Path(settings.cl_snapshot_path))
-    resolver = _merged_resolver()
+    ce_rows = load_clubelo_rows(Path(settings.cl_snapshot_path))
+    country_of = {club: code for club, code in ce_rows}
+    aliases = _merged_aliases()
     snap, unresolved = bridge_to_clubelo(
-        state.ratings, state.games, list(ce_clubs.keys()), resolver,
+        state.ratings, state.games, ce_rows, aliases,
     )
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    import json
     STATE_PATH.write_text(json.dumps({
         "ratings": {k: round(v, 4) for k, v in state.ratings.items()},
         "games": state.games,
         "last_date": state.last_date.isoformat(),
+        "seen": sorted(state.seen),
     }))
     out = Path(settings.cl_selfbuilt_snapshot_path)
-    write_clubelo_snapshot(out, snap, from_date=state.last_date)
+    write_clubelo_snapshot(out, snap, from_date=state.last_date, country_of=country_of)
     log.info("seed_done", applied=applied, teams=len(state.ratings),
              bridged=len(snap), unresolved=len(unresolved),
              from_date=str(state.last_date), out=str(out))

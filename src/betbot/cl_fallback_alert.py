@@ -37,6 +37,7 @@ class FallbackEpisode:
     engaged: bool = False
     source: str = "site_scrape"
     snapshot_from: str | None = None   # site scrape ``From`` iso — the episode key
+    reason: str = ""                   # engine fallback_reason (for both-stale wording)
 
 
 def load_state(path: Path) -> FallbackEpisode:
@@ -80,23 +81,32 @@ def decide_alert(
     * No message while steady (engaged across the same episode, or healthy).
     """
     age = "unknown" if site_age_days is None else f"{site_age_days}d"
+    both_stale = cur.reason.startswith("both_stale") or cur.reason.startswith("both_unusable")
     if cur.engaged and (
         not prev.engaged or prev.snapshot_from != cur.snapshot_from
     ):
         key = f"cl_fallback_{cur.snapshot_from}"
         if cur.source == "naive":
+            extra = (
+                " BOTH the site scrape and the self-built snapshot are stale/"
+                "unusable" if both_stale else " the self-built snapshot is also "
+                "stale/unusable"
+            )
             body = (
                 f"CL fallback ENGAGED: ClubElo site scrape is {age} stale "
-                f"(From {cur.snapshot_from}) AND the self-built snapshot is also "
-                f"stale/unusable. CL is now on the NAIVE form engine (~50.7% vs "
-                f"~58.7% held-out). Operator action needed."
+                f"(From {cur.snapshot_from}) AND{extra}. CL is now on the NAIVE "
+                f"form engine (~50.7% vs ~58.7% held-out). Operator action needed."
             )
         else:
+            both_note = (
+                " (BOTH sources are stale — serving the fresher by date)"
+                if both_stale else ""
+            )
             body = (
                 f"CL fallback ENGAGED: ClubElo site scrape is {age} stale "
                 f"(From {cur.snapshot_from}). CL is now priced off the "
-                f"{cur.source} ratings. This is a DEGRADED fallback — the "
-                f"self-built ratings disagree with real ClubElo on the "
+                f"{cur.source} ratings{both_note}. This is a DEGRADED fallback — "
+                f"the self-built ratings disagree with real ClubElo on the "
                 f"favourite for ~1 in 5 CL fixtures. Refresh the scrape."
             )
         return key, body
@@ -129,11 +139,14 @@ async def maybe_alert_cl_fallback(
         path = state_path or DEFAULT_STATE_PATH
         engaged = bool(getattr(cl_engine, "fallback_engaged", False))
         source = str(getattr(cl_engine, "fallback_source", "site_scrape"))
+        reason = str(getattr(cl_engine, "fallback_reason", ""))
         snap_date = getattr(cl_engine, "_snapshot_date", None)
         snap_from = None if snap_date is None else str(snap_date)
         age = getattr(cl_engine, "snapshot_age_days", None)
 
-        cur = FallbackEpisode(engaged=engaged, source=source, snapshot_from=snap_from)
+        cur = FallbackEpisode(
+            engaged=engaged, source=source, snapshot_from=snap_from, reason=reason,
+        )
         prev = load_state(path)
         decision = decide_alert(prev, cur, site_age_days=age)
         if decision is None:

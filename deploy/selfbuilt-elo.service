@@ -1,0 +1,16 @@
+# Self-built-Elo fallback snapshot builder (OPERATOR-RUN, FREE data, NO DB).
+# systemd USER unit. Install:
+#   cp deploy/selfbuilt-elo.{service,timer} ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now selfbuilt-elo.timer
+# Seed ONCE first: ~/tfsm/.venv/bin/python scripts/seed_selfbuilt_elo.py
+[Unit]
+Description=tfsm self-built-Elo CL fallback snapshot builder (free data, no DB)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/tfsm/tfsm
+ExecStart=/home/tfsm/tfsm/.venv/bin/python /home/tfsm/tfsm/scripts/build_selfbuilt_elo.py
+Nice=10

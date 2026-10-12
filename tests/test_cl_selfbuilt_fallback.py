@@ -177,6 +177,19 @@ def test_flag_on_missing_site_engages_selfbuilt_not_naive(settings):
     assert (p.p_home, p.p_draw, p.p_away) != (naive.p_home, naive.p_draw, naive.p_away)
 
 
+def test_flag_on_both_stale_over_90d_falls_to_naive(settings):
+    # Both present but BOTH older than the 90d hard cap -> naive, never priced.
+    old = TODAY - timedelta(days=120)
+    site = {"Strong FC": 1900.0, "Weak FC": 1500.0}
+    selfb = _band_snap("Strong FC", "Weak FC", 1600.0, 1700.0)
+    eng = _eng(settings, site=site, site_date=old, selfb=selfb, selfb_date=old, flag=True)
+    ff = _ff("Strong FC", "Weak FC", hp=2.5, ap=0.4)
+    p = eng.predict(ff)
+    naive = StrategyEngine(settings).predict(ff)
+    assert eng.fallback_source == "naive" and eng.fallback_engaged is True
+    assert (p.p_home, p.p_draw, p.p_away) == (naive.p_home, naive.p_draw, naive.p_away)
+
+
 def test_flag_on_both_unusable_falls_to_naive(settings):
     eng = _eng(settings, site={}, site_date=None,
                selfb={}, selfb_date=None, flag=True)
@@ -252,6 +265,14 @@ def test_decide_alert_naive_message_flags_naive():
     naive = FallbackEpisode(engaged=True, source="naive", snapshot_from="2026-09-01")
     key, msg = decide_alert(off, naive, site_age_days=40)
     assert "NAIVE" in msg.upper()
+
+
+def test_decide_alert_both_stale_wording():
+    off = FallbackEpisode(engaged=False)
+    cur = FallbackEpisode(engaged=True, source="self_built", snapshot_from="2026-09-01",
+                          reason="both_stale_served_fresher_self_built")
+    _key, msg = decide_alert(off, cur, site_age_days=40)
+    assert "BOTH sources are stale" in msg
 
 
 class _FakeEng:

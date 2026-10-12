@@ -1,0 +1,11 @@
+# Runs the self-built-Elo builder daily, AFTER the ClubElo scrape + the 08:00
+# UTC scoring run (so a build never races the files the scrape writes).
+[Unit]
+Description=Daily tfsm self-built-Elo CL fallback build
+
+[Timer]
+OnCalendar=*-*-* 09:30:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
