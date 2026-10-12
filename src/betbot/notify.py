@@ -255,6 +255,9 @@ def format_high_conf_alert(
     header = f"\U0001f3af *HIGH-CONFIDENCE ALERT* — {home} (HOME) v {away} (AWAY)"
     if league:
         header += f", {league}"
+    _stage = stage_label(getattr(pred, "stage", None), settings)
+    if _stage:
+        header += f", {_stage}"
     if ko:
         header += f", KO {ko} EAT"
 
@@ -282,9 +285,6 @@ def format_high_conf_alert(
         _model_triple_line(pred, top_pick, market_str),
         format_band_line(min_p, live_tally, sold=live_tally_sold),
     ]
-    _stage = stage_label(getattr(pred, "stage", None), settings)
-    if _stage:
-        _lines.insert(1, _stage)
     _note = anchor_note(pred, settings)
     if _note:
         _lines.append(_note)

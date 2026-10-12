@@ -18,7 +18,7 @@ domestic leagues. Facts under test:
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import inspect
@@ -104,6 +104,32 @@ def test_rescore_without_payload_preserves_stage(db):
     upsert_prediction(_cl_pred(3), kickoff=NOW, stage="LAST_16")
     upsert_prediction(_cl_pred(3), kickoff=NOW)  # rescore, stage defaulted None
     assert _row(3).stage == "LAST_16"
+
+
+def test_rescore_insert_on_new_day_keeps_stage(db):
+    # The kickoff-60 rescore can land on a day with NO daily row for today, so
+    # it INSERTS a fresh (fixture_id, run_date) row rather than updating. The
+    # daily_jobs rescore call now forwards ``stage=baseline.stage``, so the new
+    # row must carry the stage and not fall back to NULL.
+    yesterday = (NOW - timedelta(days=1)).date().isoformat()
+    with session_scope() as s:
+        s.add(
+            PredictionRow(
+                fixture_id=30, competition_code="CL", kickoff=NOW,
+                run_date=yesterday, home_team="A", away_team="B",
+                p_home=0.55, p_draw=0.25, p_away=0.20,
+                home_score=1.0, away_score=0.0, draw_score=2.4,
+                stage="SEMI_FINALS",
+            )
+        )
+    # Rescore TODAY, forwarding the baseline stage exactly as daily_jobs does.
+    upsert_prediction(_cl_pred(30), kickoff=NOW, stage="SEMI_FINALS")
+    with session_scope() as s:
+        rows = s.query(PredictionRow).filter_by(fixture_id=30).all()
+        assert len(rows) == 2  # old daily row + new rescore row (an INSERT)
+        today = date.today().isoformat()
+        new = [r for r in rows if r.run_date == today]
+        assert len(new) == 1 and new[0].stage == "SEMI_FINALS"
 
 
 def test_missing_stage_does_not_break_storage(db):

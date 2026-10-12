@@ -1191,7 +1191,7 @@ async def send_prediction_alert(
         try:
             rescored, kickoff = await rescore_fn(fixture_id, home_adj, away_adj)
             if rescored is not None:
-                upsert_prediction(rescored, kickoff=kickoff)
+                upsert_prediction(rescored, kickoff=kickoff, stage=getattr(baseline, "stage", None))
                 # Re-read so the persisted row (with any paper_bet) drives the
                 # standing format; fall back to the stored baseline on a miss.
                 pred = prediction_fn(fixture_id) or baseline

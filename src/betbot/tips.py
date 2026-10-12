@@ -82,12 +82,12 @@ def anchor_note(pred, settings) -> str | None:
 #: "Knockout", so it is not double-prefixed. Any value not in this map (and a
 #: blank / NULL / unknown stage) renders NOTHING.
 _STAGE_FRIENDLY = {
-    "LEAGUE_STAGE": "🏆 League phase",
-    "PLAYOFFS": "🏆 Knockout play-off",
-    "LAST_16": "🏆 Knockout · Round of 16",
-    "QUARTER_FINALS": "🏆 Knockout · Quarter-final",
-    "SEMI_FINALS": "🏆 Knockout · Semi-final",
-    "FINAL": "🏆 Knockout · Final",
+    "LEAGUE_STAGE": "League phase",
+    "PLAYOFFS": "Knockout play-off",
+    "LAST_16": "Knockout · Round of 16",
+    "QUARTER_FINALS": "Knockout · Quarter-final",
+    "SEMI_FINALS": "Knockout · Semi-final",
+    "FINAL": "Knockout · Final",
 }
 
 
@@ -96,7 +96,7 @@ def stage_label(stage, settings) -> str | None:
 
     ``stage`` is football-data.org's raw CL enum (stored on the prediction /
     outcome row; CL-only, so domestic rows carry ``None``). Returns the friendly
-    label ("🏆 League phase", "🏆 Knockout · Round of 16", ...) or
+    label ("League phase", "Knockout · Round of 16", ...) or
     ``None`` when there is nothing honest to show: domestic/absent stage
     (``None`` / blank), an unrecognised value, no ``settings``, or the flag off.
     Gated by ``BETBOT_STAGE_BADGE`` (default ON) so one env line rolls it back
@@ -135,6 +135,9 @@ def format_prediction(
     league = league_label(getattr(pred, "competition_code", None))
     if league:
         header += f" · {league}"
+    _stage = stage_label(getattr(pred, "stage", None), settings)
+    if _stage:
+        header += f" · {_stage}"
     if ko:
         header += f" — {ko}"
 
@@ -158,9 +161,6 @@ def format_prediction(
         model += f"   (xG {pred.home_xg:.2f}–{pred.away_xg:.2f})"
 
     parts = [header, winner, model, NON_ADVICE_CAVEAT]
-    _stage = stage_label(getattr(pred, "stage", None), settings)
-    if _stage:
-        parts.insert(1, _stage)
     _note = anchor_note(pred, settings)
     if _note:
         parts.insert(len(parts) - 1, _note)
@@ -277,15 +277,15 @@ def format_result(
     )
     if league:
         ft += f" · {league}"
+    _stage = stage_label(getattr(outcome_row, "stage", None), settings)
+    if _stage:
+        ft += f" · {_stage}"
     lines = [
         ft,
         f"Our call: {pick} — {verdict}",
         f"Model had H {outcome_row.predicted_home:.0%} / "
         f"D {outcome_row.predicted_draw:.0%} / A {outcome_row.predicted_away:.0%}",
     ]
-    _stage = stage_label(getattr(outcome_row, "stage", None), settings)
-    if _stage:
-        lines.insert(1, _stage)
     if sold_triple is not None:
         sh, sd, sa = sold_triple
         lines.append(
