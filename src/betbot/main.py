@@ -23,6 +23,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from betbot.config import get_settings
 from betbot.clubelo_alerts import ClubEloAlerter, run_clubelo_alert
+from betbot.cl_fallback_alert import maybe_alert_cl_fallback
 from betbot.data.football_data import FootballDataClient, FootballDataError
 from betbot.data.form import FormService, _parse_kickoff, _parse_team
 from betbot.data.odds import LEAGUE_TO_DIV, shared_odds_service
@@ -62,6 +63,7 @@ from betbot.storage.repos import (
     prediction_for_fixture,
     predictions_for_kickoff_range,
     reset_kill_switch,
+    upsert_cl_rating_shadow,
     upsert_model_prediction,
     upsert_prediction,
 )
@@ -154,6 +156,11 @@ async def _score_once() -> int:
             if settings.cl_elo_enabled
             else engine
         )
+        # Operator alert when the self-built-Elo fallback engages/disengages.
+        # Fires once per staleness episode (await — the sync wrapper no-ops in
+        # a running loop) and is fully failure-isolated, so it can never break
+        # the run. No-op when the flag is OFF (fallback never engages).
+        await maybe_alert_cl_fallback(settings, cl_engine)
         # ONE odds service for the whole run: a single shared TTL cache means a
         # 20-fixture Saturday costs ONE HTTP GET, not twenty (the Highlightly
         # lesson). None when BETBOT_ODDS_ANCHOR is off — the default.
@@ -278,6 +285,42 @@ async def _anchor_coverage_guard(settings, coverage: dict) -> None:
         log.warning("anchor_coverage_guard_failed", error=str(e))
 
 
+def log_cl_rating_shadow(engine, league: str, prediction, fixture_id: int) -> int:
+    """Observational CL dual-log: SITE scrape vs SELF-BUILT snapshot.
+
+    Writes one ``cl_rating_shadow`` row per source that resolves both clubs,
+    priced with the live 51/312 constants, REGARDLESS of the fallback flag or
+    whether it engaged — so comparison data accrues before any flip. Returns
+    the number of rows written (0 when not a CL fixture, the engine has no
+    ``cl_shadow_rows``, or nothing could be priced/logged).
+
+    FULLY failure-isolated (§7a / §10): a DB error, or the table not yet
+    existing on first boot before ``create_all`` runs in another process, or
+    any other fault is logged and swallowed. ``predict()`` has already run and
+    returned — this must never break the scoring loop.
+    """
+    if league != "CL":
+        return 0
+    rows_fn = getattr(engine, "cl_shadow_rows", None)
+    if rows_fn is None:
+        return 0
+    log = get_logger(__name__)
+    try:
+        rows = rows_fn(prediction.home_team, prediction.away_team)
+        if not rows:
+            return 0
+        return upsert_cl_rating_shadow(
+            fixture_id=fixture_id,
+            run_date=date.today().isoformat(),
+            home_team=prediction.home_team,
+            away_team=prediction.away_team,
+            rows=rows,
+        )
+    except Exception as e:  # noqa: BLE001 — shadow log must never break scoring
+        log.warning("cl_rating_shadow_write_failed", fixture_id=fixture_id, error=str(e))
+        return 0
+
+
 async def _score_and_log_one(
     match: dict,
     league: str,
@@ -370,6 +413,11 @@ async def _score_and_log_one(
                 )
         except Exception as e:  # noqa: BLE001 — dual-log must never break scoring
             log.warning("dual_log_write_failed", fixture_id=fixture_id, error=str(e))
+
+    # CL-only observational dual-log (cl_rating_shadow): site scrape vs
+    # self-built snapshot, both at 51/312, one row per source. Fully
+    # failure-isolated inside the helper (§7a).
+    log_cl_rating_shadow(engine, league, prediction, fixture_id)
 
     # Predictions-only: recos are NEVER suppressed (there is no trading and no
     # drawdown kill switch gating them). They always flow.

@@ -12,6 +12,7 @@ from betbot.logging import get_logger
 from betbot.storage.db import session_scope
 from betbot.storage.models import (
     ArbExecution,
+    ClRatingShadow,
     Deposit,
     GasTopup,
     GlickoRating,
@@ -2555,3 +2556,53 @@ def mark_outcome_verified(
         row.score_verify_count = int(row.score_verify_count or 0) + 1
         if source_last_updated is not None:
             row.source_last_updated = source_last_updated
+
+
+def upsert_cl_rating_shadow(
+    *,
+    fixture_id: int,
+    run_date: str,
+    home_team: str,
+    away_team: str,
+    rows: list[dict],
+) -> int:
+    """Store/refresh the CL site-vs-self-built dual-log rows for one fixture.
+
+    One row per ``(fixture_id, run_date, source)`` (unique). Purely
+    observational and refreshed each scoring tick — it never changes a
+    prediction. Returns the number of source rows written. Raises nothing of
+    its own beyond the DB layer; the CALLER wraps it so a missing table (first
+    boot before ``create_all``) or a DB error can never break ``predict()``.
+    """
+    written = 0
+    with session_scope() as s:
+        for r in rows:
+            source = r["source"]
+            existing = s.execute(
+                select(ClRatingShadow).where(
+                    ClRatingShadow.fixture_id == fixture_id,
+                    ClRatingShadow.run_date == run_date,
+                    ClRatingShadow.source == source,
+                )
+            ).scalar_one_or_none()
+            if existing is None:
+                s.add(ClRatingShadow(
+                    fixture_id=fixture_id, run_date=run_date, source=source,
+                    home_team=home_team, away_team=away_team,
+                    elo_home=r["elo_home"], elo_away=r["elo_away"],
+                    p_home=r["p_home"], p_draw=r["p_draw"], p_away=r["p_away"],
+                    favourite=r["favourite"],
+                    snapshot_age_days=r.get("snapshot_age_days"),
+                    fallback_engaged=bool(r.get("fallback_engaged", False)),
+                ))
+            else:
+                existing.home_team, existing.away_team = home_team, away_team
+                existing.elo_home, existing.elo_away = r["elo_home"], r["elo_away"]
+                existing.p_home, existing.p_draw, existing.p_away = (
+                    r["p_home"], r["p_draw"], r["p_away"]
+                )
+                existing.favourite = r["favourite"]
+                existing.snapshot_age_days = r.get("snapshot_age_days")
+                existing.fallback_engaged = bool(r.get("fallback_engaged", False))
+            written += 1
+    return written

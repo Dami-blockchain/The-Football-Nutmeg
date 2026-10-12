@@ -328,6 +328,14 @@ class Settings(BaseSettings):
             )
         if self.cl_shadow_snapshot_path is None:
             object.__setattr__(self, "cl_shadow_snapshot_path", pin)
+        # Self-built Elo fallback snapshot lands in the pin's directory under a
+        # fixed filename, so repointing BETBOT_CLUBELO_LATEST_PATH carries the
+        # fallback with it. Written by scripts/build_selfbuilt_elo.py.
+        if self.cl_selfbuilt_snapshot_path is None:
+            object.__setattr__(
+                self, "cl_selfbuilt_snapshot_path",
+                pin.with_name("clubelo_selfbuilt_latest.csv"),
+            )
         return self
 
     @property
@@ -525,6 +533,25 @@ class Settings(BaseSettings):
     # Default (None) IS the pin: it resolves to clubelo_latest_path.
     cl_shadow_snapshot_path: Path | None = Field(
         default=None, alias="BETBOT_CL_SHADOW_SNAPSHOT_PATH",
+    )
+    # Self-built cross-league Elo FALLBACK (FALLBACK_SCOPE.md rev 2). The engine
+    # uses this snapshot ONLY when the site scrape is stale/missing AND the flag
+    # below is ON; it is NEVER a replacement (favourite differs ~1/5 vs real
+    # ClubElo). Written daily by scripts/build_selfbuilt_elo.py from FREE data
+    # (football-data.co.uk + openfootball/europe), in the ClubElo CSV schema
+    # with Club/Country bridged to ClubElo canonical keys. DERIVED (None) from
+    # clubelo_latest_path's directory in _derive_cl_paths.
+    cl_selfbuilt_snapshot_path: Path | None = Field(
+        default=None, alias="BETBOT_CL_SELFBUILT_SNAPSHOT_PATH",
+    )
+    # FALLBACK flag, default OFF. OFF = today's behaviour EXACTLY (stale-but-
+    # present scrape keeps serving aged ratings; missing -> naive). ON = when
+    # the site scrape is stale, price off the self-built snapshot (raw, at the
+    # live 51/312 constants) if it is fresh+usable, else the both-stale rule
+    # (fresher-by-From, else naive). Dual-logging (cl_rating_shadow) runs
+    # REGARDLESS of this flag so comparison data accrues before any flip.
+    cl_selfbuilt_fallback_enabled: bool = Field(
+        default=False, alias="BETBOT_CL_SELFBUILT_FALLBACK",
     )
     # Home-advantage bump, on the ELO SCALE. Rescaled 65->51 for the site feed:
     # the site scale is compressed to ~0.77-0.79x of api.clubelo (measured over

@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    Boolean,
     DateTime,
     Float,
     ForeignKey,
@@ -697,4 +698,57 @@ class PromotionNoticeListing(Base):
     kickoff: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     promo_notice_sent_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
+    )
+
+
+class ClRatingShadow(Base):
+    """Observational site-scrape vs self-built-Elo dual-log for the CL engine.
+
+    One row per (CL fixture, rating source) written on EVERY CL fixture,
+    regardless of the ``cl_selfbuilt_fallback_enabled`` flag or whether the
+    fallback engaged — mirroring how ``cl_engine.dual_triples`` is purely
+    observational and never changes what ``predict()`` serves. It exists ONLY
+    to accumulate the comparison data (favourite-disagreement rate, and after
+    settlement a non-inferiority read) that any promotion decision needs.
+
+    Distinct from ``model_predictions`` (whose g_*/e_* slots already mean the
+    api-scale shadow vs the site served for CL — see
+    cl_engine.dual_triples): this table compares the SITE scrape against the
+    SELF-BUILT snapshot, both priced at the live 51/312 constants.
+
+    Additive & standalone: created by ``Base.metadata.create_all`` on the next
+    boot (no Alembic in this repo). The write path is failure-isolated at the
+    call site, so a missing table on first boot can never break ``predict()``.
+    """
+
+    __tablename__ = "cl_rating_shadow"
+    __table_args__ = (
+        UniqueConstraint(
+            "fixture_id", "run_date", "source",
+            name="uq_cl_rating_shadow_fixture_run_source",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    fixture_id: Mapped[int] = mapped_column(Integer, index=True)
+    run_date: Mapped[str] = mapped_column(String(10))  # YYYY-MM-DD scoring day
+    source: Mapped[str] = mapped_column(String(16))     # site_scrape | self_built
+    home_team: Mapped[str] = mapped_column(String(80))
+    away_team: Mapped[str] = mapped_column(String(80))
+
+    elo_home: Mapped[float] = mapped_column(Float)
+    elo_away: Mapped[float] = mapped_column(Float)
+    p_home: Mapped[float] = mapped_column(Float)
+    p_draw: Mapped[float] = mapped_column(Float)
+    p_away: Mapped[float] = mapped_column(Float)
+    favourite: Mapped[str] = mapped_column(String(4))   # HOME | DRAW | AWAY
+
+    snapshot_age_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    fallback_engaged: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
     )

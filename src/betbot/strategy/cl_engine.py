@@ -64,6 +64,11 @@ from betbot.strategy import dixon_coles as dc
 from betbot.strategy.engine import BetDecision, Outcome, Prediction, StrategyEngine
 from betbot.strategy.ensemble import anchor_to_market, log_pool
 from betbot.strategy.glicko import DRAW_CAP, DRAW_FLOOR
+from betbot.strategy.selfbuilt_elo import (
+    assess_selfbuilt,
+    assess_site,
+    decide_active,
+)
 
 log = get_logger(__name__)
 
@@ -240,6 +245,9 @@ class EuropeanStrategyEngine:
         settings,
         *,
         snapshot: dict[str, float] | None = None,
+        snapshot_date: date | None = None,
+        selfbuilt_snapshot: dict[str, float] | None = None,
+        selfbuilt_date: date | None = None,
         dc_params: dc.DCParams | None = None,
         name_map: dict[str, str] | None = None,
         resolver: TeamAliasResolver | None = None,
@@ -265,10 +273,28 @@ class EuropeanStrategyEngine:
         self._shadow_clubs: list[str] = []
         self._shadow_res_cache: dict[str, str | None] = {}
 
+        # Self-built-Elo FALLBACK seams (read-only; set by _apply_fallback).
+        # ``_site_*`` keep the untouched SITE scrape so cl_shadow_rows() can
+        # dual-log BOTH sources even when the active snapshot was swapped; the
+        # ACTIVE snapshot the engine prices off is ``self._snapshot``.
+        self.fallback_engaged = False
+        self.fallback_source = "site_scrape"
+        self.fallback_reason = "flag_off"
+        self.selfbuilt_age_days: int | None = None
+        self._selfbuilt_date: date | None = selfbuilt_date
+        self._selfbuilt_snapshot: dict[str, float] = selfbuilt_snapshot or {}
+        self._selfbuilt_clubs: list[str] = list(self._selfbuilt_snapshot.keys())
+        self._site_snapshot: dict[str, float] = {}
+        self._site_clubs: list[str] = []
+        self._site_res_cache: dict[str, str | None] = {}
+        self._selfbuilt_res_cache: dict[str, str | None] = {}
+
         if snapshot is not None:
             self._snapshot = snapshot
             self._clubs = list(snapshot.keys())
-            self._snapshot_date: date | None = None
+            self._snapshot_date: date | None = snapshot_date
+            self._site_snapshot = snapshot
+            self._site_clubs = list(snapshot.keys())
         else:
             # Primary = the fresh site-scale feed. Fallback stays site-scale
             # (newest dated file under data/clubelo_site/) — never the api-scale
@@ -284,6 +310,14 @@ class EuropeanStrategyEngine:
             self._snapshot_date = snap_date
             self._check_freshness(path)
             self._load_shadow(Path(settings.cl_shadow_snapshot_path))
+            self._site_snapshot = snap
+            self._site_clubs = list(snap.keys())
+            self._load_selfbuilt(Path(settings.cl_selfbuilt_snapshot_path))
+
+        # Decide which snapshot predict() prices off (flag + both-stale rule).
+        # With the flag OFF this is a no-op: the active snapshot stays the site
+        # scrape, byte-identical to the pre-fallback engine.
+        self._apply_fallback()
 
         self._res_cache: dict[str, str | None] = {}
 
@@ -363,6 +397,115 @@ class EuropeanStrategyEngine:
         )
         self._shadow_res_cache[name] = hit
         return hit
+
+    def _resolve_in(
+        self, name: str, clubs: list[str], cache: dict[str, str | None],
+    ) -> str | None:
+        """Resolve ``name`` against a specific club list (its own cache).
+
+        Uses the SAME TeamAliasResolver + default threshold as the live
+        resolve, so the self-built snapshot (already keyed by ClubElo canonical
+        names via the build-time bridge) is matched identically to the site
+        scrape. No per-source matcher drift.
+        """
+        if name in cache:
+            return cache[name]
+        hit = self._resolver.match(name, clubs) if clubs else None
+        cache[name] = hit
+        return hit
+
+    def _load_selfbuilt(self, path: Path) -> None:
+        """Load the self-built fallback snapshot. Best-effort: a missing or
+        unparseable file simply means no self-built source (empty), never an
+        error into the engine."""
+        try:
+            snap, snap_date = _load_snapshot(path)
+        except Exception:  # noqa: BLE001 — fallback load must never break the engine
+            snap, snap_date = {}, None
+        self._selfbuilt_snapshot = snap or {}
+        self._selfbuilt_clubs = list(self._selfbuilt_snapshot.keys())
+        self._selfbuilt_date = snap_date
+
+    def _apply_fallback(self) -> None:
+        """Decide which snapshot ``predict()`` prices off (flag + both-stale).
+
+        OFF (default) -> the active snapshot stays the SITE scrape, byte-
+        identical to the pre-fallback engine. ON + stale site -> self-built (if
+        fresh+usable), else the both-stale rule (fresher-by-From, else naive).
+        Sets the read-only ``fallback_*`` seams the operator alert polls.
+        """
+        today = date.today()
+        site = assess_site(
+            self._site_snapshot, self._snapshot_date,
+            today=today, stale_after=STALE_AFTER_DAYS,
+        )
+        selfb = assess_selfbuilt(
+            self._selfbuilt_snapshot, self._selfbuilt_date, today=today,
+        )
+        self.selfbuilt_age_days = selfb.age_days
+        flag_on = bool(
+            getattr(self._settings, "cl_selfbuilt_fallback_enabled", False)
+        )
+        decision = decide_active(site, selfb, flag_on=flag_on)
+        self.fallback_engaged = decision.engaged
+        self.fallback_source = decision.source
+        self.fallback_reason = decision.reason
+        # Swap the ACTIVE snapshot. With the flag off this re-assigns the same
+        # site dict, so pricing is unchanged.
+        self._snapshot = decision.clubs
+        self._clubs = list(decision.clubs.keys())
+        if decision.engaged:
+            log.error(
+                "cl_selfbuilt_fallback_engaged",
+                source=decision.source, reason=decision.reason,
+                site_age_days=site.age_days, site_reason=site.reason,
+                selfbuilt_age_days=selfb.age_days, selfbuilt_reason=selfb.reason,
+                selfbuilt_sd=selfb.sd, active_clubs=len(decision.clubs),
+                impact="cl_priced_off_degraded_fallback",
+            )
+
+    def cl_shadow_rows(
+        self, home_name: str, away_name: str,
+    ) -> list[dict]:
+        """Observational dual-log rows for ``cl_rating_shadow`` — one per source
+        (``site_scrape`` / ``self_built``) that resolves BOTH clubs.
+
+        Both sources are priced with the SAME live constants (51/312), so the
+        only difference logged is the ratings themselves — exactly the
+        site-vs-self-built comparison the promotion gate will read. Runs
+        REGARDLESS of the flag or whether the fallback is engaged. A source that
+        cannot resolve both clubs is skipped (it could not price the fixture).
+        """
+        s = self._settings
+        rows: list[dict] = []
+        sources = (
+            ("site_scrape", self._site_snapshot, self._site_clubs,
+             self._site_res_cache, self.snapshot_age_days),
+            ("self_built", self._selfbuilt_snapshot, self._selfbuilt_clubs,
+             self._selfbuilt_res_cache, self.selfbuilt_age_days),
+        )
+        for source, snap, clubs, cache, age in sources:
+            if not clubs:
+                continue
+            hit_h = self._resolve_in(home_name, clubs, cache)
+            hit_a = self._resolve_in(away_name, clubs, cache)
+            if hit_h is None or hit_a is None:
+                continue
+            ph, pd, pa = self._model_triple(
+                snap, hit_h, hit_a, home_name, away_name,
+                s.cl_elo_home_adv, s.cl_elo_scale,
+            )
+            fav = "HOME" if ph >= pd and ph >= pa else ("AWAY" if pa >= pd else "DRAW")
+            rows.append({
+                "source": source,
+                "elo_home": snap[hit_h],
+                "elo_away": snap[hit_a],
+                "p_home": ph, "p_draw": pd, "p_away": pa,
+                "favourite": fav,
+                "snapshot_age_days": age,
+                "fallback_engaged": self.fallback_engaged,
+            })
+        return rows
 
     def _model_triple(
         self, snapshot: dict[str, float], hit_h: str, hit_a: str,
