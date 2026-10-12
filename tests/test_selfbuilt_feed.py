@@ -19,7 +19,6 @@ from betbot.data.selfbuilt_feed import (
     EloState,
     FeedError,
     Result,
-    align_any_country,
     align_to_state,
     bridge_to_clubelo,
     expected_home,
@@ -27,6 +26,7 @@ from betbot.data.selfbuilt_feed import (
     load_clubelo_rows,
     parse_fdorg_matches,
     parse_football_data_co_uk,
+    strip_country,
     update_elo,
     validate_csv_body,
     write_clubelo_snapshot,
@@ -222,24 +222,76 @@ def test_bridge_ignores_low_game_idents():
     assert snap == {} and "Man City" in unresolved
 
 
-# ---- alignment -------------------------------------------------------
-def test_align_to_state_folds_domestic_names_within_country():
-    aliases = _aliases()
-    existing = ["Arsenal FC (England)", "Manchester City (England)", "Napoli (Italy)"]
-    rows = [
-        Result(date(2026, 9, 1), "Arsenal", "Man City", 1, 1, "DOM"),  # E0 short names
+# ---- alignment (country-restricted token-subset, NO alias) -----------
+def test_align_domestic_token_subset_and_translit():
+    existing = [
+        "Leicester City (England)", "Arsenal FC (England)",
+        "Deportivo Alavés (Spain)", "FC Koeln (Germany)",
     ]
-    aligned = align_to_state(rows, existing, "England", aliases)
-    assert aligned[0].home == "Arsenal FC (England)"      # exact after strip
-    assert aligned[0].away == "Manchester City (England)"  # via alias
+    rows = [
+        Result(date(2026, 9, 1), "Leicester", "Arsenal", 1, 1, "DOM"),
+    ]
+    aligned = align_to_state(rows, existing, "England")
+    assert aligned[0].home == "Leicester City (England)"   # {leicester} subset, unique
+    assert aligned[0].away == "Arsenal FC (England)"
 
 
-def test_align_any_country_folds_cl_names_and_refuses_ties():
-    existing = ["Manchester City (England)", "Paris Saint-Germain (France)"]
-    rows = [Result(date(2026, 9, 1), "Manchester City FC", "Unknown Club FC", 2, 0, "UEFA CL")]
-    aligned = align_any_country(rows, existing, _aliases())
-    assert aligned[0].home == "Manchester City (England)"
-    assert aligned[0].away == "Unknown Club FC"            # unresolved stays raw
+def test_align_alaves_and_koeln_via_translit():
+    existing = ["Deportivo Alavés (Spain)", "FC Koeln (Germany)"]
+    a = align_to_state([Result(date(2026, 9, 1), "Alaves", "Vallecano", 1, 0, "DOM")],
+                       existing, "Spain")
+    assert a[0].home == "Deportivo Alavés (Spain)"
+    assert a[0].away == "Vallecano (Spain)"                # not in state -> suffixed
+    k = align_to_state([Result(date(2026, 9, 1), "FC Koln", "Mainz", 2, 2, "DOM")],
+                       existing, "Germany")
+    assert k[0].home == "FC Koeln (Germany)"               # Koln -> Koeln via translit
+
+
+def test_align_refuses_ambiguous_verona():
+    existing = ["Hellas Verona (Italy)", "Chievo Verona (Italy)"]
+    rows = [Result(date(2026, 9, 1), "Verona", "Napoli", 1, 0, "DOM")]
+    aligned = align_to_state(rows, existing, "Italy")
+    assert aligned[0].home == "Verona (Italy)"             # ambiguous -> suffixed, not folded
+    assert aligned[0].away == "Napoli (Italy)"
+
+
+def test_align_alias_merges_inter_and_man_city():
+    # Token rules can't merge inter<->internazionale (Milano/Milan clash) or
+    # man<->manchester; the exact alias-fold pass does, country-restricted.
+    aliases = _aliases()
+    existing = ["Inter (Italy)", "Milan (Italy)", "Manchester City (England)"]
+    it = align_to_state([Result(date(2026, 9, 1), "FC Internazionale Milano", "Milan", 1, 0, "UEFA CL")],
+                        existing, team_country={"FC Internazionale Milano": "Italy", "Milan": "Italy"},
+                        alias_map=aliases)
+    assert it[0].home == "Inter (Italy)"      # merged, NOT a fresh fragment
+    assert it[0].away == "Milan (Italy)"      # Milano did NOT also grab Milan
+    en = align_to_state([Result(date(2026, 9, 1), "Man City", "Spurs", 2, 0, "DOM")],
+                        existing, "England", alias_map=aliases)
+    assert en[0].home == "Manchester City (England)"   # Man City merged via alias
+    assert en[0].away == "Spurs (England)"             # unknown -> suffixed
+
+
+def test_align_cl_per_team_country_breaks_arsenal_belarus_tie():
+    existing = ["Arsenal FC (England)", "Arsenal Tula (Russia)", "Arsenal (Belarus)"]
+    tc = {"Arsenal FC": "England", "FC Bayern München": "Germany"}
+    rows = [Result(date(2026, 9, 1), "Arsenal FC", "FC Bayern München", 1, 0, "UEFA CL")]
+    aligned = align_to_state(rows, existing, team_country=tc)
+    assert aligned[0].home == "Arsenal FC (England)"       # country routing breaks the tie
+    assert aligned[0].away == "FC Bayern München (Germany)"  # not in state -> suffixed w/ country
+
+
+def test_cl_participants_all_get_a_country_zero_suffixless():
+    import json
+    participants = json.loads((_REPO / "tests/data/cl2026_participants.json").read_text())
+    tc = {name: area for name, area in participants}
+    names = list(tc)
+    rows = [Result(date(2026, 9, d % 28 + 1), names[i], names[i + 1], 1, 0, "UEFA CL")
+            for i, d in enumerate(range(len(names) - 1))]
+    aligned = align_to_state(rows, state_idents=[], team_country=tc, alias_map=_aliases())
+    out_names = {r.home for r in aligned} | {r.away for r in aligned}
+    suffixless = [n for n in out_names if not strip_country(n)[1]]
+    assert suffixless == [], f"CL names left suffix-less: {suffixless}"
+    assert len(out_names) == len(names)
 
 
 # ---- snapshot round-trip --------------------------------------------

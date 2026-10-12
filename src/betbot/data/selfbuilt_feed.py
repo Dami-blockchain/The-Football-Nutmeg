@@ -48,6 +48,36 @@ ELO_INIT = 1500.0
 #: Fuzzy acceptance (token_set_ratio, 0-100) when >= 2 tokens are shared.
 FUZZY_THRESHOLD = 80.0
 
+#: Non-combining chars NFKD does not decompose, folded to their digraph/base so
+#: the Scandinavian/German spellings line up across sources.
+_PRETRANS = {
+    "ß": "ss", "ø": "o", "Ø": "o", "œ": "oe", "Œ": "oe",
+    "æ": "ae", "Æ": "ae", "đ": "d", "Đ": "d", "ł": "l", "Ł": "l",
+}
+
+
+def _translit(name: str) -> str:
+    """Transliteration-folded normalised form (ö/oe/o unify, ü/ue, ä/ae, ø/o).
+
+    ``normalize`` already strips combining diacritics (ö->o via NFKD), so we
+    pre-fold the non-decomposing chars (ß, ø, …) and then collapse the common
+    German/Nordic digraphs to their base, which lets the schochastics
+    transliterations (Koeln, Nuernberg, Malmoe, Haecken, Zuerich) meet the
+    umlaut/ASCII spellings (Köln / Koln, Nürnberg / Nurnberg, …) on one form.
+    """
+    s = strip_country(name)[0]
+    for k, v in _PRETRANS.items():
+        s = s.replace(k, v)
+    base = normalize(s)
+    for dig, one in (("oe", "o"), ("ue", "u"), ("ae", "a"), ("aa", "a")):
+        base = base.replace(dig, one)
+    return base
+
+
+def _ftokens(name: str) -> set[str]:
+    """Transliteration-folded token SET of a name (``(Country)`` stripped)."""
+    return set(_translit(name).split())
+
 
 class FeedError(Exception):
     """A fetched body failed validation (200-not-payload, bad columns, …)."""
@@ -273,13 +303,13 @@ class AliasFolder:
     def __init__(self, alias_map: dict[str, list[str]] | None = None) -> None:
         self._fold: dict[str, str] = {}
         for canon, alts in (alias_map or {}).items():
-            cn = normalize(canon)
+            cn = _translit(canon)
             self._fold[cn] = cn
             for alt in alts or []:
-                self._fold[normalize(strip_country(alt)[0])] = cn
+                self._fold[_translit(strip_country(alt)[0])] = cn
 
     def canon_norm(self, name: str) -> str:
-        base = normalize(strip_country(name)[0])
+        base = _translit(name)
         return self._fold.get(base, base)
 
 
@@ -342,17 +372,24 @@ def bridge_to_clubelo(
     unresolved: list[str] = []
     for ctry, clubs in clubs_by_ctry.items():
         idents = idents_by_ctry.get(ctry, [])
-        # Score every (club, ident) pair in this country.
-        pairs: list[tuple[float, str, str]] = []
+        # Score every (club, ident) pair in this country. Greedy MAX assignment
+        # by (score, then games): when two idents match a key equally well — the
+        # same club under two spellings both alias-folded to the key — the
+        # better-sampled (more games) rating wins, so a low-game post-cutoff
+        # fragment can never displace the seed's full-history rating. This is NOT
+        # the forbidden "most games wins" across DIFFERENT clubs: a lower score
+        # (a different club) always ranks below, so a contested key still goes
+        # unresolved rather than to a wrong club.
+        pairs: list[tuple[float, int, str, str]] = []
         for club, club_cn in clubs:
             for ident, ident_cn in idents:
                 sc = _name_score(club_cn, ident_cn)
                 if sc is not None:
-                    pairs.append((sc, club, ident))
-        pairs.sort(key=lambda p: (-p[0], p[1], p[2]))
+                    pairs.append((sc, games.get(ident, 0), club, ident))
+        pairs.sort(key=lambda p: (-p[0], -p[1], p[2], p[3]))
         used_clubs: set[str] = set()
         used_idents: set[str] = set()
-        for sc, club, ident in pairs:
+        for _sc, _g, club, ident in pairs:
             if club in used_clubs or ident in used_idents:
                 continue
             snap[club] = ratings[ident]
@@ -362,86 +399,91 @@ def bridge_to_clubelo(
     return snap, unresolved
 
 
+def _display_country(ctry_normed: str) -> str:
+    """Title-case a normalised country for a readable ``(Country)`` suffix.
+    ``strip_country`` re-normalises it, so the exact casing is cosmetic."""
+    return ctry_normed.title() if ctry_normed else ""
+
+
 def align_to_state(
     results: list[Result],
     state_idents: list[str],
-    country: str,
+    country: str | None = None,
+    *,
+    team_country: dict[str, str] | None = None,
     alias_map: dict[str, list[str]] | None = None,
 ) -> list[Result]:
-    """Rewrite domestic results' team names onto the EXISTING ``"(Country)"``
-    state idents of the SAME country, so the daily football-data.co.uk feed
-    does not FRAGMENT a club already carried from the seed.
+    """Fold feed team names onto the EXISTING ``"(Country)"`` state idents so
+    the daily feed does not FRAGMENT a club already carried from the seed.
 
-    ``country`` is the normalised country of this division (see
-    :data:`DIVISION_COUNTRY`). Matching is alias-folded + the same exact /
-    >=2-token rule as the bridge, restricted to same-country idents. An
-    unresolved name keeps its raw spelling (it will be bridged — or dropped — at
-    snapshot time).
-    """
-    ctry = ctry_norm(country)
-    cands = [i for i in state_idents if strip_country(i)[1] == ctry]
-    if not cands:
-        return results
-    folder = AliasFolder(alias_map)
-    cand_cn = [(i, folder.canon_norm(i)) for i in cands]
-    cache: dict[str, str] = {}
+    Country-restricted (never cross-country): ``country`` sets ONE country for
+    every team (a domestic division, see :data:`DIVISION_COUNTRY`);
+    ``team_country`` gives a per-team country (Champions League, from
+    ``area.name``) so each CL side is matched only against its own country's
+    idents — which breaks the "Arsenal FC" vs "Arsenal FC (Belarus)" tie.
 
-    def canon(name: str) -> str:
-        if name in cache:
-            return cache[name]
-        q = folder.canon_norm(name)
-        best, best_sc = name, 0.0
-        for ident, icn in cand_cn:
-            sc = _name_score(q, icn)
-            if sc is not None and sc > best_sc:
-                best, best_sc = ident, sc
-        cache[name] = best
-        return best
+    Matching, within the team's country, in order:
 
-    return [
-        Result(r.match_date, canon(r.home), canon(r.away), r.gh, r.ga, r.competition)
-        for r in results
-    ]
+    1. **Exact alias-fold equality.** Both the feed name and the ident are
+       folded through the alias table; if they land on the SAME canonical and
+       exactly one ident does, accept. This is the ONLY way token rules cannot
+       merge (``inter`` vs ``internazionale`` — blocked from a prefix match by
+       the Milano/Milan clash — and ``man`` vs ``manchester``), so without it
+       Inter's and Man City's post-cutoff CL/domestic games would fragment onto
+       a fresh 1500 ident. It is exact-equality + country-restricted + unique,
+       so only names the table explicitly pairs can collapse — a non-aliased
+       name folds to itself and this pass is a no-op for it.
+    2. **Unique token-subset** (transliteration-folded SETS, no alias): accept
+       iff the feed set ⊆ exactly one ident's set (or that ident's ⊆ the feed)
+       and no other candidate also satisfies it. "Leicester" ⊂ "Leicester City"
+       resolves; "Verona" ⊂ both "Hellas Verona" and "Chievo Verona" is refused.
 
-
-def align_any_country(
-    results: list[Result],
-    state_idents: list[str],
-    alias_map: dict[str, list[str]] | None = None,
-) -> list[Result]:
-    """Country-BLIND alignment for Champions League rows (football-data.org
-    names carry no country), onto the existing state idents.
-
-    Uses the same alias-folded, exact-/>=2-token rule, but requires a UNIQUE
-    best across ALL idents: a tie (two idents equally good) is REFUSED and the
-    name kept raw, so a cross-country surname clash never mis-links an elite
-    club. CL involves ~36 long-form names that mostly fold exactly onto their
-    domestic idents; the alias table covers the short ones.
+    A name that matches neither but whose country is known gets that country
+    APPENDED (``f"{name} ({Country})"``) so it is never a suffix-less phantom:
+    it stays bridgeable and its (date,home,away) key is stable across runs.
     """
     folder = AliasFolder(alias_map)
-    cand_cn = [(i, folder.canon_norm(i)) for i in state_idents]
-    cache: dict[str, str] = {}
+    by_ctry: dict[str, list[tuple[str, set[str], str]]] = {}
+    for i in state_idents:
+        by_ctry.setdefault(
+            strip_country(i)[1], []).append((i, _ftokens(i), folder.canon_norm(i)))
+    default_ctry = ctry_norm(country or "")
+    cache: dict[tuple[str, str], str] = {}
 
-    def canon(name: str) -> str:
-        if name in cache:
-            return cache[name]
-        q = folder.canon_norm(name)
-        best, best_sc, tie = name, 0.0, False
-        for ident, icn in cand_cn:
-            sc = _name_score(q, icn)
-            if sc is None:
-                continue
-            if sc > best_sc:
-                best, best_sc, tie = ident, sc, False
-            elif sc == best_sc and ident != best:
-                tie = True
-        cache[name] = name if tie else best
-        return cache[name]
+    def canon(name: str, ctry: str) -> str:
+        key = (name, ctry)
+        if key in cache:
+            return cache[key]
+        cands = by_ctry.get(ctry, [])
+        af = folder.canon_norm(name)
+        exact = [ident for ident, _it, ia in cands if ia == af]
+        if len(exact) == 1:
+            res = exact[0]
+        else:
+            ft = _ftokens(name)
+            subset = [
+                ident for ident, it, _ia in cands
+                if ft and it and (ft <= it or it <= ft)
+            ]
+            if len(subset) == 1:
+                res = subset[0]
+            elif ctry:
+                res = f"{name} ({_display_country(ctry)})"
+            else:
+                res = name
+        cache[key] = res
+        return res
 
-    return [
-        Result(r.match_date, canon(r.home), canon(r.away), r.gh, r.ga, r.competition)
-        for r in results
-    ]
+    out: list[Result] = []
+    for r in results:
+        if team_country is not None:
+            ch = ctry_norm(team_country.get(r.home, ""))
+            ca = ctry_norm(team_country.get(r.away, ""))
+        else:
+            ch = ca = default_ctry
+        out.append(Result(r.match_date, canon(r.home, ch), canon(r.away, ca),
+                          r.gh, r.ga, r.competition))
+    return out
 
 
 def parse_fdorg_matches(

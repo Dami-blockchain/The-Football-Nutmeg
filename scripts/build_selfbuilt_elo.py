@@ -44,7 +44,6 @@ from betbot.data.selfbuilt_feed import (  # noqa: E402
     DIVISION_COUNTRY,
     EloState,
     FeedError,
-    align_any_country,
     align_to_state,
     bridge_to_clubelo,
     load_clubelo_rows,
@@ -114,16 +113,29 @@ def _merged_aliases() -> dict[str, list[str]]:
     return aliases
 
 
-async def _fetch_cl(seasons: list[int], today: date) -> list:
-    """CL FINISHED matches per season window via football-data.org free tier."""
+async def _fetch_cl(seasons: list[int], today: date) -> tuple[list, dict[str, str]]:
+    """CL FINISHED matches + a {team: area.name} country map, per season window
+    (football-data.org free tier). The country map (one extra call/season) is
+    what lets CL rows route through the country-restricted alignment."""
     settings = get_settings()
-    results = []
+    results: list = []
+    team_country: dict[str, str] = {}
     async with FootballDataClient(
         api_key=settings.football_data_api_key,
         base_url=settings.football_data_base_url,
         rate_limit_per_min=settings.football_data_rate_limit_per_min,
     ) as client:
         for start_year in seasons:
+            try:
+                teams = (await client._get(
+                    "/competitions/CL/teams", {"season": start_year})).get("teams") or []
+                for t in teams:
+                    nm = (t.get("name") or "").strip()
+                    area = (t.get("area") or {}).get("name") or ""
+                    if nm and area:
+                        team_country[nm] = area
+            except FootballDataError as e:
+                log.warning("cl_teams_fetch_skipped", season=start_year, error=str(e))
             d_from = f"{start_year}-07-01"
             d_to = min(date(start_year + 1, 6, 30), today).isoformat()
             try:
@@ -132,7 +144,7 @@ async def _fetch_cl(seasons: list[int], today: date) -> list:
                 log.warning("cl_fetch_skipped", season=start_year, error=str(e))
                 continue
             results.extend(parse_fdorg_matches(matches, competition="UEFA CL"))
-    return results
+    return results, team_country
 
 
 def main() -> int:
@@ -144,13 +156,15 @@ def main() -> int:
 
     aliases = _merged_aliases()
     state_idents = list(state.ratings.keys())
-    from_year = _season_start_year(state.last_date) if state.last_date else _season_start_year(today)
+    cutoff = state.last_date   # the seed authoritatively covers up to here
+    from_year = _season_start_year(cutoff) if cutoff else _season_start_year(today)
     to_year = _season_start_year(today)
     seasons = list(range(from_year, to_year + 1))
 
     all_results: list = []
 
-    # Domestic: every division across every in-range season.
+    # Domestic: every division across every in-range season, folded onto the
+    # same-country seed idents so a new match updates the right team.
     for code in _season_codes(from_year, to_year):
         for div in FD_DIVISIONS:
             url = f"https://www.football-data.co.uk/mmz4281/{code}/{div}.csv"
@@ -160,29 +174,44 @@ def main() -> int:
             except (FeedError, OSError, ValueError) as e:
                 log.warning("fd_fetch_skipped", season=code, div=div, error=str(e))
                 continue
-            res = align_to_state(res, state_idents, DIVISION_COUNTRY[div], aliases)
-            all_results.extend(res)
+            all_results.extend(align_to_state(
+                res, state_idents, DIVISION_COUNTRY[div], alias_map=aliases))
 
-    # Cross-league: CL FINISHED matches (football-data.org free tier).
-    cl = asyncio.run(_fetch_cl(seasons, today))
-    cl = align_any_country(cl, state_idents, aliases)
+    # Cross-league: CL FINISHED matches, routed through the country-restricted
+    # alignment using each team's football-data.org area.name.
+    cl, team_country = asyncio.run(_fetch_cl(seasons, today))
     uefa_rows = len(cl)
-    all_results.extend(cl)
+    all_results.extend(align_to_state(
+        cl, state_idents, team_country=team_country, alias_map=aliases))
 
+    # Fail CLOSED: a build with zero CL rows has NO cross-league linkage, so we
+    # do NOT rewrite the snapshot (keep the prior one). In the summer off-season
+    # the feed still returns the just-finished season's CL matches, so this trips
+    # only on a genuine feed outage, not merely because no CL is being played.
     if uefa_rows == 0:
         log.error("selfbuilt_build_no_uefa",
-                  hint="no CL rows ingested -> no cross-league linkage; snapshot NOT rewritten")
+                  hint="zero CL rows -> no linkage; snapshot NOT rewritten (feed outage?)")
         return 1
+
+    # Only matches STRICTLY AFTER the seed's cutoff are new; everything up to the
+    # cutoff is already in the seed (under its own spellings), so filtering here
+    # guarantees zero pre-cutoff re-applies regardless of spelling drift. The
+    # seen-set still dedupes within/across build runs.
+    if cutoff is not None:
+        all_results = [r for r in all_results if r.match_date > cutoff]
 
     applied = update_elo(state, all_results)
     if applied == 0:
         log.warning("selfbuilt_build_no_new_rows", from_date=str(state.last_date))
+    # Round in memory so the snapshot is byte-stable when nothing was applied.
+    state.ratings = {k: round(v, 4) for k, v in state.ratings.items()}
 
     settings = get_settings()
     ce_rows = load_clubelo_rows(Path(settings.cl_snapshot_path))
     snap, unresolved = bridge_to_clubelo(state.ratings, state.games, ce_rows, aliases)
     out = Path(settings.cl_selfbuilt_snapshot_path)
-    write_clubelo_snapshot(out, snap, from_date=state.last_date)
+    write_clubelo_snapshot(out, snap, from_date=state.last_date,
+                           country_of={club: code for club, code in ce_rows})
     _save_state(state)
     log.info("selfbuilt_build_done", applied=applied, uefa_rows=uefa_rows,
              bridged=len(snap), unresolved=len(unresolved),

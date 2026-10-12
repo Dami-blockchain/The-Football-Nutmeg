@@ -37,6 +37,7 @@ from betbot.data.selfbuilt_feed import (  # noqa: E402
     Result,
     bridge_to_clubelo,
     load_clubelo_rows,
+    strip_country,
     write_clubelo_snapshot,
 )
 from betbot.logging import get_logger  # noqa: E402
@@ -101,7 +102,12 @@ def main() -> int:
             except (KeyError, ValueError, TypeError):
                 continue
             home, away = (r.get("home") or "").strip(), (r.get("away") or "").strip()
+            # Reject junk idents whose name is empty once the "(Country)" suffix
+            # is stripped (e.g. a stray " ()"), which would otherwise seed a
+            # phantom rating keyed on nothing.
             if not home or not away:
+                continue
+            if not strip_country(home)[0] or not strip_country(away)[0]:
                 continue
             state.apply(Result(d, home, away, gh, ga, r.get("competition", "")))
             applied += 1
@@ -110,6 +116,8 @@ def main() -> int:
         log.error("seed_empty")
         return 1
 
+    # Round in memory so a later no-op build writes a byte-identical snapshot.
+    state.ratings = {k: round(v, 4) for k, v in state.ratings.items()}
     settings = get_settings()
     ce_rows = load_clubelo_rows(Path(settings.cl_snapshot_path))
     country_of = {club: code for club, code in ce_rows}

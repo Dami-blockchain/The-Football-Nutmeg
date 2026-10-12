@@ -4,6 +4,16 @@
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now selfbuilt-elo.timer
 # Seed ONCE first: ~/tfsm/.venv/bin/python scripts/seed_selfbuilt_elo.py
+#
+# FAILURE / monitoring: the build exits NON-ZERO (and leaves the prior snapshot
+# untouched) when it ingests zero CL rows — a fail-closed guard against a
+# linkage-less snapshot. The free feed returns the just-finished season's CL
+# matches year-round, so this trips on a genuine feed OUTAGE, not merely because
+# no CL is being played in the summer off-season. Check runs with:
+#   systemctl --user status selfbuilt-elo.service
+#   journalctl --user -u selfbuilt-elo.service -n 50
+# (A non-zero exit is logged by systemd; wire an OnFailure= unit if you want a
+# push alert.)
 [Unit]
 Description=tfsm self-built-Elo CL fallback snapshot builder (free data, no DB)
 After=network-online.target
