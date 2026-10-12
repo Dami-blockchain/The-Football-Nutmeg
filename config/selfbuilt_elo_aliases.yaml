@@ -7,8 +7,10 @@
 # football-data.co.uk short names, football-data.org long names — that a
 # country-restricted >=2-token fuzzy match would otherwise MISS or mis-map.
 #
-# Loaded ALONGSIDE config/team_aliases.yaml by the build/seed scripts. The
-# bridge is country-restricted and refuses single-shared-token and contested
+# This is the SOLE alias table the self-built bridge/align use (team_aliases.yaml
+# is the engine's football-data.org->market table, a different canonical space,
+# and is NOT merged here — AliasFolder would reject the cross-space collisions).
+# The bridge is country-restricted and refuses single-shared-token and contested
 # matches, so these aliases exist to connect names whose token sets differ
 # (Man City <-> Manchester City, Qarabağ <-> Karabakh Agdam, …).
 #
@@ -75,3 +77,17 @@ aliases:
   "Zulte Waregem": ["SV Zulte Waregem", "Waregem"]
   "Başakşehir": ["İstanbul Başakşehir", "Istanbul Basaksehir", "Buyuksehyr"]
   "Beveren": ["Waasland Beveren", "SK Beveren"]   # KSK Beveren stays distinct
+
+  # --- ported from team_aliases.yaml: top-flight clubs that were ONLY reachable
+  # via that (now-unmerged) table, so without these they un-bridged / fragmented
+  # (Fable measured: 7 un-bridged + phantoms, every La Liga club 8-14 Elo low).
+  "Tottenham": ["Tottenham Hotspur", "Tottenham Hotspur FC", "Spurs"]
+  "Newcastle": ["Newcastle United", "Newcastle United FC", "Newcastle Utd"]
+  "Marseille": ["Olympique Marseille", "Olympique de Marseille"]
+  "Paphos": ["Pafos", "Pafos FC"]
+  "Brighton": ["Brighton & Hove Albion", "Brighton and Hove Albion", "Brighton Hove Albion"]
+  "Forest": ["Nottingham Forest", "Nott'm Forest", "Nottingham Forest FC"]
+  "Celta": ["Celta de Vigo", "Celta Vigo", "RC Celta de Vigo"]
+  "Wolves": ["Wolverhampton Wanderers", "Wolverhampton", "Wolverhampton Wanderers FC"]
+  "Hamburg": ["Hamburger SV"]
+  "Espanyol": ["Espanol", "RCD Espanyol de Barcelona", "Espanyol Barcelona"]
