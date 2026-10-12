@@ -76,6 +76,40 @@ def anchor_note(pred, settings) -> str | None:
     return anchor_badge(getattr(pred, "anchor_source", None), settings)
 
 
+#: football-data.org CL ``stage`` enum -> friendly, operator-facing label.
+#: Knockout rounds carry a "Knockout" prefix so the operator reads them AS
+#: knockouts (measured weaker: ~67% vs ~76% at 0.65). PLAYOFFS already says
+#: "Knockout", so it is not double-prefixed. Any value not in this map (and a
+#: blank / NULL / unknown stage) renders NOTHING.
+_STAGE_FRIENDLY = {
+    "LEAGUE_STAGE": "🏆 League phase",
+    "PLAYOFFS": "🏆 Knockout play-off",
+    "LAST_16": "🏆 Knockout · Round of 16",
+    "QUARTER_FINALS": "🏆 Knockout · Quarter-final",
+    "SEMI_FINALS": "🏆 Knockout · Semi-final",
+    "FINAL": "🏆 Knockout · Final",
+}
+
+
+def stage_label(stage, settings) -> str | None:
+    """One-line CL competition-stage badge for a shown fixture call.
+
+    ``stage`` is football-data.org's raw CL enum (stored on the prediction /
+    outcome row; CL-only, so domestic rows carry ``None``). Returns the friendly
+    label ("🏆 League phase", "🏆 Knockout · Round of 16", ...) or
+    ``None`` when there is nothing honest to show: domestic/absent stage
+    (``None`` / blank), an unrecognised value, no ``settings``, or the flag off.
+    Gated by ``BETBOT_STAGE_BADGE`` (default ON) so one env line rolls it back
+    and callers that pass no settings are byte-identical to the pre-badge
+    output.
+    """
+    if settings is None or not getattr(settings, "stage_badge", True):
+        return None
+    if not stage:
+        return None
+    return _STAGE_FRIENDLY.get(str(stage).strip().upper())
+
+
 def _kickoff_str(pred) -> str:
     """Kickoff as ``HH:MM EAT`` (Africa/Nairobi); empty if absent.
 
@@ -124,6 +158,9 @@ def format_prediction(
         model += f"   (xG {pred.home_xg:.2f}–{pred.away_xg:.2f})"
 
     parts = [header, winner, model, NON_ADVICE_CAVEAT]
+    _stage = stage_label(getattr(pred, "stage", None), settings)
+    if _stage:
+        parts.insert(1, _stage)
     _note = anchor_note(pred, settings)
     if _note:
         parts.insert(len(parts) - 1, _note)
@@ -246,6 +283,9 @@ def format_result(
         f"Model had H {outcome_row.predicted_home:.0%} / "
         f"D {outcome_row.predicted_draw:.0%} / A {outcome_row.predicted_away:.0%}",
     ]
+    _stage = stage_label(getattr(outcome_row, "stage", None), settings)
+    if _stage:
+        lines.insert(1, _stage)
     if sold_triple is not None:
         sh, sd, sa = sold_triple
         lines.append(

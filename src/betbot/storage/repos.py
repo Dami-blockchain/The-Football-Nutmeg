@@ -962,6 +962,10 @@ def high_conf_record_all(
                 "correct": top_pick == row.actual_outcome,
                 "anchored": None if anchored is None else bool(anchored),
                 "basis": basis,
+                # CL competition stage (None for domestic / legacy rows) so the
+                # /record all list can flag knockout calls; rendered via
+                # tips.stage_label, which shows nothing when None/unknown.
+                "stage": getattr(row, "stage", None),
             }
         )
 

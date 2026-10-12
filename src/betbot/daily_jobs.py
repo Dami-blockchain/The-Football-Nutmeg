@@ -71,6 +71,7 @@ from betbot.tips import (
     format_locked,
     format_prediction,
     format_prediction_with_lineup,
+    stage_label,
 )
 
 log = get_logger(__name__)
@@ -374,8 +375,10 @@ def render_matchday_notice(settings, fixtures, day) -> str | None:
         qualifying += 1
         league = league_label(getattr(f, "competition_code", None))
         league_tag = f" · {league}" if league else ""
+        _stage = stage_label(getattr(f, "stage", None), settings)
+        stage_tag = f" · {_stage}" if _stage else ""
         lines.append(
-            f"*{f.home_team} (H) v {f.away_team} (A)*{league_tag} — "
+            f"*{f.home_team} (H) v {f.away_team} (A)*{league_tag}{stage_tag} — "
             f"KO {ko_local:%H:%M} · 🔮 prediction at {early_local:%H:%M}, "
             f"confirmed-lineup update ~{late_local:%H:%M}"
         )
@@ -738,7 +741,7 @@ async def run_morning_drop_notices(
 _PROMOTION_NOTICE_LOCK = asyncio.Lock()
 
 
-def render_morning_promotion_notice(pred) -> str:
+def render_morning_promotion_notice(pred, settings=None) -> str:
     """The short, plain heads-up for a fixture that was NOT on the morning
     high-confidence list but has since RISEN above our confidence bar — so a
     call IS now coming that the operator was never told to expect.
@@ -752,9 +755,11 @@ def render_morning_promotion_notice(pred) -> str:
     """
     league = league_label(getattr(pred, "competition_code", None))
     league_tag = f" · {league}" if league else ""
+    _stage = stage_label(getattr(pred, "stage", None), settings)
+    stage_tag = f" · {_stage}" if _stage else ""
     return (
         "*⚽ High-confidence list — update*\n\n"
-        f"*{pred.home_team} (H) v {pred.away_team} (A)*{league_tag}\n\n"
+        f"*{pred.home_team} (H) v {pred.away_team} (A)*{league_tag}{stage_tag}\n\n"
         "\U0001f195 This was NOT on this morning's high-confidence list, but a "
         "fresh model run has since lifted it above our confidence bar — so "
         "a call IS coming on it. Watch for the full prediction before kickoff.\n\n"
@@ -892,7 +897,7 @@ async def run_morning_promotion_notices(
                 log.info("morning_promotion_notice_no_audience", fixture_id=fid)
                 continue
 
-            body = render_morning_promotion_notice(pred)
+            body = render_morning_promotion_notice(pred, settings)
             any_success = False
             for uid in recipients:
                 try:

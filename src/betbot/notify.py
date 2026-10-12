@@ -21,7 +21,7 @@ pre-match alerts dead and said nothing.
 from __future__ import annotations
 
 from betbot.leagues import league_label
-from betbot.tips import NON_ADVICE_CAVEAT, anchor_note
+from betbot.tips import NON_ADVICE_CAVEAT, anchor_note, stage_label
 
 import re
 import asyncio
@@ -282,6 +282,9 @@ def format_high_conf_alert(
         _model_triple_line(pred, top_pick, market_str),
         format_band_line(min_p, live_tally, sold=live_tally_sold),
     ]
+    _stage = stage_label(getattr(pred, "stage", None), settings)
+    if _stage:
+        _lines.insert(1, _stage)
     _note = anchor_note(pred, settings)
     if _note:
         _lines.append(_note)
