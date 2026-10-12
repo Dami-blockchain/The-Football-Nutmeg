@@ -12,6 +12,7 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 
+import json
 import pytest
 import yaml
 
@@ -26,7 +27,6 @@ from betbot.data.selfbuilt_feed import (
     load_clubelo_rows,
     parse_fdorg_matches,
     parse_football_data_co_uk,
-    strip_country,
     update_elo,
     validate_csv_body,
     write_clubelo_snapshot,
@@ -247,12 +247,32 @@ def test_align_alaves_and_koeln_via_translit():
     assert k[0].home == "FC Koeln (Germany)"               # Koln -> Koeln via translit
 
 
-def test_align_refuses_ambiguous_verona():
+def test_align_verona_resolves_to_hellas_via_alias():
+    # Chievo is defunct and only Hellas carries the "Verona" alias, so the exact
+    # alias-fold resolves Verona onto Hellas; Chievo (no alias) is NOT grabbed.
     existing = ["Hellas Verona (Italy)", "Chievo Verona (Italy)"]
     rows = [Result(date(2026, 9, 1), "Verona", "Napoli", 1, 0, "DOM")]
-    aligned = align_to_state(rows, existing, "Italy")
-    assert aligned[0].home == "Verona (Italy)"             # ambiguous -> suffixed, not folded
+    aligned = align_to_state(rows, existing, "Italy", alias_map=_aliases())
+    assert aligned[0].home == "Hellas Verona (Italy)"   # resolved via alias
     assert aligned[0].away == "Napoli (Italy)"
+
+
+def test_align_refuses_ambiguous_without_alias():
+    # Same shape but NO alias: token-subset ties two clubs -> refused -> suffixed.
+    existing = ["Hellas Verona (Italy)", "Chievo Verona (Italy)"]
+    aligned = align_to_state([Result(date(2026, 9, 1), "Verona", "Napoli", 1, 0, "DOM")],
+                             existing, "Italy")
+    assert aligned[0].home == "Verona (Italy)"
+
+
+def test_align_exact_collision_prefers_more_games():
+    # Two seed spellings of the SAME club fold to one canonical -> pick the
+    # better-sampled (Sunderland / Atromitos class).
+    existing = ["Sunderland (England)", "Sunderland AFC (England)"]
+    games = {"Sunderland (England)": 1200, "Sunderland AFC (England)": 30}
+    aligned = align_to_state([Result(date(2026, 9, 1), "Sunderland", "X", 1, 0, "DOM")],
+                             existing, "England", games=games)
+    assert aligned[0].home == "Sunderland (England)"
 
 
 def test_align_alias_merges_inter_and_man_city():
@@ -280,18 +300,65 @@ def test_align_cl_per_team_country_breaks_arsenal_belarus_tie():
     assert aligned[0].away == "FC Bayern München (Germany)"  # not in state -> suffixed w/ country
 
 
-def test_cl_participants_all_get_a_country_zero_suffixless():
-    import json
-    participants = json.loads((_REPO / "tests/data/cl2026_participants.json").read_text())
-    tc = {name: area for name, area in participants}
-    names = list(tc)
-    rows = [Result(date(2026, 9, d % 28 + 1), names[i], names[i + 1], 1, 0, "UEFA CL")
-            for i, d in enumerate(range(len(names) - 1))]
-    aligned = align_to_state(rows, state_idents=[], team_country=tc, alias_map=_aliases())
-    out_names = {r.home for r in aligned} | {r.away for r in aligned}
-    suffixless = [n for n in out_names if not strip_country(n)[1]]
-    assert suffixless == [], f"CL names left suffix-less: {suffixless}"
-    assert len(out_names) == len(names)
+#: football-data.org area.name -> schochastics seed country (mirrors the build).
+_AREA_TO_SEED = {"Monaco": "France"}
+
+
+def _seed_fixture():
+    rows = json.loads((_REPO / "tests/data/seed_idents_sample.json").read_text())
+    return [k for k, _g in rows], {k: g for k, g in rows}
+
+
+def test_cl_and_domestic_names_fold_zero_new_idents():
+    # The 7 clubs the review names MUST fold onto an EXISTING seed ident (NOT a
+    # fresh "(Country)" phantom), via CL names (per-team area.name, Monaco
+    # remapped to France) and via the football-data.co.uk domestic short names.
+    seed_idents, seed_games = _seed_fixture()
+    cases = [
+        ("Eintracht Frankfurt", "Germany", "Eintracht Frankfurt (Germany)"),
+        ("Ein Frankfurt", "Germany", "Eintracht Frankfurt (Germany)"),
+        ("Sporting Clube de Portugal", "Portugal", "Sporting CP (Portugal)"),
+        ("Sp Lisbon", "Portugal", "Sporting CP (Portugal)"),
+        ("AS Monaco FC", "Monaco", "Monaco (France)"),      # area remapped
+        ("AS Monaco", "France", "Monaco (France)"),
+        ("Royale Union Saint-Gilloise", "Belgium", "Union Saint-Gilloise (Belgium)"),
+        ("PAE AEK", "Greece", "AEK Athens (Greece)"),
+        ("AEK", "Greece", "AEK Athens (Greece)"),
+        ("Olympiakos", "Greece", "Olympiakos Piraeus (Greece)"),
+        ("Sp Braga", "Portugal", "Sporting Braga (Portugal)"),
+        ("Sporting Braga", "Portugal", "Sporting Braga (Portugal)"),
+    ]
+    tc = {name: _AREA_TO_SEED.get(area, area) for name, area, _exp in cases}
+    rows = [Result(date(2026, 9, 1), name, "ZZ Dummy", 1, 0, "UEFA CL")
+            for name, _a, _e in cases]
+    aligned = align_to_state(rows, seed_idents, team_country=tc,
+                             alias_map=_aliases(), games=seed_games)
+    new_idents = []
+    for (name, _a, expect), r in zip(cases, aligned):
+        assert r.home == expect, f"{name} -> {r.home} (expected {expect})"
+        if r.home not in seed_idents:
+            new_idents.append(r.home)
+    assert new_idents == [], f"created NEW idents: {new_idents}"
+
+
+def test_no_alias_canonical_collision_within_country():
+    # No alias may fold two DIFFERENT same-country ClubElo keys to one canonical,
+    # and known-distinct same-country seed clubs must stay distinct.
+    import csv as _csv
+    from betbot.data.selfbuilt_feed import AliasFolder
+    folder = AliasFolder(_aliases())
+    rows = list(_csv.DictReader(
+        (_REPO / "tests/data/clubelo_scrape_sample.csv").open()))
+    by_ctry: dict = {}
+    for r in rows:
+        by_ctry.setdefault(r["Country"], {}).setdefault(folder.canon_norm(r["Club"]), []).append(r["Club"])
+    collisions = {c: fold for c, folds in by_ctry.items()
+                  for fold, clubs in folds.items() if len(clubs) > 1}
+    assert collisions == {}, f"alias canonical collisions: {collisions}"
+    # Known-distinct clubs must not collapse onto one another.
+    for a, b in [("Sporting CP", "Sporting Braga"), ("Inter", "Milan"),
+                 ("AEK Athens", "Olympiakos Piraeus"), ("Hellas Verona", "Chievo Verona")]:
+        assert folder.canon_norm(a) != folder.canon_norm(b), f"{a} == {b}"
 
 
 # ---- snapshot round-trip --------------------------------------------

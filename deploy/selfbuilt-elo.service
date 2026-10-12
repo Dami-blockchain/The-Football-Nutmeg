@@ -7,9 +7,11 @@
 #
 # FAILURE / monitoring: the build exits NON-ZERO (and leaves the prior snapshot
 # untouched) when it ingests zero CL rows — a fail-closed guard against a
-# linkage-less snapshot. The free feed returns the just-finished season's CL
-# matches year-round, so this trips on a genuine feed OUTAGE, not merely because
-# no CL is being played in the summer off-season. Check runs with:
+# linkage-less snapshot. The CL fetch spans BOTH the previous and current
+# season, so in the Aug->mid-Sep gap (new season not yet started; the free tier
+# has no qualifiers) the previous season's finished matches are still returned
+# and the guard does NOT trip. It trips only when BOTH seasons return zero — a
+# genuine feed outage. Check runs with:
 #   systemctl --user status selfbuilt-elo.service
 #   journalctl --user -u selfbuilt-elo.service -n 50
 # (A non-zero exit is logged by systemd; wire an OnFailure= unit if you want a

@@ -53,6 +53,7 @@ FUZZY_THRESHOLD = 80.0
 _PRETRANS = {
     "ß": "ss", "ø": "o", "Ø": "o", "œ": "oe", "Œ": "oe",
     "æ": "ae", "Æ": "ae", "đ": "d", "Đ": "d", "ł": "l", "Ł": "l",
+    "ı": "i", "İ": "i",  # Turkish dotless/dotted i (Kasımpaşa, İstanbul, Göztepe)
 }
 
 
@@ -412,6 +413,7 @@ def align_to_state(
     *,
     team_country: dict[str, str] | None = None,
     alias_map: dict[str, list[str]] | None = None,
+    games: dict[str, int] | None = None,
 ) -> list[Result]:
     """Fold feed team names onto the EXISTING ``"(Country)"`` state idents so
     the daily feed does not FRAGMENT a club already carried from the seed.
@@ -459,6 +461,11 @@ def align_to_state(
         exact = [ident for ident, _it, ia in cands if ia == af]
         if len(exact) == 1:
             res = exact[0]
+        elif len(exact) > 1:
+            # Several seed idents share this canonical — the SAME club under
+            # multiple spellings (e.g. "Sunderland" / "Sunderland AFC"). Pick the
+            # best-sampled one so the club's games consolidate rather than split.
+            res = max(exact, key=lambda i: (games or {}).get(i, 0))
         else:
             ft = _ftokens(name)
             subset = [

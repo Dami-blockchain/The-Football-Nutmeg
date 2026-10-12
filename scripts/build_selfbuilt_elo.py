@@ -61,6 +61,20 @@ UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 FD_DIVISIONS = list(DIVISION_COUNTRY.keys())
 
+#: football-data.co.uk TOP-flight divisions. The seed (schochastics) is
+#: top-flight only, so ONLY these (and CL) are date-filtered against the seed
+#: cutoff; second divisions are not in the seed, so their rows are applied in
+#: full (seen-set deduped) rather than filtered out — avoiding the one-time loss
+#: of their pre-cutoff rows (§g).
+TOP_FLIGHT = {"E0", "SP1", "D1", "I1", "F1", "N1", "P1", "B1", "T1", "SC0", "G1"}
+
+#: football-data.org area.name -> the schochastics SEED country a club's idents
+#: live under, when a UEFA club plays its league in another country. Monaco
+#: plays Ligue 1, so its seed ident is "(France)". (Welsh clubs in the English
+#: pyramid are not CL participants, and real Welsh-league CL entrants keep
+#: Wales, so Wales is deliberately NOT remapped.)
+AREA_TO_SEED_COUNTRY = {"Monaco": "France"}
+
 
 def _season_codes(from_year: int, to_year: int) -> list[str]:
     """mmz4281 codes for each season start-year in [from_year, to_year]."""
@@ -133,7 +147,7 @@ async def _fetch_cl(seasons: list[int], today: date) -> tuple[list, dict[str, st
                     nm = (t.get("name") or "").strip()
                     area = (t.get("area") or {}).get("name") or ""
                     if nm and area:
-                        team_country[nm] = area
+                        team_country[nm] = AREA_TO_SEED_COUNTRY.get(area, area)
             except FootballDataError as e:
                 log.warning("cl_teams_fetch_skipped", season=start_year, error=str(e))
             d_from = f"{start_year}-07-01"
@@ -156,15 +170,18 @@ def main() -> int:
 
     aliases = _merged_aliases()
     state_idents = list(state.ratings.keys())
+    before_idents = set(state.ratings)
     cutoff = state.last_date   # the seed authoritatively covers up to here
     from_year = _season_start_year(cutoff) if cutoff else _season_start_year(today)
     to_year = _season_start_year(today)
-    seasons = list(range(from_year, to_year + 1))
 
-    all_results: list = []
+    # Seed-covered rows (top-flight domestic + CL) are date-filtered against the
+    # cutoff; second-division rows (NOT in the top-flight-only seed) are applied
+    # in full so their pre-cutoff rows are not lost (§g). Both are seen-set
+    # deduped, so a second run still applies nothing.
+    filtered: list = []       # top-flight + CL -> > cutoff
+    unfiltered: list = []     # second divisions -> all (seen-set dedup)
 
-    # Domestic: every division across every in-range season, folded onto the
-    # same-country seed idents so a new match updates the right team.
     for code in _season_codes(from_year, to_year):
         for div in FD_DIVISIONS:
             url = f"https://www.football-data.co.uk/mmz4281/{code}/{div}.csv"
@@ -174,35 +191,39 @@ def main() -> int:
             except (FeedError, OSError, ValueError) as e:
                 log.warning("fd_fetch_skipped", season=code, div=div, error=str(e))
                 continue
-            all_results.extend(align_to_state(
-                res, state_idents, DIVISION_COUNTRY[div], alias_map=aliases))
+            res = align_to_state(res, state_idents, DIVISION_COUNTRY[div],
+                                 alias_map=aliases, games=state.games)
+            (filtered if div in TOP_FLIGHT else unfiltered).extend(res)
 
     # Cross-league: CL FINISHED matches, routed through the country-restricted
-    # alignment using each team's football-data.org area.name.
-    cl, team_country = asyncio.run(_fetch_cl(seasons, today))
+    # alignment using each team's football-data.org area.name. The window spans
+    # the PREVIOUS season too, so the zero-CL guard only trips when BOTH seasons
+    # return nothing (not every Aug->mid-Sep when the new season has no CL yet).
+    cl_seasons = list(range(from_year - 1, to_year + 1))
+    cl, team_country = asyncio.run(_fetch_cl(cl_seasons, today))
     uefa_rows = len(cl)
-    all_results.extend(align_to_state(
-        cl, state_idents, team_country=team_country, alias_map=aliases))
+    filtered.extend(align_to_state(
+        cl, state_idents, team_country=team_country, alias_map=aliases, games=state.games))
 
     # Fail CLOSED: a build with zero CL rows has NO cross-league linkage, so we
-    # do NOT rewrite the snapshot (keep the prior one). In the summer off-season
-    # the feed still returns the just-finished season's CL matches, so this trips
-    # only on a genuine feed outage, not merely because no CL is being played.
+    # do NOT rewrite the snapshot (keep the prior one).
     if uefa_rows == 0:
         log.error("selfbuilt_build_no_uefa",
                   hint="zero CL rows -> no linkage; snapshot NOT rewritten (feed outage?)")
         return 1
 
-    # Only matches STRICTLY AFTER the seed's cutoff are new; everything up to the
-    # cutoff is already in the seed (under its own spellings), so filtering here
-    # guarantees zero pre-cutoff re-applies regardless of spelling drift. The
-    # seen-set still dedupes within/across build runs.
     if cutoff is not None:
-        all_results = [r for r in all_results if r.match_date > cutoff]
+        filtered = [r for r in filtered if r.match_date > cutoff]
 
-    applied = update_elo(state, all_results)
+    applied = update_elo(state, filtered + unfiltered)
     if applied == 0:
         log.warning("selfbuilt_build_no_new_rows", from_date=str(state.last_date))
+    # New idents = clubs that did not fold onto a seed ident. Log at WARNING so
+    # fragmentation is visible in journalctl (ideally only genuinely new clubs).
+    new_idents = {k: state.games.get(k, 0) for k in set(state.ratings) - before_idents}
+    if new_idents:
+        log.warning("selfbuilt_new_idents", count=len(new_idents),
+                    idents=sorted(new_idents.items(), key=lambda kv: -kv[1])[:40])
     # Round in memory so the snapshot is byte-stable when nothing was applied.
     state.ratings = {k: round(v, 4) for k, v in state.ratings.items()}
 
