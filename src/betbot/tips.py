@@ -76,6 +76,48 @@ def anchor_note(pred, settings) -> str | None:
     return anchor_badge(getattr(pred, "anchor_source", None), settings)
 
 
+def draw_risk_line(pred, settings) -> str | None:
+    """One-line DRAW-RISK tag for a high-confidence call, or ``None``.
+
+    Operator directive (2026-10-15): when a fixture's DE-VIGGED MARKET draw
+    probability is unusually high, flag it and name the safer play — buy NO on
+    the opponent, which pays if our pick wins OR the match draws. This is the
+    sole sanctioned exception to the 2026-09-08 "no bet/no-bet copy" rule.
+
+    Returns the line ONLY when all of these hold (else ``None`` -> nothing
+    appended, byte-identical to before):
+
+    * ``BETBOT_DRAW_RISK_TAG`` is on (``settings`` present);
+    * a MARKET draw prob was recorded on the row (``market_p_draw`` not NULL) —
+      we NEVER guess it from the model's own draw prob;
+    * that prob is >= ``draw_risk_threshold`` (default 0.20);
+    * the call is high-confidence (top pick >= ``high_conf_alert_min_p``) and is
+      NOT the draw itself (a draw pick has no single opponent, and is never a
+      high-confidence pick anyway).
+    """
+    if settings is None or not getattr(settings, "draw_risk_tag_enabled", False):
+        return None
+    mpd = getattr(pred, "market_p_draw", None)
+    if mpd is None:
+        return None
+    if float(mpd) < float(getattr(settings, "draw_risk_threshold", 0.20)):
+        return None
+    home, away = pred.home_team, pred.away_team
+    pick, p = max(
+        (("HOME", pred.p_home), ("DRAW", pred.p_draw), ("AWAY", pred.p_away)),
+        key=lambda kv: kv[1],
+    )
+    if pick == "DRAW":
+        return None
+    if p < float(getattr(settings, "high_conf_alert_min_p", 0.65)):
+        return None
+    pick_team, opponent = (home, away) if pick == "HOME" else (away, home)
+    return (
+        f"⚠️ Draw risk: market rates a draw at {mpd:.0%}. "
+        f"Safer play: NO on {opponent} (pays if {pick_team} win or draw)."
+    )
+
+
 #: football-data.org CL ``stage`` enum -> friendly, operator-facing label.
 #: Knockout rounds carry a "Knockout" prefix so the operator reads them AS
 #: knockouts (measured weaker: ~67% vs ~76% at 0.65). PLAYOFFS already says
@@ -164,6 +206,9 @@ def format_prediction(
     _note = anchor_note(pred, settings)
     if _note:
         parts.insert(len(parts) - 1, _note)
+    _risk = draw_risk_line(pred, settings)
+    if _risk:
+        parts.insert(len(parts) - 1, _risk)
     return "\n".join(parts)
 
 

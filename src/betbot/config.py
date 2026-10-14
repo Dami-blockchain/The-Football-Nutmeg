@@ -646,6 +646,22 @@ class Settings(BaseSettings):
     high_conf_alert_min_p: float = Field(
         default=0.65, alias="BETBOT_HIGH_CONF_ALERT_MIN_P"
     )
+    # ---- Draw-risk tag (operator directive 2026-10-15) --------------------
+    # Add ONE line to a high-confidence prediction alert when the DE-VIGGED
+    # market draw probability is >= draw_risk_threshold, flagging that a draw is
+    # unusually likely and suggesting the safer NO-on-the-opponent play. Measured
+    # basis (22 seasons, n=6,027 anchored 0.65 calls): market P(draw) is the best
+    # single draw predictor; >=0.20 flags ~23% of calls, which drew 20.6% vs ~16%
+    # baseline. This is an INTENTIONAL, narrowly-scoped exception to the
+    # 2026-09-08 "no bet/no-bet copy" rule — it is the only such line, and it only
+    # appears when a market quote supplied the draw prob (never guessed from the
+    # model). Flag-gated, default OFF; one env line rolls it back.
+    draw_risk_tag_enabled: bool = Field(
+        default=False, alias="BETBOT_DRAW_RISK_TAG"
+    )
+    draw_risk_threshold: float = Field(
+        default=0.20, alias="BETBOT_DRAW_RISK_THRESHOLD"
+    )
     # Accuracy-ledger epoch: outcomes settled BEFORE this date are excluded
     # from every accuracy read. Predictions made before 2026-08-17 are poisoned
     # by the degenerate 0/0/100-AWAY rating bug, so quoting them to a user

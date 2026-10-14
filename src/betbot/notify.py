@@ -21,7 +21,7 @@ pre-match alerts dead and said nothing.
 from __future__ import annotations
 
 from betbot.leagues import league_label
-from betbot.tips import NON_ADVICE_CAVEAT, anchor_note, stage_label
+from betbot.tips import NON_ADVICE_CAVEAT, anchor_note, draw_risk_line, stage_label
 
 import re
 import asyncio
@@ -288,6 +288,9 @@ def format_high_conf_alert(
     _note = anchor_note(pred, settings)
     if _note:
         _lines.append(_note)
+    _risk = draw_risk_line(pred, settings)
+    if _risk:
+        _lines.append(_risk)
     _lines.append(NON_ADVICE_CAVEAT)
     return "\n".join(_lines)
 
