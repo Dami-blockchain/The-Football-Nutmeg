@@ -211,7 +211,7 @@ def test_shared_provider_built_when_flag_on(monkeypatch):
 def test_alias_overlay_merged():
     al = _load_merged_aliases()
     assert "FK Shakhtar Donetsk" in al
-    assert "Qarabag Agdam FK" in al
+    assert "FK Bodo/Glimt" in al  # overlay-only key
     # domestic table still present
     assert any("Bayern" in k for k in al)
 
@@ -269,3 +269,65 @@ async def test_prices_refetched_after_ttl_expiry():
     q2 = await prov.quote("Shakhtar Donetsk", "AEK Athens FC", "2026-10-14")
     assert calls["n"] == 6
     assert q2.probabilities[1] != q1.probabilities[1]
+
+
+# ---- Fable review: real football-data spellings + edge shapes ---------
+def _event_named(home_pm, away_pm, toks=("TOKH", "TOKD", "TOKA"), date="2026-10-14T16:45:00Z"):
+    return {
+        "title": f"{home_pm} vs. {away_pm}",
+        "markets": [
+            {"question": f"Will {home_pm} win on 2026-10-14?", "groupItemTitle": home_pm,
+             "clobTokenIds": f'["{toks[0]}","n"]', "gameStartTime": date},
+            {"question": f"Will {home_pm} vs. {away_pm} end in a draw?", "groupItemTitle": "Draw",
+             "clobTokenIds": f'["{toks[1]}","n"]', "gameStartTime": date},
+            {"question": f"Will {away_pm} win on 2026-10-14?", "groupItemTitle": away_pm,
+             "clobTokenIds": f'["{toks[2]}","n"]', "gameStartTime": date},
+        ],
+    }
+
+
+async def test_pae_aek_fd_spelling_resolves():
+    # PM lists "AEK"; football-data spells it "PAE AEK".
+    prov = _provider([_event_named("FK Shakhtar Donetsk", "AEK")],
+                     {"TOKH": 0.55, "TOKD": 0.26, "TOKA": 0.24})
+    q = await prov.quote("FK Shakhtar Donetsk", "PAE AEK", "2026-10-14")
+    assert q is not None
+
+
+async def test_dortmund_fd_spelling_resolves():
+    # PM lists "BV Borussia 09 Dortmund"; football-data spells it "Borussia Dortmund".
+    prov = _provider([_event_named("BV Borussia 09 Dortmund", "Sabah FK")],
+                     {"TOKH": 0.55, "TOKD": 0.26, "TOKA": 0.24})
+    q = await prov.quote("Borussia Dortmund", "Sabah FK", "2026-10-14")
+    assert q is not None
+
+
+async def test_not_listed_logs_skip_reason(monkeypatch):
+    import betbot.exchanges.polymarket_cl_odds as mod
+    calls = []
+    monkeypatch.setattr(mod.log, "info", lambda event, **kw: calls.append((event, kw)))
+    prov = _provider([_event_named("FK Shakhtar Donetsk", "AEK")],
+                     {"TOKH": 0.55, "TOKD": 0.26, "TOKA": 0.24})
+    q = await prov.quote("Real Madrid", "FC Barcelona", "2026-10-14")
+    assert q is None
+    assert any(e == "odds_anchor_skipped" and kw.get("reason") == "pm_not_listed"
+               for e, kw in calls)
+
+
+async def test_reversed_orientation_does_not_match():
+    # PM lists AEK at home; a prediction with Shakhtar at home must NOT match.
+    prov = _provider([_event_named("AEK", "FK Shakhtar Donetsk")],
+                     {"TOKH": 0.55, "TOKD": 0.26, "TOKA": 0.24})
+    assert await prov.quote("FK Shakhtar Donetsk", "PAE AEK", "2026-10-14") is None
+
+
+def test_parse_rejects_halftime_result_shape():
+    ev = {
+        "title": "Feyenoord Rotterdam vs. Como 1907 - Halftime Result",
+        "markets": [
+            {"question": "Feyenoord Rotterdam leading at halftime?", "clobTokenIds": '["1"]', "gameStartTime": "x"},
+            {"question": "Feyenoord Rotterdam vs. Como 1907: Draw at halftime?", "clobTokenIds": '["2"]', "gameStartTime": "x"},
+            {"question": "Como 1907 leading at halftime?", "clobTokenIds": '["3"]', "gameStartTime": "x"},
+        ],
+    }
+    assert _parse_event(ev) is None

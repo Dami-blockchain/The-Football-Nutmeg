@@ -38,6 +38,7 @@ must never break an alert.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -106,16 +107,14 @@ def _urlopen_json(url: str, timeout: float = 30.0) -> Any:
 
 
 async def _default_gamma_get(path: str, params: dict[str, Any]) -> Any:
-    import asyncio
+    from urllib.parse import urlencode
 
-    qs = "&".join(f"{k}={v}" for k, v in params.items())
+    qs = urlencode(params)
     url = f"{GAMMA_BASE}{path}?{qs}"
     return await asyncio.to_thread(_urlopen_json, url)
 
 
 async def _default_clob_midpoint(token_id: str) -> float | None:
-    import asyncio
-
     url = f"{CLOB_BASE}/midpoint?token_id={token_id}"
     try:
         data = await asyncio.to_thread(_urlopen_json, url)
@@ -229,6 +228,16 @@ class PolymarketCLOddsProvider:
         self._ttl = ttl_seconds
         self._clock = clock
         self._primed_at: float | None = None
+        # Serialise concurrent prime() refreshes (the daemon scores fixtures
+        # concurrently): without this, N fixtures racing a cold cache each fire
+        # a full discovery. The lock is created lazily so the provider stays
+        # usable outside a running loop (tests build it bare).
+        self._lock: asyncio.Lock | None = None
+        # After a discovery failure, don't re-hammer the feed for every fixture
+        # in the same run: back off for _fail_backoff seconds (short, so a
+        # recovered feed is retried the next matchday run, not this one).
+        self._fail_backoff = 60.0
+        self._last_fail_at: float | None = None
         self._events: list[_CLEvent] | None = None
         # (canon_home, canon_away, date) -> _CLEvent
         self._index: dict[tuple[str, str, str], _CLEvent] = {}
@@ -245,11 +254,29 @@ class PolymarketCLOddsProvider:
             self._clock() - self._primed_at
         ) < self._ttl:
             return len(self._events)
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        async with self._lock:
+            # Re-check under the lock: a concurrent caller may have just primed.
+            if self._events is not None and self._primed_at is not None and (
+                self._clock() - self._primed_at
+            ) < self._ttl:
+                return len(self._events)
+            # Fresh discovery failed recently? Degrade to the last-good index
+            # (or empty) without re-hitting the feed for every fixture in a run.
+            if self._last_fail_at is not None and (
+                self._clock() - self._last_fail_at
+            ) < self._fail_backoff:
+                return len(self._events or [])
+            return await self._refresh()
+
+    async def _refresh(self) -> int:
         raw: list[dict[str, Any]] = []
         try:
             raw = await self._list_events(CL_TAG_SLUG)
         except Exception as e:  # noqa: BLE001
             log.warning("cl_pm_discovery_failed", error=str(e))
+            self._last_fail_at = self._clock()
             # On a discovery failure keep any last-good index (it degrades
             # safely as the calendar rolls past it — quote() matches on date)
             # and do NOT stamp _primed_at, so a recovered feed re-primes next
@@ -324,6 +351,13 @@ class PolymarketCLOddsProvider:
         await self.prime()
         ev = self._lookup(home, away, match_date)
         if ev is None:
+            log.info(
+                "odds_anchor_skipped",
+                league="CL",
+                home=home,
+                away=away,
+                reason="pm_not_listed",
+            )
             return None
         mids = []
         for tok in (ev.tok_home, ev.tok_draw, ev.tok_away):

@@ -13,7 +13,6 @@
 # exact pass so those collisions never reach the fuzzy fallback.
 aliases:
   # --- clubs outside the big-5 domestic alias table ---
-  "Qarabag Agdam FK": ["Qarabag", "Qarabag Agdam", "Karabakh Agdam", "FK Qarabag"]
   "FK Bodo/Glimt": ["Bodo Glimt", "Bodo/Glimt", "Bodoe Glimt", "Bod Glimt"]
   "Sporting CP": ["Sporting", "Sporting Lisbon", "Sporting Clube de Portugal"]
   "Sport Lisboa e Benfica": ["Benfica", "SL Benfica"]
@@ -40,7 +39,7 @@ aliases:
   "Besiktas JK": ["Besiktas"]
   "Istanbul Basaksehir FK": ["Basaksehir", "Istanbul Basaksehir"]
   "Olympiacos FC": ["Olympiakos", "Olympiacos", "Olympiacos Piraeus"]
-  "AEK Athens FC": ["AEK", "AEK Athens"]
+  "AEK Athens FC": ["AEK", "AEK Athens", "PAE AEK"]
   "PAOK FC": ["PAOK"]
   "FC Copenhagen": ["Copenhagen", "FC Koebenhavn", "Kobenhavn"]
   "Malmo FF": ["Malmo", "Malmoe"]
@@ -58,11 +57,9 @@ aliases:
   "AS Roma": ["Roma"]
   "Sevilla FC": ["Sevilla"]
   "Como 1907": ["Como"]
-  "Sporting de Braga": ["SC Braga", "Braga", "Sporting Braga"]
   "FCSB": ["Steaua Bucuresti", "Steaua"]
   "PFC Ludogorets 1945": ["Ludogorets", "Ludogorets Razgrad"]
   "Ferencvarosi TC": ["Ferencvaros"]
-  "FC Pafos": ["Pafos", "Paphos", "Pafos FC"]
   "FC Kairat Almaty": ["Kairat", "Kairat Almaty"]
   "Ararat-Armenia": ["Ararat Armenia", "Ararat Armenia FA"]
   "Hapoel Be'er Sheva": ["Hapoel Beer Sheva", "Beer Sheva"]
@@ -71,5 +68,8 @@ aliases:
   "Dynamo Kyiv": ["Dynamo Kyiv", "Dynamo Kiev"]
   "Eintracht Frankfurt": ["Frankfurt"]
   "Bayer 04 Leverkusen": ["Leverkusen", "Bayer Leverkusen"]
+  # football-data="Borussia Dortmund" (canonical in team_aliases.yaml); PM title
+  # spells it "BV Borussia 09 Dortmund", which normalises away from the canon.
+  "Borussia Dortmund": ["BV Borussia 09 Dortmund"]
   "RB Leipzig": ["Leipzig", "RB Leipzig"]
   "VfB Stuttgart": ["Stuttgart"]
