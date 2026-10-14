@@ -97,6 +97,11 @@ def draw_risk_line(pred, settings) -> str | None:
     """
     if settings is None or not getattr(settings, "draw_risk_tag_enabled", False):
         return None
+    # Track the displayed market badge: if the shown triple is NOT anchored
+    # (anchor_source NULL), a lingering market_p_draw is stale — never show the
+    # tag under a "Model-only" badge.
+    if not getattr(pred, "anchor_source", None):
+        return None
     mpd = getattr(pred, "market_p_draw", None)
     if mpd is None:
         return None

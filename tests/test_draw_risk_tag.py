@@ -117,3 +117,13 @@ def test_high_conf_alert_includes_tag_when_on():
 def test_high_conf_alert_excludes_tag_when_off():
     body = format_high_conf_alert(Row(), Settings())
     assert "Draw risk" not in body
+
+
+
+def test_no_tag_when_unanchored_even_with_stale_market_draw():
+    """A kickoff-60 rescore that cannot anchor leaves anchor_source NULL but may
+    keep a stale market_p_draw from the 08:00 run (repos preserves it on None).
+    The tag tracks the displayed badge, so it must NOT fire under Model-only."""
+    s = _settings(BETBOT_DRAW_RISK_TAG="true")
+    row = Row(anchor_source=None, market_p_draw=0.25)
+    assert draw_risk_line(row, s) is None

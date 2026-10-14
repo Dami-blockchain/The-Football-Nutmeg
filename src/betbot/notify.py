@@ -262,7 +262,16 @@ def format_high_conf_alert(
         header += f", KO {ko} EAT"
 
     if market is None:
-        market_str = "unavailable (no live quote)"
+        # No live quote is wired into this path, but the stored row may still
+        # have been anchored to a market at scoring time. Describe that anchor
+        # rather than say "unavailable" next to the Market-anchored badge.
+        _anchored_src = {
+            "odds": "bookmaker line (anchored)",
+            "pm": "Polymarket line (anchored)",
+        }
+        market_str = _anchored_src.get(
+            getattr(pred, "anchor_source", None), "unavailable (no live quote)"
+        )
     else:
         m_side, m_prob, m_price = market
         market_str = f"{m_side} {m_prob:.0%} ({m_price:.2f})"

@@ -551,3 +551,18 @@ async def test_rescored_row_still_clearing_keeps_the_high_conf_body(tmp_path):
     assert "HIGH-CONFIDENCE ALERT" in body
     assert "Model: HOME 71% / draw 18% / away 11%" in body
     assert "Band record: p>=0.65 hits 72.8%" in body
+
+
+
+def test_high_conf_message_anchored_no_live_quote_names_source(settings):
+    """No live quote is wired into this path, but an anchored row must name its
+    anchored source on the Market line instead of saying "unavailable" next to
+    the Market-anchored badge (Fable review)."""
+    pred = _pred(1, 0.71, 0.18, 0.11)
+    pred.anchor_source = "odds"
+    body = notify.format_high_conf_alert(pred, _hc(settings), live_tally=(3, 4))
+    assert "Market: bookmaker line (anchored)" in body
+    assert "unavailable" not in body
+    pred.anchor_source = "pm"
+    body_pm = notify.format_high_conf_alert(pred, _hc(settings), live_tally=(3, 4))
+    assert "Market: Polymarket line (anchored)" in body_pm
