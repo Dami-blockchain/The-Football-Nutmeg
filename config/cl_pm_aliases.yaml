@@ -1,0 +1,75 @@
+# CL-specific team-name overlay for the Polymarket per-match anchor
+# (betbot.exchanges.polymarket_cl_odds). MERGED on top of config/team_aliases.yaml
+# — only add CL entrants that team_aliases.yaml does not already cover, or whose
+# Polymarket spelling differs. Keys are the canonical name; values are the
+# alternative spellings football-data.org OR Polymarket titles may use.
+#
+# Seeded (2026-10-15) from the research alias tables in
+# ~/research/cl-knockouts-2026-10-12/scripts/anchor_ko.py and
+# ~/research/cl-anchor-bestcase-2026-10-14/scripts/analyze.py, which were
+# validated against 480 priced CL events. The matcher's exact-alias-first +
+# ambiguous-tie rejection (betbot.exchanges.matcher.TeamAliasResolver) is what
+# stops PSG->"Paris FC" and "Athletic Club"->"Atletico"; these entries feed the
+# exact pass so those collisions never reach the fuzzy fallback.
+aliases:
+  # --- clubs outside the big-5 domestic alias table ---
+  "Qarabag Agdam FK": ["Qarabag", "Qarabag Agdam", "Karabakh Agdam", "FK Qarabag"]
+  "FK Bodo/Glimt": ["Bodo Glimt", "Bodo/Glimt", "Bodoe Glimt", "Bod Glimt"]
+  "Sporting CP": ["Sporting", "Sporting Lisbon", "Sporting Clube de Portugal"]
+  "Sport Lisboa e Benfica": ["Benfica", "SL Benfica"]
+  "FC Porto": ["Porto"]
+  "SK Slavia Praha": ["Slavia Praha", "Slavia Prague"]
+  "AC Sparta Praha": ["Sparta Praha", "Sparta Prague"]
+  "FK Crvena Zvezda": ["Red Star Belgrade", "Crvena Zvezda", "Crvena Zvezda Beograd", "Red Star"]
+  "GNK Dinamo Zagreb": ["Dinamo Zagreb"]
+  "BSC Young Boys": ["Young Boys"]
+  "FK Shakhtar Donetsk": ["Shakhtar Donetsk", "Shakhtar", "FC Shakhtar Donetsk"]
+  "Feyenoord Rotterdam": ["Feyenoord"]
+  "PSV": ["PSV Eindhoven"]
+  "AFC Ajax": ["Ajax", "Ajax Amsterdam"]
+  "Club Brugge KV": ["Club Brugge", "Brugge"]
+  "Royal Antwerp FC": ["Antwerp", "Royal Antwerp"]
+  "FC Red Bull Salzburg": ["RB Salzburg", "Salzburg", "Red Bull Salzburg"]
+  "SK Sturm Graz": ["Sturm Graz"]
+  "LASK": ["LASK Linz"]
+  "Slovan Bratislava": ["SK Slovan Bratislava", "Slovan"]
+  "Celtic FC": ["Celtic"]
+  "Rangers FC": ["Rangers", "Glasgow Rangers"]
+  "Galatasaray SK": ["Galatasaray"]
+  "Fenerbahce SK": ["Fenerbahce"]
+  "Besiktas JK": ["Besiktas"]
+  "Istanbul Basaksehir FK": ["Basaksehir", "Istanbul Basaksehir"]
+  "Olympiacos FC": ["Olympiakos", "Olympiacos", "Olympiacos Piraeus"]
+  "AEK Athens FC": ["AEK", "AEK Athens"]
+  "PAOK FC": ["PAOK"]
+  "FC Copenhagen": ["Copenhagen", "FC Koebenhavn", "Kobenhavn"]
+  "Malmo FF": ["Malmo", "Malmoe"]
+  "BK Hacken": ["Hacken"]
+  "Stade Brestois 29": ["Brest", "Stade Brestois"]
+  "RC Lens": ["Lens", "Racing Lens"]
+  "Lille OSC": ["Lille", "LOSC Lille"]
+  "AS Monaco FC": ["Monaco", "AS Monaco"]
+  "Olympique de Marseille": ["Marseille", "Olympique Marseille"]
+  "Girona FC": ["Girona"]
+  "Villarreal CF": ["Villarreal"]
+  "Atalanta BC": ["Atalanta"]
+  "Bologna FC 1909": ["Bologna"]
+  "Juventus FC": ["Juventus", "Juve"]
+  "AS Roma": ["Roma"]
+  "Sevilla FC": ["Sevilla"]
+  "Como 1907": ["Como"]
+  "Sporting de Braga": ["SC Braga", "Braga", "Sporting Braga"]
+  "FCSB": ["Steaua Bucuresti", "Steaua"]
+  "PFC Ludogorets 1945": ["Ludogorets", "Ludogorets Razgrad"]
+  "Ferencvarosi TC": ["Ferencvaros"]
+  "FC Pafos": ["Pafos", "Paphos", "Pafos FC"]
+  "FC Kairat Almaty": ["Kairat", "Kairat Almaty"]
+  "Ararat-Armenia": ["Ararat Armenia", "Ararat Armenia FA"]
+  "Hapoel Be'er Sheva": ["Hapoel Beer Sheva", "Beer Sheva"]
+  "Vikingur Reykjavik": ["Vikingur"]
+  "KI Klaksvik": ["KI", "Klaksvik"]
+  "Dynamo Kyiv": ["Dynamo Kyiv", "Dynamo Kiev"]
+  "Eintracht Frankfurt": ["Frankfurt"]
+  "Bayer 04 Leverkusen": ["Leverkusen", "Bayer Leverkusen"]
+  "RB Leipzig": ["Leipzig", "RB Leipzig"]
+  "VfB Stuttgart": ["Stuttgart"]

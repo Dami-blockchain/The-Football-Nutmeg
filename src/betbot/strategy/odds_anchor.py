@@ -146,6 +146,8 @@ async def anchor_prediction(
             # can anchor from it instead of anchoring this number a 2nd time.
             model_probs=(prediction.p_home, prediction.p_draw, prediction.p_away),
             anchor_source="odds",
+            # De-vigged bookmaker draw prob (index 1), for the draw-risk tag.
+            market_p_draw=market[1],
         )
     except Exception as e:  # noqa: BLE001 — anchoring must never break an alert
         log.warning(

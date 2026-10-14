@@ -83,6 +83,13 @@ class PredictionRow(Base):
     raw_p_draw: Mapped[float | None] = mapped_column(Float, nullable=True)
     raw_p_away: Mapped[float | None] = mapped_column(Float, nullable=True)
 
+    # De-vigged MARKET draw probability for this fixture, captured by the anchor
+    # layer (domestic bookmaker quote or CL Polymarket triple) so the draw-risk
+    # tag is reproducible from the row. NULL when no market quote was available
+    # (model-only rows + every row written before this column). Additive &
+    # nullable, same pattern as anchor_source/raw_p_*.
+    market_p_draw: Mapped[float | None] = mapped_column(Float, nullable=True)
+
     # Competition stage, recorded ONLY for the Champions League so the live
     # knockout hit rate accrues separately from the 8-game league phase.
     # Values are football-data.org's raw ``stage`` enum (LEAGUE_STAGE,

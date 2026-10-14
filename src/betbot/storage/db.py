@@ -64,6 +64,8 @@ _ADDITIVE_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("predictions", "raw_p_home", "FLOAT"),
     ("predictions", "raw_p_draw", "FLOAT"),
     ("predictions", "raw_p_away", "FLOAT"),
+    # De-vigged market draw probability, for the draw-risk tag.
+    ("predictions", "market_p_draw", "FLOAT"),
     ("prediction_outcomes", "anchor_source", "VARCHAR(8)"),
     # Competition stage for CL fixtures (NULL for domestic + legacy rows),
     # so the knockout record accrues separately from the league phase.

@@ -75,6 +75,8 @@ from betbot.strategy.engine import StrategyEngine
 from betbot.strategy.club_engine import ClubStrategyEngine
 from betbot.strategy.cl_engine import EuropeanStrategyEngine
 from betbot.strategy.odds_anchor import anchor_prediction
+from betbot.strategy.cl_pm_anchor import anchor_prediction_cl
+from betbot.exchanges.polymarket_cl_odds import shared_cl_pm_provider
 
 # Repo root (…/tfsm), used to locate config/team_aliases.yaml regardless of cwd.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -371,6 +373,17 @@ async def _score_and_log_one(
         kickoff=kickoff,
         settings=settings,
         odds_service=odds_service,
+        engine=engine,
+    )
+    # Champions League per-match Polymarket anchor (flag-gated, default OFF).
+    # No-op for domestic fixtures and when BETBOT_CL_PM_ANCHOR is off; the
+    # domestic anchor above already returned CL fixtures unchanged (no CSV row).
+    prediction = await anchor_prediction_cl(
+        prediction,
+        league=league,
+        kickoff=kickoff,
+        settings=settings,
+        provider=shared_cl_pm_provider(settings),
         engine=engine,
     )
     # Anchoring-coverage tally for the end-of-run watchdog (see
@@ -779,6 +792,16 @@ async def score_fixture_adjusted(
             kickoff=kickoff,
             settings=settings,
             odds_service=shared_odds_service(settings),
+            engine=engine,
+        )
+        # Same CL Polymarket anchor as the daily run, so the pre-match alert and
+        # the stored baseline are priced the same way. Flag-gated, default OFF.
+        prediction = await anchor_prediction_cl(
+            prediction,
+            league=league,
+            kickoff=kickoff,
+            settings=settings,
+            provider=shared_cl_pm_provider(settings),
             engine=engine,
         )
         return prediction, kickoff

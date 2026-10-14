@@ -53,6 +53,12 @@ class Prediction:
     # anchor on top of a bookmaker-anchored number.
     model_probs: tuple[float, float, float] | None = None
     anchor_source: str | None = None
+    # De-vigged MARKET probability of a draw for this fixture (quote.
+    # probabilities[1] for a domestic bookmaker line, the PM draw leg for a CL
+    # line), set by the anchor layer when a market quote was used. ``None`` when
+    # no market quote was available. The draw-risk tag reads this and NEVER the
+    # model's own draw prob, so the tag is market-grounded and reproducible.
+    market_p_draw: float | None = None
 
     @property
     def best_outcome(self) -> Outcome:

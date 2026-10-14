@@ -61,6 +61,7 @@ def upsert_prediction(
         prediction.p_home, prediction.p_draw, prediction.p_away
     )
     anchor_source = getattr(prediction, "anchor_source", None)
+    market_p_draw = getattr(prediction, "market_p_draw", None)
     with session_scope() as s:
         existing = s.execute(
             select(PredictionRow)
@@ -83,6 +84,11 @@ def upsert_prediction(
             existing.away_xg = prediction.away_xg
             existing.anchor_source = anchor_source
             existing.raw_p_home, existing.raw_p_draw, existing.raw_p_away = raw
+            # Preserve-on-None: a re-upsert that carries no fresh market quote
+            # (e.g. a payload-free rescore) must not blank a draw prob already
+            # recorded at the daily run.
+            if market_p_draw is not None:
+                existing.market_p_draw = market_p_draw
             # Preserve-on-None: the kickoff-60 rescore re-upserts the same
             # (fixture_id, run_date) row WITHOUT the match payload, so it
             # passes stage=None. Only overwrite when a value is supplied, so
@@ -110,6 +116,7 @@ def upsert_prediction(
             raw_p_home=raw[0],
             raw_p_draw=raw[1],
             raw_p_away=raw[2],
+            market_p_draw=market_p_draw,
             stage=stage,
         )
         s.add(row)

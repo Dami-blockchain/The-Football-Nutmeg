@@ -563,6 +563,14 @@ class Settings(BaseSettings):
     cl_selfbuilt_fallback_enabled: bool = Field(
         default=False, alias="BETBOT_CL_SELFBUILT_FALLBACK",
     )
+    # Anchor CL per-match predictions to the Polymarket orderbook-midpoint 1X2
+    # line (betbot.strategy.cl_pm_anchor). The domestic bookmaker CSV feed does
+    # not cover CL, so without this every CL fixture ships unanchored. Reuses
+    # BETBOT_ODDS_ANCHOR_W as the market weight. Flag-gated, default OFF; the
+    # self-built Elo fallback path is independent of it.
+    cl_pm_anchor_enabled: bool = Field(
+        default=False, alias="BETBOT_CL_PM_ANCHOR",
+    )
     # Home-advantage bump, on the ELO SCALE. Rescaled 65->51 for the site feed:
     # the site scale is compressed to ~0.77-0.79x of api.clubelo (measured over
     # 6 snapshots), so 65*0.78 ~= 51 keeps the same real home edge.
