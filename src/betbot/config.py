@@ -141,6 +141,15 @@ class Settings(BaseSettings):
     odds_anchor_min_coverage: float = Field(
         default=0.5, alias="BETBOT_ODDS_ANCHOR_MIN_COVERAGE"
     )
+    # Odds-arrival re-anchor pass (flag-gated, default OFF). The free
+    # football-data.co.uk weekend card publishes AFTER the 08:00 scoring run,
+    # so that run anchors nothing; this bounded morning cron re-fetches and
+    # re-anchors the still-unanchored fixtures once the card lands. No-op (and
+    # zero extra HTTP) when off or when BETBOT_ODDS_ANCHOR is off.
+    odds_retry_enabled: bool = Field(default=False, alias="BETBOT_ODDS_RETRY")
+    odds_retry_cron: str = Field(
+        default="15,45 8-13 * * *", alias="BETBOT_ODDS_RETRY_CRON"
+    )
     # When True (default), every probability-showing user message carries a
     # one-line badge stating whether the shown triple was market-anchored
     # ("Market-anchored") or is the raw model because no market line was

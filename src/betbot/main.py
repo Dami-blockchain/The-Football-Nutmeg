@@ -67,6 +67,7 @@ from betbot.storage.repos import (
     prediction_for_fixture,
     predictions_for_kickoff_range,
     reset_kill_switch,
+    unanchored_anchorable_fixtures,
     upsert_cl_rating_shadow,
     upsert_model_prediction,
     upsert_prediction,
@@ -246,6 +247,30 @@ def _tally_anchor_coverage(coverage, league: str, prediction) -> None:
         coverage["anchored"] += 1
 
 
+def _anchor_coverage_low_message(
+    anchored: int, scored: int, frac: float, min_cov: float
+) -> str:
+    """Body for the low-anchoring operator alert, as VALID Telegram Markdown.
+
+    The log-key globs are wrapped in code spans: a bare ``*`` in
+    ``odds_refresh_*`` is an unterminated entity in Telegram's legacy Markdown
+    and 400s the send (the plain-text retry then carried it, so the operator
+    still got the message but every scoring run logged a spurious
+    telegram_notify_failed). Backticks make the identifiers literal so the body
+    parses on the first attempt. Keep this function free of unescaped ``*`` /
+    ``_`` / unclosed ``[`` / backticks (see tests/test_odds_retry_anchor.py).
+    """
+    return (
+        "⚠️ Odds-anchor coverage LOW: "
+        f"{anchored}/{scored} ({frac:.0%}) of scored fixtures "
+        f"anchored this run (min {min_cov:.0%}). The free odds feed "
+        "(football-data.co.uk fixtures.csv) may be down, empty for our "
+        "leagues, or team names stopped resolving -- users are seeing "
+        "RAW model probabilities. Check the daemon log for "
+        "`odds_refresh_*` / `odds_names_unresolved`."
+    )
+
+
 async def _anchor_coverage_guard(settings, coverage: dict) -> None:
     """Loudly alert the operator when a scoring run's anchored fraction is low.
 
@@ -275,15 +300,7 @@ async def _anchor_coverage_guard(settings, coverage: dict) -> None:
     try:
         await notify_operator(
             settings,
-            (
-                "⚠️ Odds-anchor coverage LOW: "
-                f"{anchored}/{scored} ({frac:.0%}) of scored fixtures "
-                f"anchored this run (min {min_cov:.0%}). The free odds feed "
-                "(football-data.co.uk fixtures.csv) may be down, empty for our "
-                "leagues, or team names stopped resolving -- users are seeing "
-                "RAW model probabilities. Check the daemon log for "
-                "odds_refresh_* / odds_names_unresolved."
-            ),
+            _anchor_coverage_low_message(anchored, scored, frac, min_cov),
             kind="anchor_coverage_low",
             dedupe_key=f"anchor_cov_{date.today().isoformat()}",
         )
@@ -1647,6 +1664,73 @@ def run_daemon(
         except Exception as e:  # noqa: BLE001 — never crash the daemon
             get_logger(__name__).warning("player_minutes_refresh_failed", error=str(e))
 
+    async def _odds_retry_tick() -> None:
+        # Odds-arrival re-anchor pass (BETBOT_ODDS_RETRY, default OFF). The free
+        # football-data.co.uk weekend card publishes ~09:30-13:00 UTC, AFTER the
+        # 08:00 scoring run, so that run stores UNANCHORED rows. prime() does not
+        # advance _loaded_at on an empty refresh, so KO-lead rescores already
+        # re-fetch at the 60s floor — the value here is the STORED row in the gap
+        # between the card landing and the KO-lead rescore: the hourly prematch
+        # planner gates 0.65 on the stored triple, so a fixture that is raw 0.62
+        # / anchored 0.68 is never planned at all until the stored row is
+        # re-anchored. This bounded pass (BETBOT_ODDS_RETRY_CRON) re-fetches once
+        # (invalidate() + the 60s floor still protects the feed) and, ONLY once a
+        # forward card has landed, re-scores + re-anchors the still-unanchored,
+        # not-yet-kicked-off big-5 fixtures. It logs NO paper bets
+        # (score_fixture_adjusted never does) so it cannot double-stake, and
+        # upsert_prediction's anchor-preservation invariant means a stray
+        # no-quote rescore can never regress an anchored row. Early exits keep it
+        # cheap: no flag -> 0 HTTP; nothing unanchored -> 0 HTTP; no forward card
+        # -> 1 odds GET and no get_match. A 6s throttle spaces the per-fixture
+        # re-scores (each opens a fresh client, ~4 calls) off the 429 path.
+        s = get_settings()
+        if not getattr(s, "odds_retry_enabled", False):
+            return
+        if not getattr(s, "odds_anchor_enabled", False):
+            return
+        svc = shared_odds_service(s)
+        if svc is None:
+            return
+        _log = get_logger(__name__)
+        try:
+            now = datetime.now(timezone.utc)
+            candidates = unanchored_anchorable_fixtures(now, set(LEAGUE_TO_DIV))
+            if not candidates:
+                _log.info("odds_retry_skipped", reason="nothing_unanchored")
+                return
+            svc.invalidate()
+            await svc.prime(getattr(s, "leagues", ()))
+            if not svc.has_rows_on_or_after(date.today()):
+                _log.info(
+                    "odds_retry_no_card",
+                    unanchored=len(candidates),
+                    note="card not yet published; will retry next pass",
+                )
+                return
+            reanchored = 0
+            for i, (fid, stage) in enumerate(candidates):
+                if i:
+                    # Throttle: score_fixture_adjusted opens a fresh
+                    # FootballDataClient (~4 calls); space them so the pass does
+                    # not lean on 429 Retry-After back-off.
+                    await asyncio.sleep(6)
+                try:
+                    rescored, kickoff = await score_fixture_adjusted(s, fid)
+                    if rescored is None or kickoff is None:
+                        continue
+                    if getattr(rescored, "anchor_source", None):
+                        upsert_prediction(rescored, kickoff=kickoff, stage=stage)
+                        reanchored += 1
+                except Exception as e:  # noqa: BLE001 — one fixture can't sink the pass
+                    _log.warning(
+                        "odds_retry_fixture_failed", fixture_id=fid, error=str(e)
+                    )
+            _log.info(
+                "odds_retry_done", candidates=len(candidates), reanchored=reanchored
+            )
+        except Exception as e:  # noqa: BLE001 — the pass must never crash the daemon
+            _log.warning("odds_retry_failed", error=str(e))
+
     async def _main() -> None:
         s = get_settings()
         init_engine(s.db_path)  # cron jobs may fire before the first scoring tick
@@ -1728,6 +1812,28 @@ def run_daemon(
             trigger=CronTrigger.from_crontab("20 9 * * *", timezone=timezone.utc),
             id="score_reverification",
         )
+        # Odds-arrival re-anchor (BETBOT_ODDS_RETRY, default OFF). Bounded
+        # morning cron that re-fetches the free odds card and re-anchors the
+        # fixtures the 08:00 run missed because the card had not published yet.
+        # The tick no-ops (zero extra HTTP) when the flag or anchoring is off.
+        try:
+            _odds_retry_trigger = CronTrigger.from_crontab(
+                getattr(s, "odds_retry_cron", "15,45 8-13 * * *"),
+                timezone=timezone.utc,
+            )
+        except Exception as e:  # noqa: BLE001 — a bad cron must not sink startup
+            log.error(
+                "odds_retry_cron_invalid",
+                cron=getattr(s, "odds_retry_cron", None),
+                error=str(e),
+            )
+        else:
+            add_async_job(
+                scheduler,
+                _odds_retry_tick,
+                trigger=_odds_retry_trigger,
+                id="odds_retry_reanchor",
+            )
         # Periodic (every 15m) RETRY SAFETY-NET for the morning drop notice. The
         # notice is delivered EVENT-DRIVEN at PLAN time (the primary hook, every
         # scheduling pass) with the fire-time suppression as a secondary catch

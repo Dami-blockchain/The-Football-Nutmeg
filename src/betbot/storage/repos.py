@@ -74,21 +74,46 @@ def upsert_prediction(
             # Skipping it here is what let a rescheduled match keep its ORIGINAL
             # time forever — which pinned its pre-match alerts to a dead slot.
             existing.kickoff = kickoff
-            existing.p_home = prediction.p_home
-            existing.p_draw = prediction.p_draw
-            existing.p_away = prediction.p_away
+            # Anchor-preservation invariant (DEFENSIVE): a re-upsert that
+            # carries NO fresh market anchor (anchor_source is None) must never
+            # blank a row that is ALREADY anchored back to its raw model triple.
+            # The free odds card lands AFTER the 08:00 run, so a later lineup /
+            # odds-retry rescore can legitimately re-score a fixture with no
+            # quote in hand; without this guard such a rescore would overwrite
+            # the stored anchored triple, and the reveal (which re-reads this
+            # row) would then sell the raw number. No same-day anchored->no_quote
+            # regression has actually been OBSERVED in the daemon log — this
+            # closes the hole so it cannot happen, and the preserve branch logs
+            # if it ever does. Keep the last-good anchored snapshot until a
+            # GENUINE new quote (anchor_source set) replaces it; settlement
+            # scores, kickoff and stage still update on every path. (The historic
+            # NULL-anchor reveals were pre-3fe99de rows, written before the
+            # reveal column was populated — not a regression this would catch.)
+            _regress = anchor_source is None and existing.anchor_source is not None
+            if _regress:
+                # Make any REAL no-quote-over-anchored event greppable, to tell a
+                # genuine regression from this defensive no-op.
+                log.info(
+                    "anchor_preserved_on_no_quote",
+                    fixture_id=prediction.fixture_id,
+                    run_date=run_date,
+                )
+            else:
+                existing.p_home = prediction.p_home
+                existing.p_draw = prediction.p_draw
+                existing.p_away = prediction.p_away
+                existing.home_xg = prediction.home_xg
+                existing.away_xg = prediction.away_xg
+                existing.anchor_source = anchor_source
+                existing.raw_p_home, existing.raw_p_draw, existing.raw_p_away = raw
+                # Preserve-on-None: a re-upsert that carries no fresh market
+                # quote (e.g. a payload-free rescore) must not blank a draw prob
+                # already recorded at the daily run.
+                if market_p_draw is not None:
+                    existing.market_p_draw = market_p_draw
             existing.home_score = prediction.home_score
             existing.away_score = prediction.away_score
             existing.draw_score = prediction.draw_score
-            existing.home_xg = prediction.home_xg
-            existing.away_xg = prediction.away_xg
-            existing.anchor_source = anchor_source
-            existing.raw_p_home, existing.raw_p_draw, existing.raw_p_away = raw
-            # Preserve-on-None: a re-upsert that carries no fresh market quote
-            # (e.g. a payload-free rescore) must not blank a draw prob already
-            # recorded at the daily run.
-            if market_p_draw is not None:
-                existing.market_p_draw = market_p_draw
             # Preserve-on-None: the kickoff-60 rescore re-upserts the same
             # (fixture_id, run_date) row WITHOUT the match payload, so it
             # passes stage=None. Only overwrite when a value is supplied, so
@@ -1981,6 +2006,34 @@ def predictions_for_kickoff_range(
         if cur is None or (r.run_date, r.id) > (cur.run_date, cur.id):
             best[r.fixture_id] = r
     return [r for r in rows if best[r.fixture_id] is r]
+
+
+def unanchored_anchorable_fixtures(
+    now: datetime, leagues: set[str]
+) -> list[tuple[int, str | None]]:
+    """``(fixture_id, stage)`` for TODAY's predictions still UNANCHORED and not
+    yet kicked off, limited to the anchorable (big-5) ``leagues``.
+
+    The odds-retry pass re-scores exactly these: an anchored row is skipped
+    (nothing to fix), a kicked-off fixture is skipped (too late to matter), and
+    a non-anchorable league (CL, the free feed has no such division) is skipped
+    (it can never anchor from this feed). (fixture_id, run_date) is unique, so
+    there is one row per fixture for today — no dedup needed.
+    """
+    run_date = date.today().isoformat()
+    if not leagues:
+        return []
+    with session_scope() as s:
+        rows = list(
+            s.execute(
+                select(PredictionRow.fixture_id, PredictionRow.stage)
+                .where(PredictionRow.run_date == run_date)
+                .where(PredictionRow.anchor_source.is_(None))
+                .where(PredictionRow.kickoff > now)
+                .where(PredictionRow.competition_code.in_(tuple(leagues)))
+            )
+        )
+    return [(int(fid), stage) for fid, stage in rows]
 
 
 def prediction_for_fixture(fixture_id: int) -> PredictionRow | None:

@@ -510,6 +510,28 @@ class OddsService:
             self._loaded_at = self._clock()
             return len(rows)
 
+    def invalidate(self) -> None:
+        """Force the next :meth:`prime` to re-fetch (the odds-retry pass).
+
+        Clears only the freshness stamp, so the 60s ``_may_request`` floor still
+        protects the struggling free feed: a retry that lands <60s after another
+        fetch is skipped and simply tries again on the next pass.
+        """
+        self._loaded_at = None
+
+    def has_rows_on_or_after(self, ref: date) -> bool:
+        """True if any CACHED fixture kicks off on/after ``ref``.
+
+        The odds-retry pass uses this to tell a freshly-landed forward card from
+        a RETAINED past-weekend index (the empty-refresh branch keeps the last
+        good rows): only a forward card is worth the per-fixture re-score burst.
+        """
+        for rows in self._index.values():
+            for r in rows:
+                if r.match_date >= ref:
+                    return True
+        return False
+
     def load_rows(self, rows: Iterable[MatchOdds]) -> None:
         """Inject rows directly (tests, backtests, offline replays)."""
         self._reindex(list(rows))
