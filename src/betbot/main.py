@@ -1731,6 +1731,42 @@ def run_daemon(
         except Exception as e:  # noqa: BLE001 — the pass must never crash the daemon
             _log.warning("odds_retry_failed", error=str(e))
 
+    async def _trade_log_sync_tick() -> None:
+        # Operator Polymarket trade-log sync (BETBOT_TRADE_LOG, default OFF).
+        # PULL + STORE only, no Telegram — a read-only mirror of the operator's
+        # own public on-chain activity. No-op when the flag is off or the
+        # wallet is unset.
+        _s = get_settings()
+        if not getattr(_s, "trade_log_enabled", False):
+            return
+        if not (getattr(_s, "operator_pm_wallet", "") or "").strip():
+            get_logger(__name__).warning("trade_log_sync_skipped", reason="no_wallet")
+            return
+        try:
+            from betbot import trade_log
+
+            await asyncio.to_thread(trade_log.sync, _s)
+        except Exception as e:  # noqa: BLE001 — never crash the daemon
+            get_logger(__name__).warning("trade_log_sync_failed", error=str(e))
+
+    async def _trade_log_report_tick() -> None:
+        # Monthly operator report (1st of month, UTC). Sends to the OPERATOR
+        # only. Refreshes the mirror first so the report is current.
+        _s = get_settings()
+        if not getattr(_s, "trade_log_enabled", False):
+            return
+        if not (getattr(_s, "operator_pm_wallet", "") or "").strip():
+            return
+        try:
+            from betbot import trade_log
+            from betbot.notify import notify_operator
+
+            await asyncio.to_thread(trade_log.sync, _s)
+            body = await asyncio.to_thread(trade_log.render_report_from_db, _s)
+            await notify_operator(_s, body, kind="trade_log_monthly")
+        except Exception as e:  # noqa: BLE001 — never crash the daemon
+            get_logger(__name__).warning("trade_log_report_failed", error=str(e))
+
     async def _main() -> None:
         s = get_settings()
         init_engine(s.db_path)  # cron jobs may fire before the first scoring tick
@@ -1859,6 +1895,31 @@ def run_daemon(
             trigger=IntervalTrigger(minutes=15, timezone=timezone.utc),
             id="morning_promotion_notices",
         )
+        # Operator Polymarket trade-log jobs (BETBOT_TRADE_LOG, default OFF).
+        # Daily pull+store sync (no message) + monthly report to the operator.
+        # Registered ONLY when the flag is on, so an off deploy schedules
+        # nothing and never imports betbot.trade_log.
+        if getattr(s, "trade_log_enabled", False):
+            try:
+                _tl_sync_trigger = CronTrigger.from_crontab(
+                    getattr(s, "trade_log_sync_cron", "30 23 * * *"),
+                    timezone=timezone.utc,
+                )
+                _tl_report_trigger = CronTrigger.from_crontab(
+                    getattr(s, "trade_log_report_cron", "0 8 1 * *"),
+                    timezone=timezone.utc,
+                )
+            except Exception as e:  # noqa: BLE001 — a bad cron must not sink startup
+                log.error("trade_log_cron_invalid", error=str(e))
+            else:
+                add_async_job(
+                    scheduler, _trade_log_sync_tick,
+                    trigger=_tl_sync_trigger, id="trade_log_sync",
+                )
+                add_async_job(
+                    scheduler, _trade_log_report_tick,
+                    trigger=_tl_report_trigger, id="trade_log_report",
+                )
         # Belt-and-braces: catch anything registered through a raw add_job
         # that bypassed add_async_job. Loud, but never fatal to the daemon.
         _broken = unawaitable_jobs(scheduler)

@@ -703,6 +703,40 @@ async def log_group_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
+async def _safe_reply(update: Update, body: str) -> None:
+    """Reply with Markdown, falling back to plain text on a parse 400.
+
+    The trade-log body wraps dynamic content (team names) in a fenced code
+    block, but a plain fallback guards the legacy-Markdown 400 regardless.
+    """
+    try:
+        await update.message.reply_text(body, parse_mode=ParseMode.MARKDOWN)
+    except Exception:  # noqa: BLE001 — Telegram BadRequest on unparseable Markdown
+        await update.message.reply_text(body.replace("```", ""))
+
+
+async def trades_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Operator-only read-only report of their OWN Polymarket trading.
+
+    Gated twice: the handler is registered only when BETBOT_TRADE_LOG is on,
+    and this body still checks the caller is the operator so a shared/forked
+    chat can never read it. Silent for a non-operator caller.
+    """
+    settings = get_settings()
+    user = update.effective_user
+    if not user or user.id != settings.telegram_allowed_user_id:
+        return
+    try:
+        from betbot import trade_log
+
+        body = trade_log.render_report_from_db(settings)
+    except Exception as e:  # noqa: BLE001 — never crash the bot on a report
+        log.warning("trades_cmd_failed", error_type=type(e).__name__)
+        await update.message.reply_text("Trade log is unavailable right now.")
+        return
+    await _safe_reply(update, body)
+
+
 def build_application(settings) -> Application:
     app = Application.builder().token(settings.telegram_bot_token).build()
     # Registered BEFORE the handlers so a failure during startup is still
@@ -752,6 +786,11 @@ def build_application(settings) -> Application:
     app.add_handler(CommandHandler("status", status_cmd, filters=_priv))
     app.add_handler(CommandHandler("record", record_cmd, filters=_priv))
     app.add_handler(CommandHandler("title", title_cmd, filters=_priv))
+    # Operator-only Polymarket trade-log report. Registered ONLY when
+    # BETBOT_TRADE_LOG is on; the handler re-checks the operator id so it can
+    # never be read by a non-operator even if the filter is widened. DM-only.
+    if getattr(settings, "trade_log_enabled", False):
+        app.add_handler(CommandHandler("trades", trades_cmd, filters=_priv))
     # Read-only PUBLIC subset in approved groups only. Registered AFTER the
     # private handlers; the allowlist filter keys on the exact approved chat
     # ids, so a private chat (served above) and any unapproved group never

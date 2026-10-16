@@ -777,3 +777,71 @@ class ClRatingShadow(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
     )
+
+
+class OperatorTrade(Base):
+    """One on-chain Polymarket activity row for the OPERATOR's own wallet.
+
+    READ-ONLY MIRROR. Every row here is a faithful copy of a public
+    ``data-api.polymarket.com`` ``/activity`` event for the operator's proxy
+    wallet (:data:`betbot.config.Settings.operator_pm_wallet`). The bot never
+    signs, places or settles anything — this table only records what the
+    operator already did on-chain, so :class:`betbot.trade_log` can report his
+    realised P&L and hit-rate-vs-price against the model's calls.
+
+    Idempotency: the unique key ``(transaction_hash, asset, activity_type,
+    side)`` means a re-run of the backfill/sync UPDATES the existing row
+    (refreshing the derived match fields) rather than double-counting a fill.
+    The raw trade facts (size/price/usdc) are immutable; only the derived
+    columns (matched_fixture_id, classification, ...) are re-written on sync.
+    """
+
+    __tablename__ = "operator_trades"
+    __table_args__ = (
+        UniqueConstraint(
+            "transaction_hash",
+            "asset",
+            "activity_type",
+            "side",
+            name="uq_operator_trade_fill",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # --- raw on-chain facts (immutable once written) ---
+    transaction_hash: Mapped[str] = mapped_column(String(80), index=True)
+    condition_id: Mapped[str] = mapped_column(String(80), index=True)
+    asset: Mapped[str] = mapped_column(String(80))
+    activity_type: Mapped[str] = mapped_column(String(16))  # TRADE/REDEEM/YIELD/...
+    side: Mapped[str] = mapped_column(String(8))            # BUY/SELL/"" 
+    size: Mapped[float] = mapped_column(Float)              # outcome shares
+    price: Mapped[float] = mapped_column(Float)
+    usdc_size: Mapped[float] = mapped_column(Float)         # fee-inclusive cash flow
+    fee_usdc: Mapped[float] = mapped_column(Float, default=0.0)
+    outcome: Mapped[str] = mapped_column(String(8))         # Yes/No
+    outcome_index: Mapped[int] = mapped_column(Integer, default=0)
+    title: Mapped[str] = mapped_column(String(200))
+    slug: Mapped[str] = mapped_column(String(200))
+    event_slug: Mapped[str] = mapped_column(String(200))
+    traded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    # --- derived match fields (re-written on every sync) ---
+    competition_code: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    matched_fixture_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, index=True
+    )
+    prediction_pick: Mapped[str | None] = mapped_column(String(4), nullable=True)
+    market_side: Mapped[str | None] = mapped_column(String(4), nullable=True)
+    classification: Mapped[str] = mapped_column(String(16), default="UNMATCHED")
+    high_conf: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    draw_risk: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    anchor_source: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    exit_timing: Mapped[str | None] = mapped_column(String(12), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
