@@ -1762,7 +1762,9 @@ def run_daemon(
             from betbot.notify import notify_operator
 
             await asyncio.to_thread(trade_log.sync, _s)
-            body = await asyncio.to_thread(trade_log.render_report_from_db, _s)
+            body = await asyncio.to_thread(
+                trade_log.render_monthly_report_from_db, _s
+            )
             await notify_operator(_s, body, kind="trade_log_monthly")
         except Exception as e:  # noqa: BLE001 — never crash the daemon
             get_logger(__name__).warning("trade_log_report_failed", error=str(e))

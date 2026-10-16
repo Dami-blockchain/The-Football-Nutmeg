@@ -2699,6 +2699,8 @@ def upsert_operator_trade(fields: dict) -> bool:
         "asset": fields["asset"],
         "activity_type": fields["activity_type"],
         "side": fields["side"],
+        "traded_at": fields["traded_at"],
+        "size": fields["size"],
     }
     derived = (
         "competition_code",
@@ -2718,6 +2720,8 @@ def upsert_operator_trade(fields: dict) -> bool:
                 OperatorTrade.asset == key["asset"],
                 OperatorTrade.activity_type == key["activity_type"],
                 OperatorTrade.side == key["side"],
+                OperatorTrade.traded_at == key["traded_at"],
+                OperatorTrade.size == key["size"],
             )
         ).scalar_one_or_none()
         if existing is None:

@@ -803,6 +803,8 @@ class OperatorTrade(Base):
             "asset",
             "activity_type",
             "side",
+            "traded_at",
+            "size",
             name="uq_operator_trade_fill",
         ),
     )

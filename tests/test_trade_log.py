@@ -78,7 +78,8 @@ def test_activity_fee_only_on_trades():
          "conditionId": "c", "asset": "a", "transactionHash": "t",
          "title": "T", "slug": "s", "eventSlug": "e", "timestamp": 1}
     )
-    assert buy.fee_usdc == pytest.approx(taker_fee(600.08, 0.71))
+    assert buy.fee_usdc == pytest.approx(abs(432.2346 - 600.08 * 0.71))
+    assert buy.fee_usdc == pytest.approx(taker_fee(600.08, 0.71), abs=0.01)
     redeem = PmActivity.from_api(
         {"type": "REDEEM", "side": "", "size": 600.08, "price": 0.0,
          "usdcSize": 600.08, "outcome": "Yes", "outcomeIndex": 0,
@@ -386,7 +387,7 @@ def test_render_is_fenced_and_plain_safe():
     assert body.startswith("```")
     assert body.count("```") == 2  # exactly one fenced block
     assert "Operator trade log" in body
-    assert "Edge =" in body
+    assert "edge =" in body
 
 
 # --------------------------------------------------------------------------
@@ -445,3 +446,111 @@ def test_sync_requires_wallet(db):
     s = Settings(_env_file=None, BETBOT_TRADE_LOG="true")
     with pytest.raises(ValueError):
         tl.sync(s, client=_FakeClient([]))
+
+
+# --------------------------------------------------------------------------
+# Fable review fixes
+# --------------------------------------------------------------------------
+
+
+def test_fee_zero_for_maker_fill():
+    # Maker fill: usdcSize == size*price exactly -> fee 0.
+    maker = PmActivity.from_api({
+        "type": "TRADE", "side": "BUY", "size": 100.0, "price": 0.50,
+        "usdcSize": 50.0, "outcome": "Yes", "outcomeIndex": 0,
+        "conditionId": "c", "asset": "a", "transactionHash": "t",
+        "title": "T", "slug": "s", "eventSlug": "e", "timestamp": 1})
+    assert maker.fee_usdc == pytest.approx(0.0)
+    # Taker fill: fee is the cash gap.
+    taker = PmActivity.from_api({
+        "type": "TRADE", "side": "BUY", "size": 100.0, "price": 0.50,
+        "usdcSize": 51.25, "outcome": "Yes", "outcomeIndex": 0,
+        "conditionId": "c", "asset": "a", "transactionHash": "t2",
+        "title": "T", "slug": "s", "eventSlug": "e", "timestamp": 2})
+    assert taker.fee_usdc == pytest.approx(1.25)
+
+
+def test_won_none_when_unresolved():
+    # Directional WIN, no outcome row, no redeem, no feed -> UNRESOLVED (None),
+    # NOT a miss.
+    p = tl.Position(
+        condition_id="c", asset="a", outcome_index=0, title="t",
+        competition_code="PL", fixture_id=1, classification=tl.WIN, pick="HOME",
+        market_side="HOME", high_conf=True, draw_risk=False, anchor_source=None)
+    p.bought_usdc = 50.0
+    p.bought_shares = 100.0
+    p.entry_notional = 50.0
+    p.first_ts = KO
+    assert p.won is None
+    s = tl.summarize([p], label="x")
+    assert s.n_settled_directional == 0  # excluded, not counted as a miss
+    assert s.hit_rate is None
+
+
+def test_pending_payout_excluded_from_pnl(db, settings):
+    _seed_prediction(12, "A", "B", (0.8, 0.12, 0.08), code="PL")
+    buy = _activity("Will A win on 2026-10-14?", "Yes", side="BUY",
+                    size=100, price=0.6, usdc=60.0, cond="cp", asset="tp", oidx=0)
+    m = tl.PredictionMatcher(settings)
+    row = _store(buy, m.match(buy))
+    # Settled winner, redeemable, value > 0, NOT yet redeemed.
+    feed = [PmPosition.from_api({
+        "conditionId": "cp", "asset": "tp", "size": 100, "avgPrice": 0.6,
+        "currentValue": 100.0, "curPrice": 1.0, "redeemable": True,
+        "outcomeIndex": 0, "title": "A", "endDate": "2026-10-14"})]
+    positions = tl.build_positions([row], feed)
+    p = positions[0]
+    assert p.is_pending is True
+    assert p.is_open is False
+    s = tl.summarize(positions, label="x")
+    assert s.n_pending == 1
+    assert s.pending_claimable == pytest.approx(100.0)
+    assert s.pending_cost == pytest.approx(60.0)
+    # NOT counted as a realised loss.
+    assert s.realized_pnl == pytest.approx(0.0)
+    assert s.total_cost == pytest.approx(0.0)
+
+
+def test_monthly_report_uses_previous_month():
+    start = datetime(2026, 9, 10, tzinfo=timezone.utc)
+    sep = _won_position(tl.WIN, "HOME", "HOME", 0.6, 60.0)
+    sep.first_ts = start
+    oct1 = _won_position(tl.WIN, "HOME", "HOME", 0.6, 60.0)
+    oct1.first_ts = datetime(2026, 10, 1, 0, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 10, 1, 8, 0, tzinfo=timezone.utc)  # 08:00 on the 1st
+    body = tl.render_monthly_report([sep, oct1], now=now)
+    assert "September 2026" in body
+    assert "monthly report" in body
+    # The Sept position is in-window; the Oct-1 one is not.
+    s = tl.summarize([sep, oct1], label="Sep",
+                     since=tl.prev_month_bounds(now)[0],
+                     until=tl.prev_month_bounds(now)[1])
+    assert s.n_positions == 1
+
+
+def test_prev_month_bounds():
+    start, end = tl.prev_month_bounds(datetime(2026, 1, 15, tzinfo=timezone.utc))
+    assert start == datetime(2025, 12, 1, tzinfo=timezone.utc)
+    assert end == datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+def test_idempotency_key_includes_ts_and_size(db):
+    base = dict(
+        transaction_hash="tx", asset="a", activity_type="TRADE", side="BUY",
+        condition_id="c", price=0.5, usdc_size=5.0, fee_usdc=0.0,
+        outcome="Yes", outcome_index=0, title="T", slug="s", event_slug="e",
+        classification=tl.WIN)
+    # Two partial fills in one tx: same tx+asset+type+side but different size/ts.
+    f1 = dict(base, size=10.0, traded_at=KO)
+    f2 = dict(base, size=20.0, traded_at=datetime(2026, 10, 14, 19, 5, tzinfo=timezone.utc))
+    assert upsert_operator_trade(f1) is True
+    assert upsert_operator_trade(f2) is True
+    assert len(list_operator_trades()) == 2
+
+
+def test_live_marks_unavailable_note():
+    positions = [_won_position(tl.WIN, "HOME", "HOME", 0.6, 60.0)]
+    body = tl.render_report(positions, now=KO, live_marks_ok=False)
+    assert "live marks unavailable" in body
+    ok_body = tl.render_report(positions, now=KO, live_marks_ok=True)
+    assert "live marks unavailable" not in ok_body

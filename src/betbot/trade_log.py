@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from betbot.exchanges.matcher import TeamAliasResolver
 from betbot.exchanges.pm_activity import PmActivity, PmDataClient, PmPosition
@@ -306,6 +306,15 @@ def sync(
 
     inserted = 0
     for act in acts:
+        # MERGE / SPLIT / CONVERSION (and any unknown type) that carry a
+        # conditionId change a position in ways this mirror does not model;
+        # surface them so a silent gap in the P&L is visible.
+        if act.activity_type not in _POSITION_TYPES and act.condition_id:
+            log.warning(
+                "operator_trade_unmodeled_activity",
+                activity_type=act.activity_type,
+                slug=act.slug,
+            )
         m = matcher.match(act)
         et = (
             exit_timing(act.timestamp, m.kickoff)
@@ -384,6 +393,8 @@ class Position:
     # filled from /positions + outcomes
     current_value: float = 0.0
     is_open: bool = False
+    is_pending: bool = False  # settled WINNER not yet redeemed (payout claimable)
+    has_feed_row: bool = False
     actual_outcome: str | None = None
 
     @property
@@ -415,21 +426,27 @@ class Position:
 
     @property
     def won(self) -> bool | None:
-        """Did the side held resolve in the money? None if undetermined."""
+        """Did the side held resolve in the money? None if UNRESOLVED.
+
+        Never fabricates a miss: an open/unplayed position, a position the
+        operator sold out of before settlement (no feed row, no outcome row),
+        or a run where the live feed failed all return None, so they are
+        EXCLUDED from the hit rate rather than scored as losses.
+        """
         if self.classification == DRAW_BET:
-            if self.actual_outcome is None:
-                return self.redeem_usdc > 0 if self._is_settled else None
-            return self.actual_outcome == "DRAW"
+            if self.actual_outcome is not None:
+                return self.actual_outcome == "DRAW"
+            return True if self.redeem_usdc > 0 else None
         if self.actual_outcome is not None and self.pick is not None:
             if self.classification == WIN:
                 return self.actual_outcome == self.pick
             if self.classification == NO_OPP:
-                # NO on opponent -> wins unless the opponent won.
                 opp = "AWAY" if self.pick == "HOME" else "HOME"
                 return self.actual_outcome != opp
-        # Fallback: redemption only happens on the winning side.
-        if self._is_settled:
-            return self.redeem_usdc > 0
+        # No settled outcome row for this fixture: a redemption is proof of a
+        # win; anything else is UNRESOLVED from our data (never a guessed loss).
+        if self.redeem_usdc > 0:
+            return True
         return None
 
     @property
@@ -509,13 +526,14 @@ def build_positions(
         # with a non-zero current value (an unsettled market). A settled loser
         # has current_value 0 and is NOT open.
         if feed is not None:
+            pos.has_feed_row = True
             pos.current_value = feed.current_value
-            pos.is_open = (
-                pos.net_shares > 1e-6
-                and pos.redeem_usdc <= 0.0
-                and feed.current_value > 0.0
-                and not feed.redeemable
-            )
+            holds = pos.net_shares > 1e-6 and pos.redeem_usdc <= 0.0
+            # Unsettled market, still priced -> OPEN (genuine unrecovered cost).
+            pos.is_open = holds and feed.current_value > 0.0 and not feed.redeemable
+            # Resolved IN FAVOUR but not yet redeemed -> PENDING PAYOUT, not a
+            # realised loss: the winnings are claimable (redeemable + value>0).
+            pos.is_pending = holds and feed.current_value > 0.0 and feed.redeemable
         if pos.fixture_id is not None:
             pos.actual_outcome = repos.actual_outcome_for(pos.fixture_id)
     # Exclude pure-cash rows (YIELD etc.) — they have no condition position.
@@ -549,6 +567,9 @@ class Summary:
     pnl_domestic: float = 0.0
     pnl_cl: float = 0.0
     n_early_sold: int = 0
+    n_pending: int = 0
+    pending_claimable: float = 0.0
+    pending_cost: float = 0.0
 
     @property
     def roi(self) -> float:
@@ -574,27 +595,50 @@ class Summary:
         return hr - ap
 
 
-def summarize(positions: list[Position], *, label: str, since: datetime | None = None) -> Summary:
+def summarize(
+    positions: list[Position],
+    *,
+    label: str,
+    since: datetime | None = None,
+    until: datetime | None = None,
+) -> Summary:
+    """Aggregate positions bucketed by FIRST FILL into [since, until).
+
+    A PENDING-PAYOUT position (settled winner not yet redeemed) is kept OUT
+    of the realised-P&L / ROI / hit buckets and reported on its own line, so
+    an unredeemed winner is never shown as a realised loss. OPEN positions
+    stay IN realised/total-cost (their cost is genuinely unrecovered), which
+    is why the ROI denominator includes still-open cost.
+    """
     s = Summary(label=label)
     for p in positions:
         if since is not None and (p.first_ts is None or p.first_ts < since):
             continue
+        if until is not None and (p.first_ts is None or p.first_ts >= until):
+            continue
         s.n_positions += 1
-        s.realized_pnl += p.realized_pnl
-        s.total_cost += p.bought_usdc
         s.fees += p.fee_usdc
         s.by_type[p.classification] = s.by_type.get(p.classification, 0) + 1
+        if p.competition_code == "CL":
+            s.n_cl += 1
+        else:
+            s.n_domestic += 1
+        if p.sold_early:
+            s.n_early_sold += 1
+        if p.is_pending:
+            s.n_pending += 1
+            s.pending_claimable += p.current_value
+            s.pending_cost += p.bought_usdc
+            continue  # excluded from realised P&L / hit until redeemed
+        s.realized_pnl += p.realized_pnl
+        s.total_cost += p.bought_usdc
         s.pnl_by_type[p.classification] = (
             s.pnl_by_type.get(p.classification, 0.0) + p.realized_pnl
         )
         if p.competition_code == "CL":
-            s.n_cl += 1
             s.pnl_cl += p.realized_pnl
         else:
-            s.n_domestic += 1
             s.pnl_domestic += p.realized_pnl
-        if p.sold_early:
-            s.n_early_sold += 1
         if p.is_open:
             s.n_open += 1
             s.open_exposure += p.current_value
@@ -607,6 +651,14 @@ def summarize(positions: list[Position], *, label: str, since: datetime | None =
                 if won:
                     s.n_hits += 1
     return s
+
+
+def prev_month_bounds(now: datetime | None = None) -> tuple[datetime, datetime]:
+    """[start, end) of the calendar month BEFORE ``now`` (UTC)."""
+    end = month_start(now)
+    last = end - timedelta(seconds=1)
+    start = last.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return start, end
 
 
 def month_start(now: datetime | None = None) -> datetime:
@@ -662,6 +714,12 @@ def _render_summary_block(s: Summary) -> list[str]:
         f"Domestic: {s.n_domestic} ({_money(s.pnl_domestic)})   "
         f"CL: {s.n_cl} ({_money(s.pnl_cl)})"
     )
+    if s.n_pending:
+        lines.append(
+            f"Pending payout: {s.n_pending} "
+            f"(${s.pending_claimable:,.2f} claimable, cost ${s.pending_cost:,.2f}) "
+            f"— excluded from P&L until redeemed"
+        )
     if s.n_open:
         lines.append(
             f"Open exposure: ${s.open_exposure:,.2f} "
@@ -670,37 +728,97 @@ def _render_summary_block(s: Summary) -> list[str]:
     return lines
 
 
+_HEADING = "Operator trade log — Polymarket"
+
+
+def _assemble(summaries: list[Summary], *, live_marks_ok: bool, heading: str) -> str:
+    body = [heading, ""]
+    for s in summaries:
+        body += _render_summary_block(s)
+        body.append("")
+    if body and body[-1] == "":
+        body.pop()
+    notes = [
+        "Read-only mirror of your own on-chain trades. Facts only.",
+        "P&L is net of fees (fee = usdcSize vs size*price; maker fills pay 0).",
+        "hit = the side held resolved in the money (independent of early exit).",
+        "edge = hit rate - unweighted per-position avg entry price.",
+        "ROI denominator includes still-open cost; a month buckets by first fill.",
+    ]
+    if not live_marks_ok:
+        notes.append(
+            "live marks unavailable (positions feed failed) — "
+            "open/pending positions may be understated."
+        )
+    return "```\n" + "\n".join(body) + "\n```\n" + "\n".join(notes)
+
+
 def render_report(
     positions: list[Position],
     *,
     now: datetime | None = None,
-    heading: str = "Operator trade log — Polymarket",
+    live_marks_ok: bool = True,
+    heading: str = _HEADING,
 ) -> str:
+    """Month-to-date + all-time (the /trades command)."""
     now = now or datetime.now(timezone.utc)
-    mstart = month_start(now)
-    mtd = summarize(positions, label=now.strftime("Month to date (%b %Y)"), since=mstart)
-    alltime = summarize(positions, label="All time (since 2026-08-01)")
-    body = [heading, ""]
-    body += _render_summary_block(mtd)
-    body.append("")
-    body += _render_summary_block(alltime)
-    note = (
-        "\nRead-only mirror of your own on-chain trades. P&L is net of the "
-        "5% p(1-p) taker fee. Edge = hit rate - avg entry price paid."
+    mtd = summarize(
+        positions, label=now.strftime("Month to date (%b %Y)"), since=month_start(now)
     )
-    return "```\n" + "\n".join(body) + "\n```" + note
+    alltime = summarize(positions, label="All time (since 2026-08-01)")
+    return _assemble([mtd, alltime], live_marks_ok=live_marks_ok, heading=heading)
 
 
-def render_report_from_db(settings, *, now: datetime | None = None) -> str:
-    """Build the /trades body from the stored mirror + a live /positions pull."""
+def render_monthly_report(
+    positions: list[Position],
+    *,
+    now: datetime | None = None,
+    live_marks_ok: bool = True,
+    heading: str = _HEADING,
+) -> str:
+    """The PREVIOUS calendar month + all-time (the 1st-of-month DM).
+
+    Keyed off the month BEFORE ``now`` so a report sent at 08:00 UTC on the 1st
+    covers the month that just ended, never the new, empty month.
+    """
+    now = now or datetime.now(timezone.utc)
+    start, end = prev_month_bounds(now)
+    prev = summarize(
+        positions, label=start.strftime("%B %Y"), since=start, until=end
+    )
+    alltime = summarize(positions, label="All time (since 2026-08-01)")
+    return _assemble(
+        [prev, alltime], live_marks_ok=live_marks_ok,
+        heading=heading + " — monthly report",
+    )
+
+
+def _load_positions(settings) -> tuple[list[Position], bool]:
+    """Positions from the stored mirror + a live /positions mark. 2nd item is
+    True iff the live feed was successfully read."""
     trades = repos.list_operator_trades(since=DEFAULT_BACKFILL_START)
     positions_feed: list[PmPosition] = []
+    live_ok = True
     address = (getattr(settings, "operator_pm_wallet", "") or "").strip()
-    if address:
+    if not address:
+        live_ok = False
+    else:
         try:
             with PmDataClient() as c:
                 positions_feed = c.fetch_positions(address)
         except Exception as e:  # noqa: BLE001 — a live-mark failure must not break the report
+            live_ok = False
             log.warning("operator_positions_fetch_failed", error_type=type(e).__name__)
-    positions = build_positions(trades, positions_feed)
-    return render_report(positions, now=now)
+    return build_positions(trades, positions_feed), live_ok
+
+
+def render_report_from_db(settings, *, now: datetime | None = None) -> str:
+    """Build the /trades body from the stored mirror + a live /positions pull."""
+    positions, live_ok = _load_positions(settings)
+    return render_report(positions, now=now, live_marks_ok=live_ok)
+
+
+def render_monthly_report_from_db(settings, *, now: datetime | None = None) -> str:
+    """Build the 1st-of-month report body (previous month + all-time)."""
+    positions, live_ok = _load_positions(settings)
+    return render_monthly_report(positions, now=now, live_marks_ok=live_ok)

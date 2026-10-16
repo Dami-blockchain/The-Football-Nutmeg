@@ -14,6 +14,7 @@ set:  python -m betbot.telegram_bot
 
 from __future__ import annotations
 
+import asyncio
 import time
 from datetime import datetime, timezone
 
@@ -729,7 +730,7 @@ async def trades_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         from betbot import trade_log
 
-        body = trade_log.render_report_from_db(settings)
+        body = await asyncio.to_thread(trade_log.render_report_from_db, settings)
     except Exception as e:  # noqa: BLE001 — never crash the bot on a report
         log.warning("trades_cmd_failed", error_type=type(e).__name__)
         await update.message.reply_text("Trade log is unavailable right now.")

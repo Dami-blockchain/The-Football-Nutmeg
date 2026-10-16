@@ -29,12 +29,12 @@ reconciling three known fills (not guessed; see ``docs``/the PR notes):
     timestamp       unix seconds
     title/slug/eventSlug  human + url-slug market identifiers
 
-The sports TAKER FEE is ``size * 0.05 * price * (1 - price)`` — Polymarket's
-5% * p(1-p) curve. Reconciled to the cent against the operator's real fills:
-a BUY of 600.08 Stuttgart shares @0.71 shows usdcSize 432.2346 == 600.08*0.71
-+ 600.08*0.05*0.71*0.29. ``usdcSize`` already bakes it in, so P&L built from
-``usdcSize`` is net-of-fee WITHOUT us re-deriving anything; :func:`taker_fee`
-is provided only to REPORT the fee component.
+The taker fee follows Polymarket's 5% * p(1-p) sports curve, but a MAKER
+fill pays ZERO — so the fee actually charged on a fill is read from the
+cash itself: ``fee = abs(usdcSize - size*price)`` (a maker fill has
+usdcSize == size*price, hence 0). ``usdcSize`` already bakes the fee in,
+so P&L built from ``usdcSize`` is net-of-fee without re-deriving anything;
+:func:`taker_fee` returns the THEORETICAL taker fee (for reference only).
 """
 
 from __future__ import annotations
@@ -103,9 +103,11 @@ class PmActivity:
 
     @property
     def fee_usdc(self) -> float:
+        # The fee ACTUALLY charged on this fill, read from the cash: a maker
+        # fill pays 0 (usdcSize == size*price), a taker fill pays the gap.
         if self.activity_type != "TRADE":
             return 0.0
-        return taker_fee(self.size, self.price)
+        return abs(self.usdc_size - self.size * self.price)
 
     @classmethod
     def from_api(cls, row: dict[str, Any]) -> "PmActivity":
