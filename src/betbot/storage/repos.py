@@ -19,6 +19,7 @@ from betbot.storage.models import (
     KillSwitch,
     MatchdayNoticeRun,
     ModelPrediction,
+    OperatorTrade,
     MorningNoticeListing,
     PaperBet,
     PromotionNoticeListing,
@@ -2679,3 +2680,107 @@ def upsert_cl_rating_shadow(
                 existing.fallback_engaged = bool(r.get("fallback_engaged", False))
             written += 1
     return written
+
+
+# ---------------------------------------------------------------------------
+# Operator Polymarket trade-log mirror (read-only; see betbot.trade_log).
+# ---------------------------------------------------------------------------
+
+
+def upsert_operator_trade(fields: dict) -> bool:
+    """Idempotent insert/update of one /activity fill. True iff a new row.
+
+    Keyed on (transaction_hash, asset, activity_type, side). A re-run refreshes
+    ONLY the derived match columns (classification/fixture/etc.); the raw trade
+    facts are left as first written. Never double-counts a fill.
+    """
+    key = {
+        "transaction_hash": fields["transaction_hash"],
+        "asset": fields["asset"],
+        "activity_type": fields["activity_type"],
+        "side": fields["side"],
+        "traded_at": fields["traded_at"],
+        "size": fields["size"],
+    }
+    derived = (
+        "competition_code",
+        "matched_fixture_id",
+        "prediction_pick",
+        "market_side",
+        "classification",
+        "high_conf",
+        "draw_risk",
+        "anchor_source",
+        "exit_timing",
+    )
+    with session_scope() as s:
+        existing = s.execute(
+            select(OperatorTrade).where(
+                OperatorTrade.transaction_hash == key["transaction_hash"],
+                OperatorTrade.asset == key["asset"],
+                OperatorTrade.activity_type == key["activity_type"],
+                OperatorTrade.side == key["side"],
+                OperatorTrade.traded_at == key["traded_at"],
+                OperatorTrade.size == key["size"],
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            s.add(OperatorTrade(**fields))
+            return True
+        # Refresh derived fields only (matching may improve as predictions
+        # settle); raw facts stay immutable.
+        for col in derived:
+            if col in fields:
+                setattr(existing, col, fields[col])
+        return False
+
+
+def list_operator_trades(since: datetime | None = None) -> list[OperatorTrade]:
+    """All operator-trade rows (optionally traded at/after ``since``), oldest-first."""
+    with session_scope() as s:
+        stmt = select(OperatorTrade)
+        if since is not None:
+            stmt = stmt.where(OperatorTrade.traded_at >= since)
+        stmt = stmt.order_by(OperatorTrade.traded_at.asc(), OperatorTrade.id.asc())
+        rows = list(s.execute(stmt).scalars().all())
+        for r in rows:  # detach-safe: touch the attrs we read later
+            _ = (r.condition_id, r.asset, r.classification)
+        return rows
+
+
+def freshest_predictions_on_date(date_str: str) -> list[PredictionRow]:
+    """One prediction row per fixture kicking off on ``date_str`` (ISO yyyy-mm-dd).
+
+    Returns the FRESHEST row per fixture (latest run_date, then id), which is
+    the triple settlement scored. Used to match a Polymarket market title+date
+    back to the fixture the model predicted.
+    """
+    with session_scope() as s:
+        rows = list(
+            s.execute(
+                select(PredictionRow)
+                .where(func.substr(PredictionRow.kickoff, 1, 10) == date_str)
+                .order_by(PredictionRow.run_date.asc(), PredictionRow.id.asc())
+            )
+            .scalars()
+            .all()
+        )
+    freshest: dict[int, PredictionRow] = {}
+    for r in rows:  # later rows (fresher) overwrite earlier ones
+        freshest[r.fixture_id] = r
+    out = list(freshest.values())
+    for r in out:  # touch attrs so they survive session close
+        _ = (r.home_team, r.away_team, r.p_home, r.p_draw, r.p_away,
+             r.anchor_source, r.market_p_draw, r.kickoff, r.competition_code)
+    return out
+
+
+def actual_outcome_for(fixture_id: int) -> str | None:
+    """Settled actual outcome (HOME/DRAW/AWAY) for a fixture, or None."""
+    with session_scope() as s:
+        row = s.execute(
+            select(PredictionOutcome.actual_outcome).where(
+                PredictionOutcome.fixture_id == fixture_id
+            )
+        ).first()
+    return row[0] if row else None

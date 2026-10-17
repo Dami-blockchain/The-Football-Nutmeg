@@ -311,6 +311,26 @@ class Settings(BaseSettings):
         default=20, alias="BETBOT_LLM_DAILY_LIMIT_PER_USER"
     )
 
+    # ---- Operator Polymarket trade-log mirror (BETBOT_TRADE_LOG) ------
+    # READ-ONLY mirror + P&L report of the OPERATOR'S OWN on-chain Polymarket
+    # trading (his public proxy wallet), matched against Ronaldo's calls. The
+    # bot signs nothing and moves no money — it only reads the public
+    # data-api.polymarket.com feed. Flag-gated, DEFAULT OFF: with the flag off,
+    # the daily sync job, the monthly report and the /trades command are all
+    # inert and betbot.trade_log is never imported by a running service.
+    trade_log_enabled: bool = Field(default=False, alias="BETBOT_TRADE_LOG")
+    # The operator's Polymarket PROXY wallet (public address, read-only). Stored
+    # as a setting, never hardcoded, and never echoed to a user-facing channel.
+    operator_pm_wallet: str = Field(default="", alias="BETBOT_OPERATOR_PM_WALLET")
+    # Daily pull-and-store sync (no Telegram). UTC cron.
+    trade_log_sync_cron: str = Field(
+        default="30 23 * * *", alias="BETBOT_TRADE_LOG_SYNC_CRON"
+    )
+    # Monthly report to the operator, on the 1st. UTC cron.
+    trade_log_report_cron: str = Field(
+        default="0 8 1 * *", alias="BETBOT_TRADE_LOG_REPORT_CRON"
+    )
+
     @model_validator(mode="after")
     def _repair_placeholder_highlightly_key(self) -> "Settings":
         """Recover the real HIGHLIGHTLY key when a duplicate ``.env`` line wins.
